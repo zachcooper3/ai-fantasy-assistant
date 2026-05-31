@@ -64,7 +64,7 @@ Open **two terminals**, both from the repo root (`ai-fantasy-assistant/`).
 ### Terminal 1 — Backend
 
 ```bash
-venv\Scripts\activate
+venv/Scripts/activate
 uvicorn backend.app.main:app --reload
 ```
 
