@@ -1,0 +1,22 @@
+# Fantasy Football Draft Assistant — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# API framework
+fastapi>=0.115.0
+uvicorn>=0.46.0
+
+# Database
+sqlmodel>=0.0.21
+
+# Vector store (RAG layer)
+chromadb>=1.5.0
+
+# AI
+anthropic>=0.102.0
+
+# HTTP client (Sleeper API calls)
+httpx>=0.28.0
+
+# Config / settings
+pydantic>=2.13.0
+pydantic-settings>=2.14.0
