@@ -569,11 +569,14 @@ video {
 .mt-0\.5 {
   margin-top: 0.125rem;
 }
+.mt-1 {
+  margin-top: 0.25rem;
+}
 .mt-2 {
   margin-top: 0.5rem;
 }
-.mt-8 {
-  margin-top: 2rem;
+.mt-6 {
+  margin-top: 1.5rem;
 }
 .block {
   display: block;
@@ -607,9 +610,6 @@ video {
 }
 .h-screen {
   height: 100vh;
-}
-.max-h-96 {
-  max-height: 24rem;
 }
 .min-h-0 {
   min-height: 0px;
@@ -1046,6 +1046,9 @@ video {
 }
 .font-medium {
   font-weight: 500;
+}
+.font-normal {
+  font-weight: 400;
 }
 .font-semibold {
   font-weight: 600;

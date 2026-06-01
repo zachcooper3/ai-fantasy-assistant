@@ -4,12 +4,13 @@
  * Highlights in green when it's the user's turn.
  */
 
-import { Undo2, Wifi, WifiOff } from "lucide-react";
-import { DraftState } from "@/lib/api";
+import { Undo2, Wifi, WifiOff, RefreshCw } from "lucide-react";
+import { DraftState, SyncStatus } from "@/lib/api";
 
 interface Props {
   session: DraftState;
   isConnected: boolean;
+  syncStatus: SyncStatus | null;
   onUndo: () => void;
   onReset: () => void;
 }
@@ -23,7 +24,7 @@ const POS_COLORS: Record<string, string> = {
   K: "text-slate-400",
 };
 
-export default function StatusBar({ session, isConnected, onUndo, onReset }: Props) {
+export default function StatusBar({ session, isConnected, syncStatus, onUndo, onReset }: Props) {
   const myTurn = session.is_my_turn;
 
   return (
@@ -107,7 +108,47 @@ export default function StatusBar({ session, isConnected, onUndo, onReset }: Pro
         Reset
       </button>
 
-      {/* Connection indicator */}
+      {/* Sleeper sync indicator */}
+      {syncStatus && syncStatus.status !== "idle" && (
+        <span
+          title={
+            syncStatus.status === "syncing"
+              ? `Sleeper sync active (${syncStatus.synced_pick_count} picks synced)`
+              : syncStatus.status === "complete"
+              ? "Sleeper draft complete"
+              : `Sync error: ${syncStatus.error}`
+          }
+          className="flex items-center gap-1 text-xs"
+        >
+          <RefreshCw
+            size={12}
+            className={
+              syncStatus.status === "syncing"
+                ? "text-emerald-400 animate-spin"
+                : syncStatus.status === "complete"
+                ? "text-slate-500"
+                : "text-red-400"
+            }
+          />
+          <span
+            className={
+              syncStatus.status === "syncing"
+                ? "text-emerald-400"
+                : syncStatus.status === "complete"
+                ? "text-slate-500"
+                : "text-red-400"
+            }
+          >
+            {syncStatus.status === "syncing"
+              ? "Sleeper live"
+              : syncStatus.status === "complete"
+              ? "Draft complete"
+              : "Sync error"}
+          </span>
+        </span>
+      )}
+
+      {/* WebSocket connection indicator */}
       <span title={isConnected ? "Live" : "Reconnecting…"}>
         {isConnected
           ? <Wifi size={14} className="text-emerald-500" />

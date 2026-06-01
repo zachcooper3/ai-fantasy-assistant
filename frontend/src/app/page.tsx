@@ -23,6 +23,7 @@ export default function DraftPage() {
     session,
     board,
     recommendation,
+    syncStatus,
     isConnected,
     isLoadingRec,
     error,
@@ -50,6 +51,7 @@ export default function DraftPage() {
       <StatusBar
         session={session}
         isConnected={isConnected}
+        syncStatus={syncStatus}
         onUndo={undoPick}
         onReset={() => startSession({
           league_size: session.league_size,

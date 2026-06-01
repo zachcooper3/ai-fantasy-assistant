@@ -19,7 +19,8 @@ from backend.db.database import create_db_and_tables
 from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.ai_service import AIService
-from backend.app.api import players, draft, websocket, recommendations
+from backend.app.services.draft_sync import DraftSyncService
+from backend.app.api import players, draft, websocket, recommendations, sync
 
 
 # ---------------------------------------------------------------------------
@@ -30,12 +31,16 @@ from backend.app.api import players, draft, websocket, recommendations
 async def lifespan(app: FastAPI):
     # Startup: create DB tables and attach services to app state
     create_db_and_tables()
-    app.state.draft_service = DraftStateService()
-    app.state.connection_manager = ConnectionManager()
+    draft_service = DraftStateService()
+    connection_manager = ConnectionManager()
+    app.state.draft_service = draft_service
+    app.state.connection_manager = connection_manager
     app.state.ai_service = AIService()
+    app.state.sync_service = DraftSyncService(draft_service, connection_manager)
     print("Fantasy Draft Assistant API is ready.")
     yield
-    # Shutdown: nothing to clean up for now
+    # Shutdown: stop any active Sleeper sync task cleanly
+    await app.state.sync_service.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +67,7 @@ app.add_middleware(
 app.include_router(players.router)
 app.include_router(draft.router)
 app.include_router(recommendations.router)
+app.include_router(sync.router)
 app.include_router(websocket.router)
 
 

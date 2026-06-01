@@ -7,12 +7,11 @@
  * - The big board (available players + scarcity)
  * - AI recommendation
  * - WebSocket connection for real-time pick updates
- *
- * All components read from this hook — there's no global store needed.
+ * - Optional Sleeper live draft sync
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Board, DraftState, Recommendation, WsEvent } from "@/lib/api";
+import { api, Board, DraftState, Recommendation, SyncStatus, WsEvent } from "@/lib/api";
 
 const WS_URL =
   (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000")
@@ -22,6 +21,7 @@ export interface DraftHook {
   session: DraftState | null;
   board: Board | null;
   recommendation: Recommendation | null;
+  syncStatus: SyncStatus | null;
   isConnected: boolean;
   isLoadingRec: boolean;
   error: string | null;
@@ -29,6 +29,7 @@ export interface DraftHook {
     league_size: number;
     my_draft_position: number;
     total_rounds: number;
+    sleeper_draft_id?: string;
   }) => Promise<void>;
   recordPick: (playerId: number) => Promise<void>;
   undoPick: () => Promise<void>;
@@ -40,6 +41,7 @@ export function useDraft(): DraftHook {
   const [session, setSession] = useState<DraftState | null>(null);
   const [board, setBoard] = useState<Board | null>(null);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isLoadingRec, setIsLoadingRec] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -84,18 +86,17 @@ export function useDraft(): DraftHook {
         } else if (msg.type === "pick" || msg.type === "undo") {
           setSession(msg.state);
           refreshBoard();
-          // Clear stale recommendation after a pick
           setRecommendation(null);
         } else if (msg.type === "reset") {
           setSession(null);
           setBoard(null);
           setRecommendation(null);
+          setSyncStatus(null);
         }
       };
 
       ws.onclose = () => {
         setIsConnected(false);
-        // Reconnect after 3 s
         retryTimeout = setTimeout(connect, 3000);
       };
 
@@ -115,12 +116,33 @@ export function useDraft(): DraftHook {
   // ------------------------------------------------------------------
 
   const startSession = useCallback(
-    async (config: { league_size: number; my_draft_position: number; total_rounds: number }) => {
+    async (config: {
+      league_size: number;
+      my_draft_position: number;
+      total_rounds: number;
+      sleeper_draft_id?: string;
+    }) => {
       try {
-        const state = await api.startSession(config);
+        const { sleeper_draft_id, ...sessionConfig } = config;
+        const state = await api.startSession(sessionConfig);
         setSession(state);
         setRecommendation(null);
+        setSyncStatus(null);
         await refreshBoard();
+
+        // If a Sleeper draft ID was provided, start live sync immediately
+        if (sleeper_draft_id) {
+          try {
+            const status = await api.startSync(sleeper_draft_id);
+            setSyncStatus(status);
+          } catch (e) {
+            setError(
+              `Session started, but Sleeper sync failed: ${
+                e instanceof Error ? e.message : "unknown error"
+              }`
+            );
+          }
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to start session");
       }
@@ -135,7 +157,6 @@ export function useDraft(): DraftHook {
   const recordPick = useCallback(async (playerId: number) => {
     try {
       await api.recordPick(playerId);
-      // Board + session refresh via the WebSocket "pick" event
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to record pick");
     }
@@ -144,7 +165,6 @@ export function useDraft(): DraftHook {
   const undoPick = useCallback(async () => {
     try {
       await api.undoPick();
-      // Session + board refresh via the WebSocket "undo" event
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to undo pick");
     }
@@ -173,6 +193,7 @@ export function useDraft(): DraftHook {
     session,
     board,
     recommendation,
+    syncStatus,
     isConnected,
     isLoadingRec,
     error,

@@ -1,7 +1,7 @@
 "use client";
 /**
  * SetupModal — shown on first load or when no active session exists.
- * Collects league_size and my_draft_position before starting the draft.
+ * Collects league size, draft position, rounds, and an optional Sleeper draft ID.
  */
 
 import { useState } from "react";
@@ -11,6 +11,7 @@ interface Props {
     league_size: number;
     my_draft_position: number;
     total_rounds: number;
+    sleeper_draft_id?: string;
   }) => void;
 }
 
@@ -18,6 +19,7 @@ export default function SetupModal({ onStart }: Props) {
   const [leagueSize, setLeagueSize] = useState(12);
   const [draftPos, setDraftPos] = useState(1);
   const [rounds, setRounds] = useState(15);
+  const [sleeperDraftId, setSleeperDraftId] = useState("");
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
@@ -95,16 +97,47 @@ export default function SetupModal({ onStart }: Props) {
               ))}
             </div>
           </div>
+
+          {/* Sleeper draft ID — optional */}
+          <div>
+            <label className="block text-sm font-medium text-slate-300 mb-1">
+              Sleeper Draft ID{" "}
+              <span className="text-slate-500 font-normal">(optional)</span>
+            </label>
+            <p className="text-xs text-slate-500 mb-2">
+              Paste your Sleeper draft ID to sync picks automatically.
+              Found in Sleeper under league settings → Drafts, or in the draft URL.
+            </p>
+            <input
+              type="text"
+              placeholder="e.g. 1234567890"
+              value={sleeperDraftId}
+              onChange={(e) => setSleeperDraftId(e.target.value.trim())}
+              className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-600 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:border-slate-400"
+            />
+          </div>
         </div>
 
-        {/* Summary + start */}
-        <div className="mt-8 p-4 rounded-xl bg-slate-800 text-slate-300 text-sm mb-6">
-          {leagueSize}-team PPR · Slot {draftPos} of {leagueSize} · {rounds} rounds
+        {/* Summary */}
+        <div className="mt-6 p-4 rounded-xl bg-slate-800 text-slate-300 text-sm mb-6">
+          <div>
+            {leagueSize}-team PPR · Slot {draftPos} of {leagueSize} · {rounds} rounds
+          </div>
+          {sleeperDraftId && (
+            <div className="text-emerald-400 mt-1 text-xs">
+              ✓ Sleeper sync enabled — picks will update automatically
+            </div>
+          )}
         </div>
 
         <button
           onClick={() =>
-            onStart({ league_size: leagueSize, my_draft_position: draftPos, total_rounds: rounds })
+            onStart({
+              league_size: leagueSize,
+              my_draft_position: draftPos,
+              total_rounds: rounds,
+              ...(sleeperDraftId ? { sleeper_draft_id: sleeperDraftId } : {}),
+            })
           }
           className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-bold text-base transition-colors"
         >
