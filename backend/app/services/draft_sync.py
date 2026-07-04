@@ -22,7 +22,8 @@ from backend.app.api.draft import _pick_response, _state_response
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 5  # seconds between Sleeper API polls
+POLL_INTERVAL = 2          # seconds between Sleeper API polls
+COMPLETION_CHECK_EVERY = 5  # only check draft completion every N polls
 
 
 class DraftSyncService:
@@ -48,6 +49,7 @@ class DraftSyncService:
         self._draft_id: str | None = None
         self._task: asyncio.Task | None = None
         self._synced_pick_count: int = 0  # picks we've already processed
+        self._poll_count: int = 0          # total polls run (for completion check cadence)
         self.status: str = "idle"          # "idle" | "syncing" | "complete" | "error"
         self.error: str | None = None
 
@@ -60,6 +62,7 @@ class DraftSyncService:
         await self.stop()
         self._draft_id = draft_id
         self._synced_pick_count = len(self._draft_svc.picks) if self._draft_svc.is_active else 0
+        self._poll_count = 0
         self.status = "syncing"
         self.error = None
         self._task = asyncio.create_task(self._poll_loop(), name="sleeper-sync")
@@ -84,10 +87,25 @@ class DraftSyncService:
     # -----------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
-        """Runs until cancelled or the draft is complete."""
+        """
+        Runs until cancelled or the draft is complete.
+
+        Sleep is at the TOP of the loop so that:
+        - The very first poll fires immediately (before the loop body runs the
+          first time the task is created, start() has already set up state).
+        - Every subsequent cycle is a clean POLL_INTERVAL regardless of how
+          long _poll_once takes, keeping end-to-end pick latency close to
+          POLL_INTERVAL rather than POLL_INTERVAL + HTTP round-trip time.
+        """
         consecutive_errors = 0
 
+        # First poll fires immediately on start — no initial sleep.
+        first = True
         while True:
+            if not first:
+                await asyncio.sleep(POLL_INTERVAL)
+            first = False
+
             try:
                 await self._poll_once()
                 consecutive_errors = 0
@@ -105,33 +123,32 @@ class DraftSyncService:
             if self.status != "syncing":
                 return
 
-            await asyncio.sleep(POLL_INTERVAL)
-
     async def _poll_once(self) -> None:
         """Fetches the latest picks from Sleeper and processes any new ones."""
         if not self._draft_id or not self._draft_svc.is_active:
             return
 
+        self._poll_count += 1
         picks = await sleeper_client.get_draft_picks(self._draft_id)
 
         # Only process picks we haven't seen yet
         new_picks = [p for p in picks if p.get("pick_no", 0) > self._synced_pick_count]
 
-        if not new_picks:
-            return
+        if new_picks:
+            # Sort ascending so we process in order
+            new_picks.sort(key=lambda p: p.get("pick_no", 0))
 
-        # Sort ascending so we process in order
-        new_picks.sort(key=lambda p: p.get("pick_no", 0))
+            with Session(engine) as db:
+                for sleeper_pick in new_picks:
+                    await self._process_pick(sleeper_pick, db)
 
-        with Session(engine) as db:
-            for sleeper_pick in new_picks:
-                await self._process_pick(sleeper_pick, db)
-
-        # Check if draft is now complete
-        draft_info = await sleeper_client.get_draft(self._draft_id)
-        if draft_info.get("status") == "complete":
-            self.status = "complete"
-            logger.info("Sleeper draft complete — sync finished")
+        # Check draft completion only every COMPLETION_CHECK_EVERY polls to
+        # avoid an extra HTTP round trip on every cycle.
+        if self._poll_count % COMPLETION_CHECK_EVERY == 0:
+            draft_info = await sleeper_client.get_draft(self._draft_id)
+            if draft_info.get("status") == "complete":
+                self.status = "complete"
+                logger.info("Sleeper draft complete — sync finished")
 
     async def _process_pick(self, sleeper_pick: dict, db: Session) -> None:
         """Resolves a single Sleeper pick to a local player and records it."""

@@ -4,17 +4,17 @@ Async HTTP client for the Sleeper API.
 Sleeper API is public — no auth required for read-only operations.
 Base URL: https://api.sleeper.app/v1
 
-Key endpoints used:
-  GET /user/{username}                → resolve username to user_id
-  GET /league/{league_id}/drafts      → list drafts for a league
-  GET /draft/{draft_id}               → draft metadata (order, settings)
-  GET /draft/{draft_id}/picks         → all picks made so far
-  GET /players/nfl                    → full player database (~7 MB, cache daily)
+A single persistent httpx.AsyncClient is used for all requests so that
+TCP connections and TLS sessions are reused across polls, avoiding the
+expensive per-request handshake overhead.
+
+Call `await close()` during app shutdown to release the connection pool.
 
 Author: Zach Cooper
 """
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -24,13 +24,48 @@ logger = logging.getLogger(__name__)
 BASE = "https://api.sleeper.app/v1"
 TIMEOUT = 10.0  # seconds
 
+# ---------------------------------------------------------------------------
+# Persistent client — one connection pool for all Sleeper API calls
+# ---------------------------------------------------------------------------
 
-async def _get(path: str) -> Any:
-    """Makes a GET request to the Sleeper API and returns parsed JSON."""
-    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-        resp = await client.get(f"{BASE}{path}")
-        resp.raise_for_status()
-        return resp.json()
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """Returns the shared client, creating it on first use."""
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            timeout=TIMEOUT,
+            headers={"User-Agent": "ai-fantasy-assistant/1.0"},
+        )
+        logger.debug("Created persistent Sleeper API client")
+    return _client
+
+
+async def close() -> None:
+    """Close the persistent client. Should be called from app lifespan cleanup."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+        logger.debug("Closed Sleeper API client")
+    _client = None
+
+
+async def _get(path: str, bust_cache: bool = False) -> Any:
+    """Makes a GET request to the Sleeper API and returns parsed JSON.
+
+    Pass bust_cache=True on polling endpoints to append a millisecond
+    timestamp query param, bypassing any CDN cache on Sleeper's side.
+    """
+    url = f"{BASE}{path}"
+    if bust_cache:
+        sep = "&" if "?" in path else "?"
+        url = f"{url}{sep}_={int(time.time() * 1000)}"
+    client = _get_client()
+    resp = await client.get(url)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -38,10 +73,6 @@ async def _get(path: str) -> Any:
 # ---------------------------------------------------------------------------
 
 async def get_user(username: str) -> dict:
-    """
-    Returns Sleeper user info for a given username.
-    Useful for resolving a username to a user_id.
-    """
     return await _get(f"/user/{username}")
 
 
@@ -50,15 +81,10 @@ async def get_user(username: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def get_league(league_id: str) -> dict:
-    """Returns league metadata — name, roster positions, scoring settings."""
     return await _get(f"/league/{league_id}")
 
 
 async def get_league_drafts(league_id: str) -> list[dict]:
-    """
-    Returns all drafts for a league.
-    The most recent one is typically the current season's draft.
-    """
     return await _get(f"/league/{league_id}/drafts")
 
 
@@ -80,6 +106,7 @@ async def get_draft(draft_id: str) -> dict:
 async def get_draft_picks(draft_id: str) -> list[dict]:
     """
     Returns all picks made so far in a draft, ordered by pick_no (ascending).
+    Cache is busted on every call so Sleeper's CDN returns a fresh response.
 
     Each pick has:
       player_id   — Sleeper's internal player ID (string)
@@ -90,7 +117,7 @@ async def get_draft_picks(draft_id: str) -> list[dict]:
       pick_no     — overall pick number (1-indexed)
       metadata    — {first_name, last_name, position, team, ...}
     """
-    return await _get(f"/draft/{draft_id}/picks")
+    return await _get(f"/draft/{draft_id}/picks", bust_cache=True)
 
 
 # ---------------------------------------------------------------------------
@@ -101,13 +128,5 @@ async def get_nfl_players() -> dict[str, dict]:
     """
     Returns the full Sleeper NFL player database as {player_id: player_data}.
     This is a large payload (~7 MB). Cache it — it changes infrequently.
-
-    Relevant fields per player:
-      player_id   — Sleeper's string ID
-      full_name   — "Patrick Mahomes"
-      first_name  — "Patrick"
-      last_name   — "Mahomes"
-      position    — "QB" | "RB" | "WR" | "TE" | "K" | "DEF"
-      team        — "KC" (NFL team abbreviation, or None if FA)
     """
     return await _get("/players/nfl")

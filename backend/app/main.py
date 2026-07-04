@@ -20,7 +20,9 @@ from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.ai_service import AIService
 from backend.app.services.draft_sync import DraftSyncService
+from backend.app.services import sleeper_client
 from backend.app.api import players, draft, websocket, recommendations, sync
+from backend.ingestion.fetch_adp import auto_refresh as _refresh_adp
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +33,10 @@ from backend.app.api import players, draft, websocket, recommendations, sync
 async def lifespan(app: FastAPI):
     # Startup: create DB tables and attach services to app state
     create_db_and_tables()
+
+    # Auto-refresh ADP data if the CSV is older than 7 days
+    await _refresh_adp()
+
     draft_service = DraftStateService()
     connection_manager = ConnectionManager()
     app.state.draft_service = draft_service
@@ -39,8 +45,9 @@ async def lifespan(app: FastAPI):
     app.state.sync_service = DraftSyncService(draft_service, connection_manager)
     print("Fantasy Draft Assistant API is ready.")
     yield
-    # Shutdown: stop any active Sleeper sync task cleanly
+    # Shutdown: stop sync task and close the persistent Sleeper HTTP client
     await app.state.sync_service.stop()
+    await sleeper_client.close()
 
 
 # ---------------------------------------------------------------------------

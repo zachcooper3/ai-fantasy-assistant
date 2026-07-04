@@ -17,7 +17,7 @@ AI-powered draft day co-pilot for Sleeper PPR leagues. Built with FastAPI (Pytho
 ### 1. Install Python dependencies
 
 ```bash
-venv\Scripts\activate
+venv/Scripts/activate
 pip install -r requirements.txt
 ```
 
@@ -94,13 +94,29 @@ App runs at `http://localhost:3000`
 
 ## Refreshing Player Data
 
-When a new ADP CSV is available from FantasyPros, drop it into `data/raw/fantasypros_adp.csv` and re-run:
+ADP data is fetched automatically from [FantasyFootballCalculator](https://fantasyfootballcalculator.com) on startup if the local CSV is older than 7 days. No manual action needed in most cases.
+
+To force a manual refresh at any time:
+
+```bash
+python -m backend.ingestion.fetch_adp
+```
+
+This fetches fresh PPR ADP, overwrites `data/raw/fantasypros_adp.csv`, and reloads the database. Options:
+
+```bash
+python -m backend.ingestion.fetch_adp --year 2026   # specific season
+python -m backend.ingestion.fetch_adp --teams 10    # non-12-team league
+python -m backend.ingestion.fetch_adp --no-ingest   # write CSV only, skip DB reload
+```
+
+**Note:** FantasyFootballCalculator typically publishes data starting in July/August once community drafts begin. Running before then will show a warning and keep existing data.
+
+If you have a FantasyPros CSV you'd prefer to use instead, drop it into `data/raw/fantasypros_adp.csv` and run:
 
 ```bash
 python -m backend.ingestion.ingest_players
 ```
-
-This wipes and reloads the player table — no other steps needed.
 
 ---
 
