@@ -78,7 +78,18 @@ def _build_indexes(
 # Main sync
 # ---------------------------------------------------------------------------
 
-async def _sync() -> None:
+async def sync_sleeper_ids() -> tuple[int, int]:
+    """
+    Matches every Player row against Sleeper's player database and populates
+    sleeper_id. Returns (matched, unmatched) so callers can log a summary or
+    decide whether to alert on a bad match rate.
+
+    Public (no leading underscore) because backend/ingestion/fetch_adp.py
+    calls this directly after every re-ingest — ingest_players.py does a
+    full delete-and-reinsert of the Player table, which wipes sleeper_id
+    every time, so this has to be re-run after every ADP refresh or live
+    Sleeper draft sync silently degrades to name-matching.
+    """
     logger.info("Fetching Sleeper NFL player database…")
     sleeper_players = await get_nfl_players()
     logger.info(f"  {len(sleeper_players):,} players received from Sleeper")
@@ -128,10 +139,12 @@ async def _sync() -> None:
         if len(unmatched_names) > 20:
             logger.info(f"  … and {len(unmatched_names) - 20} more")
 
+    return matched, unmatched
+
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    asyncio.run(_sync())
+    asyncio.run(sync_sleeper_ids())

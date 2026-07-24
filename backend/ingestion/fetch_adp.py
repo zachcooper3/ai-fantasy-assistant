@@ -34,6 +34,14 @@ CURRENT_YEAR = datetime.now().year
 # Positions to include — matches what ingest_players.py and the app expect
 VALID_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
+# A full PPR ADP pull is normally ~150-200 draftable players across these
+# positions (161 as of 2026-07-24). If FFC ever returns a degraded response
+# that's non-empty but suspiciously small (a partial API response, a
+# mid-deploy blip on their end, etc.), we'd otherwise silently overwrite a
+# good CSV with a bad one. This is a floor well below any real response,
+# just high enough to catch "something's wrong" before it hits SQLite.
+MIN_EXPECTED_PLAYERS = 100
+
 
 # ---------------------------------------------------------------------------
 # Refresh cadence
@@ -153,6 +161,51 @@ def write_csv(rows: list[dict], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Validation — catch a bad fetch before it overwrites good data
+# ---------------------------------------------------------------------------
+
+def _validate_rows(rows: list[dict]) -> None:
+    """
+    Raises ValueError if the fetched/filtered data looks implausible. Row
+    count is a cheap, effective check: a real PPR ADP pull is never anywhere
+    close to MIN_EXPECTED_PLAYERS, so falling below it means something went
+    wrong upstream (a partial API response, an FFC-side bug, etc.) even
+    though the request itself returned 200 with a non-empty body.
+    """
+    if len(rows) < MIN_EXPECTED_PLAYERS:
+        raise ValueError(
+            f"Only {len(rows)} players survived filtering — expected at "
+            f"least {MIN_EXPECTED_PLAYERS}. Refusing to overwrite "
+            f"{OUT_PATH} with what looks like a bad or partial response."
+        )
+
+
+def _existing_row_count(path: Path) -> int | None:
+    """Row count of the CSV currently on disk, or None if it doesn't exist yet."""
+    if not path.exists():
+        return None
+    with open(path, newline="", encoding="utf-8") as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+def _write_and_report(rows: list[dict], path: Path = OUT_PATH) -> None:
+    """
+    Validates the new data, writes it, and logs an old-count -> new-count
+    diff — the at-a-glance signal for "did this refresh look sane?" without
+    having to open the CSV or query the DB by hand.
+    """
+    _validate_rows(rows)
+    previous = _existing_row_count(path)
+    write_csv(rows, path)
+    if previous is None:
+        print(f"ADP diff: no previous CSV on disk — {len(rows)} players written.")
+    else:
+        delta = len(rows) - previous
+        sign = "+" if delta >= 0 else ""
+        print(f"ADP diff: {previous} -> {len(rows)} players ({sign}{delta})")
+
+
+# ---------------------------------------------------------------------------
 # Auto-refresh (called from app lifespan)
 # ---------------------------------------------------------------------------
 
@@ -182,11 +235,27 @@ async def auto_refresh(year: int = CURRENT_YEAR, teams: int = 12) -> None:
     try:
         players = await asyncio.to_thread(fetch_adp, year, teams)
         rows = build_csv_rows(players)
-        await asyncio.to_thread(write_csv, rows, OUT_PATH)
+        await asyncio.to_thread(_write_and_report, rows, OUT_PATH)
 
         from backend.ingestion.ingest_players import ingest_csv
         count = await asyncio.to_thread(ingest_csv, str(OUT_PATH))
         print(f"ADP auto-refresh complete: {count} players loaded.")
+
+        # ingest_csv() above did a full delete-and-reinsert of the Player
+        # table, which wipes sleeper_id on every row. Re-sync immediately so
+        # live Sleeper draft sync doesn't silently degrade to name-matching
+        # until someone remembers to run this by hand.
+        try:
+            from backend.ingestion.sync_sleeper_ids import sync_sleeper_ids
+            matched, unmatched = await sync_sleeper_ids()
+            print(f"Sleeper ID sync complete: {matched} matched, {unmatched} unmatched.")
+        except Exception as e:
+            print(
+                f"[WARN] Sleeper ID sync failed after ADP refresh: {e}. "
+                "Player data is still current — live Sleeper draft sync will "
+                "fall back to name-matching until this is re-run.",
+                file=sys.stderr,
+            )
 
     except httpx.HTTPStatusError as e:
         print(
@@ -236,7 +305,7 @@ def main() -> None:
         print(f"Received {len(players)} players from FantasyFootballCalculator")
 
         rows = build_csv_rows(players)
-        write_csv(rows, OUT_PATH)
+        _write_and_report(rows, OUT_PATH)
 
         if args.no_ingest:
             print("Skipping database ingest (--no-ingest).")
@@ -246,6 +315,11 @@ def main() -> None:
         from backend.ingestion.ingest_players import ingest_csv
         count = ingest_csv(str(OUT_PATH))
         print(f"Done. {count} players loaded into SQLite.")
+
+        print("Re-syncing Sleeper player IDs (ingest wipes sleeper_id) ...")
+        from backend.ingestion.sync_sleeper_ids import sync_sleeper_ids
+        matched, unmatched = asyncio.run(sync_sleeper_ids())
+        print(f"Done. {matched} matched, {unmatched} unmatched.")
 
     except httpx.HTTPStatusError as e:
         print(f"\nHTTP error: {e.response.status_code} {e.request.url}", file=sys.stderr)
