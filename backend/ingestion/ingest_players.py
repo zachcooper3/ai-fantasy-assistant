@@ -29,10 +29,18 @@ from backend.db.models import Player
 def _parse_position(pos_rank: str) -> str:
     """
     Extracts the position letters from a pos_rank string.
-    Examples: "RB1" -> "RB", "WR12" -> "WR", "QB3" -> "QB", "DEF" -> "DEF"
+    Examples: "RB1" -> "RB", "WR12" -> "WR", "QB3" -> "QB", "DEF" -> "DST"
+
+    Both FantasyPros and FantasyFootballCalculator label team defenses "DEF",
+    but everywhere else in this app (schemas.py, recommendations.py scarcity
+    thresholds, sync_sleeper_ids.py's DST matching branch, the frontend's
+    position filter/badge) standardizes on "DST". Normalize here, once, at
+    ingestion time so every downstream consumer can rely on "DST" and never
+    has to special-case "DEF".
     """
     match = re.match(r"([A-Za-z]+)", pos_rank)
-    return match.group(1).upper() if match else pos_rank.upper()
+    position = match.group(1).upper() if match else pos_rank.upper()
+    return "DST" if position == "DEF" else position
 
 
 def _parse_bye(bye_str: str) -> int | None:

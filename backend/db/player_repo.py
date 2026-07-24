@@ -75,7 +75,7 @@ def count_available_by_position(session: Session) -> dict[str, int]:
     Returns a dict of {position: count_of_available_players}.
     Used for positional scarcity calculations.
 
-    Example: {"QB": 18, "RB": 42, "WR": 58, "TE": 16, "K": 12, "DEF": 10}
+    Example: {"QB": 18, "RB": 42, "WR": 58, "TE": 16, "K": 12, "DST": 10}
     """
     players = session.exec(
         select(Player).where(Player.is_available == True)
@@ -142,30 +142,6 @@ def reset_draft_availability(session: Session) -> int:
 
 
 def get_handcuff(session: Session, player_id: int) -> Player | None:
-    """
-    Returns the best available handcuff target for a given RB.
-    A handcuff is the next-highest ADP available RB on the same NFL team.
-
-    Returns None if:
-    - The player isn't found
-    - The player isn't an RB
-    - No other available RBs exist on the same team
-    """
-    player = session.get(Player, player_id)
-    if player is None or player.position != "RB":
-        return None
-
-    return session.exec(
-        select(Player)
-        .where(Player.team == player.team)
-        .where(Player.position == "RB")
-        .where(Player.is_available == True)
-        .where(Player.id != player_id)
-        .order_by(Player.adp)
-    ).first()
-
-
-def get_handcuff(session: Session, player_id: int) -> "Player | None":
     """
     Returns the best available handcuff target for a given RB.
     A handcuff is the next-highest ADP available RB on the same NFL team.
