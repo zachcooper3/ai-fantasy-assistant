@@ -1,0 +1,11 @@
+# Normalize line endings to LF for every text file, on every platform,
+# regardless of each contributor's local core.autocrlf setting.
+#
+# Why: this repo has been edited from both Windows (native CRLF-leaning
+# tools) and Linux/macOS environments. Without this file, git relies on
+# each clone's local core.autocrlf config to decide how line endings are
+# handled, which is inconsistent across contributors and tools — the
+# same unmodified file can show up as "changed" (CRLF vs LF) depending on
+# who last touched it. `eol=lf` pins the checked-out line ending to LF
+# for text files no matter what, so `git status` only shows real changes.
+* text=auto eol=lf
