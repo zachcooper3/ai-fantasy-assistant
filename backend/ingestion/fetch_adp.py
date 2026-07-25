@@ -27,6 +27,16 @@ from pathlib import Path
 
 import httpx
 
+# Allow running this file directly (`py backend/ingestion/fetch_adp.py`) as
+# well as the documented `py -m backend.ingestion.fetch_adp`. Direct
+# execution puts this file's own directory on sys.path, not the repo root,
+# so the deferred `from backend.X import Y` imports inside auto_refresh()
+# and main() below would otherwise fail with "No module named 'backend'".
+# Only kicks in when this file is the actual entry point — running via -m
+# already sets __package__ correctly, so this is a no-op in that case.
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 FFC_URL = "https://fantasyfootballcalculator.com/api/v1/adp/ppr"
 OUT_PATH = Path("data/raw/fantasypros_adp.csv")
 CURRENT_YEAR = datetime.now().year

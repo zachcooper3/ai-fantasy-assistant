@@ -10,7 +10,13 @@ player database diverges noticeably from our CSV (e.g. mid-season trades).
 Matching strategy (in order):
   1. Exact full_name + position match
   2. Normalised name match (lowercase, strip punctuation) + position
-  3. DST: match by NFL team abbreviation
+  3. Suffix-stripped match (drop a trailing Jr/Sr/II/III/IV/V) + position —
+     Sleeper's player database omits generational suffixes entirely (verified
+     2026-07-25: Sleeper has "James Cook", "Kenneth Walker", "Travis
+     Etienne", "Marvin Harrison" — no "III"/"Jr." anywhere), while our ADP
+     data keeps them. This was the cause of 16/207 unmatched players after
+     the 2026-07-24 refresh — every single one had a suffix.
+  4. DST: match by NFL team abbreviation
 
 Author: Zach Cooper
 """
@@ -40,6 +46,22 @@ def _normalise(name: str) -> str:
     name = re.sub(r"[^\w\s]", "", name)   # strip apostrophes, dots, hyphens
     name = re.sub(r"\s+", " ", name).strip()
     return name
+
+
+_GENERATIONAL_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def _strip_suffix(normalised_name: str) -> str | None:
+    """
+    Drops a trailing generational suffix from an already-normalised name,
+    e.g. "kenneth walker iii" -> "kenneth walker". Returns None if there was
+    no suffix to strip, so callers can tell "stripped" apart from "unchanged"
+    without a second normalise() call.
+    """
+    parts = normalised_name.split()
+    if len(parts) > 1 and parts[-1] in _GENERATIONAL_SUFFIXES:
+        return " ".join(parts[:-1])
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +142,12 @@ async def sync_sleeper_ids() -> tuple[int, int]:
                 # 2. Normalised match
                 if sid is None:
                     sid = norm_index.get((_normalise(player.name), sleeper_pos))
+                # 3. Suffix-stripped match — Sleeper's names never carry a
+                #    generational suffix (see module docstring), ours do.
+                if sid is None:
+                    stripped = _strip_suffix(_normalise(player.name))
+                    if stripped is not None:
+                        sid = norm_index.get((stripped, sleeper_pos))
 
             if sid:
                 player.sleeper_id = sid
