@@ -8,8 +8,13 @@ uvicorn>=0.46.0
 # Database
 sqlmodel>=0.0.21
 
-# Vector store (RAG layer)
-chromadb>=1.5.0
+# Vector store (RAG layer) — NOT installed by default. backend/rag/ exists
+# (embedder.py, vector_store.py) but isn't called from the live recommendation
+# flow (ai_service.py) yet, so nothing in the running app needs it. chromadb
+# pulls in onnxruntime and adds real install time/disk for a feature that's
+# currently dead code. Uncomment + `pip install -r requirements.txt` once
+# backend/rag/ is actually wired into ai_service.py:
+# chromadb>=1.5.0
 
 # AI
 anthropic>=0.102.0

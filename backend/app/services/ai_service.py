@@ -294,6 +294,13 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
 # Service
 # ---------------------------------------------------------------------------
 
+# .env.example ships this as a fill-in-the-blank value. If someone copies
+# the file without editing it, ANTHROPIC_API_KEY looks "set" to os.getenv()
+# but isn't a real key — without this check it would silently be sent to
+# Anthropic and only fail once the first recommendation is requested.
+_PLACEHOLDER_KEYS = {"your_key_here"}
+
+
 class AIService:
     """
     Thin wrapper around the Anthropic client.
@@ -301,13 +308,31 @@ class AIService:
     """
 
     def __init__(self) -> None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
+        api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+
+        if api_key in _PLACEHOLDER_KEYS:
+            logger.warning(
+                "ANTHROPIC_API_KEY is still the placeholder value from "
+                ".env.example — treating it as unset. AI recommendations "
+                "will use fallback mode until a real key is set."
+            )
+            api_key = ""
+        elif not api_key:
             logger.warning(
                 "ANTHROPIC_API_KEY not set — AI recommendations will use fallback mode."
             )
+
         self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
         self._model = _DEFAULT_MODEL
+
+    @property
+    def is_configured(self) -> bool:
+        """True if a real (non-placeholder) Anthropic API key is active."""
+        return self._client is not None
+
+    @property
+    def model_name(self) -> str:
+        return self._model
 
     async def recommend(self, ctx: RecommendationContext) -> RecommendationResult:
         """

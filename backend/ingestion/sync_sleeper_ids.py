@@ -32,7 +32,6 @@ from backend.db.database import create_db_and_tables, engine
 from backend.db.models import Player
 from backend.app.services.sleeper_client import get_nfl_players
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -175,4 +174,10 @@ async def sync_sleeper_ids() -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Only configure logging when this file is the actual entry point — not
+    # when it's imported as a library (fetch_adp.py imports sync_sleeper_ids
+    # after every re-ingest). A module-level basicConfig() here would have
+    # silently decided the log format for the whole FastAPI process on
+    # whichever request happened to trigger the first import.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     asyncio.run(sync_sleeper_ids())
