@@ -29,3 +29,8 @@ httpx>=0.28.0
 # Config / settings
 pydantic>=2.13.0
 pydantic-settings>=2.14.0
+
+# Loads .env into the process environment (see backend/__init__.py) — every
+# entrypoint in this app reads config via os.getenv(), and nothing else was
+# actually reading the .env file before this.
+python-dotenv>=1.0.1
