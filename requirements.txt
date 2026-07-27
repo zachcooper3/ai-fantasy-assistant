@@ -8,18 +8,22 @@ uvicorn>=0.46.0
 # Database
 sqlmodel>=0.0.21
 
-# Vector store (RAG layer) — NOT installed by default. backend/rag/ exists
-# (embedder.py, vector_store.py) but isn't called from the live recommendation
-# flow (ai_service.py) yet, so nothing in the running app needs it. chromadb
-# pulls in onnxruntime and adds real install time/disk for a feature that's
-# currently dead code. Uncomment + `pip install -r requirements.txt` once
-# backend/rag/ is actually wired into ai_service.py:
-# chromadb>=1.5.0
+# Vector store (RAG layer) — now wired into ai_service.py's recommendation
+# prompt (see backend/rag/vector_store.py). Re-commented out on 2026-07-25
+# was temporary, while the layer was dead code; it's live again as of the
+# player-news/analytics RAG build.
+chromadb>=1.5.0
+
+# NFL stats (opportunity/volume, efficiency, team context, consistency/risk,
+# forward-looking signals — see backend/ingestion/fetch_metrics.py). This is
+# nflreadpy, NOT the deprecated nfl_data_py — the nflverse project retired
+# nfl_data_py in favor of this in 2026.
+nflreadpy>=0.1.5
 
 # AI
 anthropic>=0.102.0
 
-# HTTP client (Sleeper API calls)
+# HTTP client (Sleeper API calls, RotoWire RSS)
 httpx>=0.28.0
 
 # Config / settings

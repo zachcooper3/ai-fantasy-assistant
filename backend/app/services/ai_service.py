@@ -69,7 +69,9 @@ class RecommendationContext:
     # My roster — list of {player_name, position, nfl_team}
     my_roster: list[dict] = field(default_factory=list)
 
-    # Available players sorted by ADP — list of {id, rank, name, position, team, adp}
+    # Available players sorted by ADP — list of {id, rank, name, position,
+    # team, adp, sleeper_id}. sleeper_id may be None for a player Sleeper
+    # doesn't have a crosswalk entry for; retrieval below skips those.
     top_available: list[dict] = field(default_factory=list)
 
     # How many of each position remain undrafted
@@ -77,6 +79,67 @@ class RecommendationContext:
 
     # Opponent position counts: {slot: {"RB": 2, "WR": 1, ...}}
     opponent_position_counts: dict[int, dict[str, int]] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Retrieval — grounds the prompt in real news/analysis from ChromaDB
+# ---------------------------------------------------------------------------
+
+# Only the most relevant candidates get a retrieval lookup — querying Chroma
+# for all 25 listed players would balloon both latency and prompt size for
+# players near the bottom of the list that are unlikely to be picked anyway.
+_MAX_CONTEXT_PLAYERS = 10
+_MAX_CHUNKS_PER_PLAYER_PER_TYPE = 2
+
+
+def _retrieve_player_context(top_available: list[dict]) -> str:
+    """
+    Pulls "what happened" (Sleeper injury status + RotoWire news) and "what
+    it means" (Claude-synthesized analysis) chunks for the top candidate
+    players out of ChromaDB, so the recommendation is grounded in more than
+    ADP and roster math alone.
+
+    Best-effort and silent on failure: if ChromaDB isn't installed, the
+    collection is empty, or a query errors, this returns "" and the prompt
+    is built without this section — draft day shouldn't stall (or crash)
+    waiting on a vector store, same stance as the Claude API fallback above.
+    """
+    try:
+        from backend.rag.vector_store import query as vector_query
+    except Exception as e:
+        logger.info(f"Vector store unavailable — building prompt without retrieved context: {e}")
+        return ""
+
+    sections: list[str] = []
+    for p in top_available[:_MAX_CONTEXT_PLAYERS]:
+        sleeper_id = p.get("sleeper_id")
+        if not sleeper_id:
+            continue
+
+        player_lines: list[str] = []
+        for chunk_type, label in (("what_happened", "News"), ("what_it_means", "Analysis")):
+            try:
+                results = vector_query(
+                    p["name"],
+                    n_results=_MAX_CHUNKS_PER_PLAYER_PER_TYPE,
+                    where={"$and": [{"sleeper_id": sleeper_id}, {"chunk_type": chunk_type}]},
+                )
+            except Exception as e:
+                logger.warning(f"Vector query failed for {p['name']} ({chunk_type}): {e}")
+                continue
+            player_lines += [f"  [{label}] {r}" for r in results]
+
+        if player_lines:
+            sections.append(f"- {p['name']} ({p['position']}):\n" + "\n".join(player_lines))
+
+    if not sections:
+        return ""
+
+    return "\n".join([
+        "## Player News & Analysis (retrieved)",
+        *sections,
+        "",
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +215,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                 pos_str = ", ".join(f"{pos}: {n}" for pos, n in sorted(pos_counts.items()))
                 lines.append(f"  Slot {slot:>2}: {pos_str}")
         lines.append("")
+
+    # Retrieved player news/analysis (best-effort; omitted if unavailable)
+    retrieved = _retrieve_player_context(ctx.top_available)
+    if retrieved:
+        lines.append(retrieved)
 
     # Output schema
     lines += [
@@ -301,6 +369,31 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
 _PLACEHOLDER_KEYS = {"your_key_here"}
 
 
+def build_anthropic_client(api_key_env: str = "ANTHROPIC_API_KEY") -> anthropic.Anthropic | None:
+    """
+    Reads an API key from the given env var and returns a configured client,
+    or None if the key is unset or still the .env.example placeholder.
+
+    Shared by AIService (live per-pick recommendations) and
+    backend/ingestion/fetch_synthesis.py (batch "what it means" note
+    generation) so the placeholder-key guard — the part actually worth
+    not duplicating — only has to live in one place.
+    """
+    api_key = (os.getenv(api_key_env) or "").strip()
+
+    if api_key in _PLACEHOLDER_KEYS:
+        logger.warning(
+            f"{api_key_env} is still the placeholder value from .env.example — "
+            "treating it as unset."
+        )
+        return None
+    if not api_key:
+        logger.warning(f"{api_key_env} not set.")
+        return None
+
+    return anthropic.Anthropic(api_key=api_key)
+
+
 class AIService:
     """
     Thin wrapper around the Anthropic client.
@@ -308,21 +401,9 @@ class AIService:
     """
 
     def __init__(self) -> None:
-        api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-
-        if api_key in _PLACEHOLDER_KEYS:
-            logger.warning(
-                "ANTHROPIC_API_KEY is still the placeholder value from "
-                ".env.example — treating it as unset. AI recommendations "
-                "will use fallback mode until a real key is set."
-            )
-            api_key = ""
-        elif not api_key:
-            logger.warning(
-                "ANTHROPIC_API_KEY not set — AI recommendations will use fallback mode."
-            )
-
-        self._client = anthropic.Anthropic(api_key=api_key) if api_key else None
+        self._client = build_anthropic_client()
+        if self._client is None:
+            logger.warning("AI recommendations will use fallback mode until a real key is set.")
         self._model = _DEFAULT_MODEL
 
     @property

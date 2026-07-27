@@ -145,6 +145,43 @@ py -m backend.ingestion.sync_sleeper_ids
 
 ---
 
+## Player Analytics & News
+
+Recommendations are grounded in more than ADP — a three-stage pipeline builds a ChromaDB
+layer of real player news and Claude-synthesized analysis, retrieved into the recommendation
+prompt for whichever players are actually under consideration. None of this is required for
+the app to run; every stage degrades gracefully if skipped or if a data source is unavailable.
+
+**1. Compute player metrics** (opportunity/volume, efficiency, team context, consistency &
+risk, forward-looking signals) from `nflreadpy` (nflverse's stats package):
+
+```bash
+py -m backend.ingestion.fetch_metrics            # current season
+py -m backend.ingestion.fetch_metrics --season 2025
+```
+
+**2. Ingest "what happened"** — factual event reporting: Sleeper's `injury_status` field and
+RotoWire's NFL news RSS feed (both explicitly free to reuse this way):
+
+```bash
+py -m backend.ingestion.chunker
+```
+
+**3. Generate "what it means"** — a short Claude-written scouting note per player, synthesized
+only from that player's own computed metrics (never invented stats). Requires
+`ANTHROPIC_API_KEY`; one Claude call per player, so `--limit` is worth using for a smoke test:
+
+```bash
+py -m backend.ingestion.fetch_synthesis --limit 5 --dry-run   # preview a few notes first
+py -m backend.ingestion.fetch_synthesis                       # generate for everyone, write to Chroma
+```
+
+Once populated, `backend/app/services/ai_service.py` automatically retrieves both chunk types
+for the top candidate players on every recommendation — no extra step needed. If ChromaDB is
+empty or unavailable, recommendations just proceed without that section.
+
+---
+
 ## Project Structure
 
 ```
@@ -152,11 +189,12 @@ ai-fantasy-assistant/
 ├── backend/
 │   ├── app/          # FastAPI routes, services, AI layer
 │   ├── db/           # SQLite models and player repo
-│   ├── ingestion/    # CSV → SQLite ingestion, Sleeper ID sync
-│   └── rag/          # ChromaDB layer — exists but not wired into the app yet
+│   ├── ingestion/    # CSV → SQLite ingestion, Sleeper ID sync, metrics/RAG pipeline
+│   └── rag/          # ChromaDB vector store, wired into ai_service.py's recommendation prompt
 ├── data/             # gitignored — created by first-time setup, not cloned
 │   ├── raw/          # Source CSVs (fantasypros_adp.csv)
 │   └── fantasy.db    # SQLite database (auto-created)
+├── chroma_db/        # gitignored — local vector store, created by the analytics/news pipeline
 ├── frontend/         # Next.js draft room UI
 ├── dev.sh            # runs backend + frontend together
 ├── .env              # API keys (not committed)
@@ -175,6 +213,9 @@ and defaults) — nothing requires a code change to adjust, including for deploy
   recommendations fall back to best-available-by-ADP. The startup banner tells you which mode
   you're in.
 - `CLAUDE_MODEL` — override the recommendation model (default: `claude-haiku-4-5-20251001`).
+- `SYNTHESIS_MODEL` — override the model used for batch "what it means" note generation
+  (`fetch_synthesis.py`). Defaults to `CLAUDE_MODEL`; safe to point at a pricier model since
+  it runs offline, not on the clock.
 - `DB_PATH` — SQLite file location (default: `data/fantasy.db`).
 - `CORS_ORIGINS` — comma-separated allowed frontend origins. Defaults to the local dev ports;
   set this to your deployed frontend URL when you go live instead of editing `main.py`.

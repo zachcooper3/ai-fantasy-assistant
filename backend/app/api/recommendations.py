@@ -88,6 +88,7 @@ def _build_context(
             "position": p.position,
             "team": p.team,
             "adp": p.adp,
+            "sleeper_id": p.sleeper_id,
         }
         for p in repo.get_top_available(db, n=top_n)
     ]
