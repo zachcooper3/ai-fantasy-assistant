@@ -181,6 +181,12 @@ def chunk_synthesis_note(player: Player, note: str) -> tuple[str, dict]:
     }
     if player.sleeper_id:
         meta["sleeper_id"] = player.sleeper_id
+        # One current note per player — regenerating should replace the
+        # old note, not pile up a new stale entry each run (Claude's
+        # wording differs slightly every call, so a text-hash ID would
+        # never collide with the previous run's chunk on its own).
+        # See vector_store._chunk_id.
+        meta["dedupe_key"] = f"synthesis:{player.sleeper_id}"
     return note, meta
 
 

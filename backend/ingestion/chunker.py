@@ -177,6 +177,12 @@ def chunk_sleeper_injuries(sleeper_players: dict[str, dict]) -> tuple[list[str],
             "source": "sleeper_injury_status",
             "player_name": name,
             "sleeper_id": sleeper_id,
+            # One current status per player — a later status should
+            # replace this chunk, not accumulate alongside it, and two
+            # different players can render identical text (e.g. same name,
+            # same status, no body part), so text alone can't be the key.
+            # See vector_store._chunk_id.
+            "dedupe_key": f"sleeper_injury:{sleeper_id}",
         })
 
     return chunks, metadatas
