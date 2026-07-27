@@ -180,6 +180,29 @@ Once populated, `backend/app/services/ai_service.py` automatically retrieves bot
 for the top candidate players on every recommendation — no extra step needed. If ChromaDB is
 empty or unavailable, recommendations just proceed without that section.
 
+You can sanity-check what's actually in the collection with:
+
+```bash
+py -m backend.rag.vector_store
+```
+
+This re-ingests "what happened" chunks, then drops you into an interactive prompt. Ask about a
+specific player (e.g. "Is Puka Nacua injured?"), not a ranking ("who's the best WR?") — the
+collection holds narrow factual/analytical snippets, not leaderboards; ADP/SQL handles ranking.
+
+**If you ever change what a chunk-producing function outputs** — a reworded template, a new
+field, a removed source — run this once with `--reset` first:
+
+```bash
+py -m backend.rag.vector_store --reset
+```
+
+Ingestion only ever upserts what it's given; it never deletes chunks an old code path used to
+produce. Without a reset, old- and new-format chunks sit side by side indefinitely and can
+outcompete the current chunks in similarity search (this happened in practice: a pre-rewrite
+collection had 382 leftover chunks in the original ADP-CSV-row format, and generic queries kept
+matching those instead of the real Sleeper/RotoWire content).
+
 ---
 
 ## Project Structure

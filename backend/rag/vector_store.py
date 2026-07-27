@@ -19,16 +19,46 @@ from backend.rag.embedder import embedding_fn
 
 logger = logging.getLogger(__name__)
 
+_COLLECTION_NAME = "nfl_collection"
+_CHROMA_PATH = "./chroma_db"
+
 _collection = None
 
 def get_collection():
     global _collection
     if _collection is None:
-        client = chromadb.PersistentClient(path="./chroma_db")
+        client = chromadb.PersistentClient(path=_CHROMA_PATH)
         _collection = client.get_or_create_collection(
-            name="nfl_collection",
+            name=_COLLECTION_NAME,
             embedding_function=embedding_fn)
     return _collection
+
+
+def reset_collection() -> None:
+    """
+    Deletes and recreates the Chroma collection from scratch.
+
+    add_chunks() only ever upserts what it's given — a source that used to
+    produce chunks but no longer does (or produces them in a different
+    shape) never gets cleaned up on its own, so old chunks just sit there
+    forever, polluting every query alongside the current ones. Confirmed
+    live: a collection that predated this session's chunker.py rewrite
+    still had 382 chunks in the old "Player | ADP: X | Position: Y | Team:
+    Z" format mixed in with the new Sleeper/RotoWire chunks, and generic
+    queries were matching the stale ones more often than the real content.
+
+    Call this once after any change to what a chunk-producing function
+    outputs (a new field, a reworded template, a removed source) — routine
+    re-ingestion of the *same* schema doesn't need it, since add_chunks'
+    dedupe_key-based upserts already handle that correctly.
+    """
+    global _collection
+    client = chromadb.PersistentClient(path=_CHROMA_PATH)
+    try:
+        client.delete_collection(name=_COLLECTION_NAME)
+    except Exception:
+        pass  # collection didn't exist yet -- nothing to reset
+    _collection = None
 
 def _chunk_id(chunk: str, meta: dict | None) -> str:
     """
@@ -118,15 +148,39 @@ def query(question: str, n_results: int = 5, where: dict | None = None) -> list[
     return results["documents"][0]
 
 def main():
+    import argparse
+
     from backend.ingestion.chunker import build_what_happened_chunks
+
+    parser = argparse.ArgumentParser(
+        description="Ingest 'what happened' chunks and interactively query the ChromaDB collection."
+    )
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Wipe the collection before re-ingesting. Use this once after changing "
+             "what a chunk-producing function outputs, so old-format chunks don't "
+             "linger and pollute query results (see reset_collection's docstring).",
+    )
+    args = parser.parse_args()
+
+    if args.reset:
+        reset_collection()
+        print("Collection reset.")
 
     chunks, metadatas = build_what_happened_chunks()
     add_chunks(chunks, metadatas)
     print(f"Added {len(chunks)} chunks to the collection")
+    print(
+        "\nNote: this collection holds factual 'what happened' snippets (and, once "
+        "you've run fetch_synthesis.py, short 'what it means' notes) — not player "
+        "rankings. It's built to be queried per-player (e.g. 'Is Bijan Robinson "
+        "injured?'), not as a general leaderboard ('who's the best WR?'). Ranking "
+        "questions are answered by ADP/SQL in the live app, not retrieval."
+    )
 
     # Test a query
     while True:
-        user_entry = input("Enter a question about the NFL: ")
+        user_entry = input("\nEnter a question about the NFL: ")
         if user_entry.strip() == "":
             break
 
