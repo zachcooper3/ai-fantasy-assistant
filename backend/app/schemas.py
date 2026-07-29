@@ -40,11 +40,27 @@ class ScarcityResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class DraftConfigRequest(BaseModel):
-    """Request body for POST /api/draft/session."""
+    """Request body for POST /api/draft/session.
+
+    The roster-slot fields (qb_slots through dst_slots) default to a
+    standard 1-QB PPR lineup — the same assumption the app made implicitly
+    (hardcoded, unconfigurable) before this field existed. Leaving them
+    unset preserves that exact prior behavior; only someone who deliberately
+    overrides one changes anything. No support for a position satisfying
+    more than one slot type (e.g. superflex QB-as-FLEX) — not needed today,
+    and would meaningfully complicate ai_service.py's gap/FLEX-surplus math
+    if added later.
+    """
     league_size: int = Field(default=12, ge=8, le=16)
     my_draft_position: int = Field(default=1, ge=1, le=16)
     total_rounds: int = Field(default=15, ge=10, le=20)
     scoring_format: str = Field(default="ppr")
+    qb_slots: int = Field(default=1, ge=0, le=4)
+    rb_slots: int = Field(default=2, ge=0, le=6)
+    wr_slots: int = Field(default=2, ge=0, le=6)
+    te_slots: int = Field(default=1, ge=0, le=4)
+    flex_slots: int = Field(default=1, ge=0, le=4)
+    dst_slots: int = Field(default=1, ge=0, le=2)
 
 
 class PickRequest(BaseModel):

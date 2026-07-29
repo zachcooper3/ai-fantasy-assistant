@@ -121,6 +121,7 @@ def _build_context(
         top_available=top_available,
         available_counts=repo.count_available_by_position(db),
         opponent_position_counts=opponent_position_counts,
+        starting_lineup=svc.config.starting_lineup,
     )
 
 

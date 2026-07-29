@@ -22,11 +22,36 @@ from dataclasses import dataclass, field
 
 @dataclass
 class DraftConfig:
-    """Immutable settings for a draft session."""
+    """Immutable settings for a draft session.
+
+    The roster-slot fields default to a standard 1-QB PPR lineup — the same
+    assumption ai_service.py made implicitly (hardcoded, unconfigurable)
+    before these fields existed. See RecommendationContext.starting_lineup
+    for where this feeds into pick recommendations.
+    """
     league_size: int = 12
     my_draft_position: int = 1    # 1-indexed slot (1 = first overall pick)
     total_rounds: int = 15
     scoring_format: str = "ppr"
+    qb_slots: int = 1
+    rb_slots: int = 2
+    wr_slots: int = 2
+    te_slots: int = 1
+    flex_slots: int = 1
+    dst_slots: int = 1
+
+    @property
+    def starting_lineup(self) -> dict[str, int]:
+        """Roster-slot config as a {position: required_count} dict, in the
+        shape ai_service.py's gap-computation logic expects."""
+        return {
+            "QB": self.qb_slots,
+            "RB": self.rb_slots,
+            "WR": self.wr_slots,
+            "TE": self.te_slots,
+            "FLEX": self.flex_slots,
+            "DST": self.dst_slots,
+        }
 
 
 @dataclass

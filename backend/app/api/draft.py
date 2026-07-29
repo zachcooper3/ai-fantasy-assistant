@@ -102,6 +102,12 @@ async def start_session(
         my_draft_position=body.my_draft_position,
         total_rounds=body.total_rounds,
         scoring_format=body.scoring_format,
+        qb_slots=body.qb_slots,
+        rb_slots=body.rb_slots,
+        wr_slots=body.wr_slots,
+        te_slots=body.te_slots,
+        flex_slots=body.flex_slots,
+        dst_slots=body.dst_slots,
     )
     svc.start_session(config)
     repo.reset_draft_availability(db)

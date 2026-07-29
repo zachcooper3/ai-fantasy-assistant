@@ -81,16 +81,28 @@ class RecommendationContext:
     # Opponent position counts: {slot: {"RB": 2, "WR": 1, ...}}
     opponent_position_counts: dict[int, dict[str, int]] = field(default_factory=dict)
 
+    # Required starting-lineup slot counts, e.g. {"QB": 1, "RB": 2, "WR": 2,
+    # "TE": 1, "FLEX": 1, "DST": 1}. Defaults to the standard 1-QB PPR shape
+    # (matches DraftConfig's own defaults) so any caller that doesn't set
+    # this explicitly — including _build_preview_context below and any
+    # older test fixtures — gets identical behavior to before this field
+    # existed. The real app always sets this from DraftConfig.starting_lineup
+    # (see backend/app/api/recommendations.py::_build_context).
+    starting_lineup: dict[str, int] = field(default_factory=lambda: dict(_STANDARD_STARTING_LINEUP))
+
 
 # ---------------------------------------------------------------------------
 # Starting lineup gaps — gives Claude a concrete target, not just "consider
 # roster needs"
 # ---------------------------------------------------------------------------
 
-# Standard PPR starting lineup for a 12-team, 15-round league (this app's
-# defaults — see DraftConfig). There's no per-league roster-construction
-# config anywhere in this app yet, so this is a reasonable fixed assumption
-# rather than something read from user settings.
+# Standard 1-QB PPR starting lineup — matches DraftConfig's own field
+# defaults. Now just a fallback: real requests read the configured lineup
+# from DraftConfig.starting_lineup (settable per-session via qb_slots /
+# rb_slots / etc. on POST /api/draft/session) and pass it into
+# _compute_roster_gaps explicitly. This constant only kicks in for callers
+# that don't pass a lineup — RecommendationContext.starting_lineup's own
+# default, and any pre-existing test fixture that predates this option.
 #
 # This exists because a real gap was found live: the AI never once
 # recommended a QB across a full draft. Root cause wasn't a bad prompt
@@ -106,14 +118,21 @@ _FLEX_ELIGIBLE_POSITIONS = {"RB", "WR", "TE"}
 
 def _compute_roster_gaps(
     my_roster: list[dict],
-    lineup: dict[str, int] = _STANDARD_STARTING_LINEUP,
+    lineup: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """
     Returns {position: still_needed} for every starting slot not yet filled,
     treating extra RB/WR/TE beyond their required minimums as satisfying the
     FLEX slot. Positions already fully covered are omitted entirely (empty
     dict = a complete starting lineup).
+
+    lineup defaults to the standard 1-QB PPR shape when not given (e.g. from
+    callers/tests that predate DraftConfig.starting_lineup); the live app
+    always passes ctx.starting_lineup explicitly.
     """
+    if lineup is None:
+        lineup = _STANDARD_STARTING_LINEUP
+
     have: dict[str, int] = {}
     for p in my_roster:
         have[p["position"]] = have.get(p["position"], 0) + 1
@@ -305,12 +324,20 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # _compute_roster_gaps' docstring for why this exists: without it,
     # nothing told Claude it still needed a starting QB, and it never
     # once got recommended across a full draft as a result)
-    gaps = _compute_roster_gaps(ctx.my_roster)
+    gaps = _compute_roster_gaps(ctx.my_roster, ctx.starting_lineup)
     rounds_remaining = max(0, ctx.total_rounds - ctx.round_number)
     lineup_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(gaps.items()))
+    # Built from ctx.starting_lineup (not hardcoded) so this line reflects
+    # this league's actual configured roster, e.g. via /api/draft/session.
+    _slot_order = ["QB", "RB", "WR", "TE", "FLEX", "DST"]
+    required_str = ", ".join(
+        f"{ctx.starting_lineup[pos]} {pos}"
+        for pos in _slot_order
+        if ctx.starting_lineup.get(pos, 0) > 0
+    )
     if gaps:
         gap_total = sum(gaps.values())
-        lines.append("## Starting Lineup Status (standard: 1 QB, 2 RB, 2 WR, 1 TE, 1 FLEX, 1 DST)")
+        lines.append(f"## Starting Lineup Status (required: {required_str})")
         lines.append(f"Still need to fill: {lineup_str}")
         if gap_total >= rounds_remaining and rounds_remaining > 0:
             lines.append(
@@ -320,7 +347,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             )
         lines.append("")
     else:
-        lines += ["## Starting Lineup Status", "All standard starting slots filled.", ""]
+        lines += [
+            f"## Starting Lineup Status (required: {required_str})",
+            "All required starting slots filled.",
+            "",
+        ]
 
     # Top available players (cap at 25 to keep prompt tight)
     lines.append("## Top Available Players (by ADP)")
