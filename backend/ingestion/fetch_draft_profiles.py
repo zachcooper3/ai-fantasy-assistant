@@ -86,6 +86,13 @@ _GENERATIONAL_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
 def _normalise(name: str) -> str:
     name = name.lower()
+    # Hyphens are treated as word separators, not deleted outright — found
+    # via a live 2026-07-29 run where "Jacory Croskey-Merritt" failed to
+    # match CFBD's college stats because deleting the hyphen collapsed it
+    # to "croskeymerritt", a single token that can't match whatever
+    # spelling (hyphen or space) the other data source used for the same
+    # compound surname.
+    name = name.replace("-", " ")
     name = re.sub(r"[^\w\s]", "", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name

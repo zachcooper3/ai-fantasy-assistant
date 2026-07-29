@@ -73,6 +73,27 @@ _STAT_FIELDS: list[tuple[str, str, tuple[str, ...]]] = [
     ("receptions", "receiving", ("REC", "rec", "receptions")),
 ]
 
+# Common first-name nickname/formal pairs. Added after a live 2026-07-29
+# run where "Cam Ward", "Cam Skattebo", "Woody Marks", and "Mike
+# Washington Jr." all failed to match despite being real, well-documented
+# college seasons — nflreadpy's draft_picks matched all of these against
+# our own Player.name just fine (see fetch_draft_profiles.py), so the
+# nickname/formal split is specifically a CFBD-vs-everyone-else thing, not
+# an error on our side. NOT verified against a raw CFBD row (network-
+# restricted dev sandbox — see module docstring): this is a best-effort
+# fallback to retry with, not a confirmed mapping. If match counts don't
+# improve after this, the real explanation is something else and this
+# table isn't it.
+_NICKNAME_TO_FORMAL = {
+    "cam": "cameron", "mike": "michael", "woody": "woodrow",
+    "zach": "zachary", "alex": "alexander", "chris": "christopher",
+    "nick": "nicholas", "matt": "matthew", "will": "william",
+    "sam": "samuel", "tony": "anthony", "rob": "robert",
+    "dan": "daniel", "joe": "joseph", "ben": "benjamin",
+    "nate": "nathaniel", "josh": "joshua", "jake": "jacob",
+}
+_FORMAL_TO_NICKNAME = {formal: nick for nick, formal in _NICKNAME_TO_FORMAL.items()}
+
 
 # ---------------------------------------------------------------------------
 # Fetch + pivot
@@ -124,6 +145,39 @@ def _fetch_season(season: int) -> dict[str, dict[str, dict[str, float]]]:
     return by_player
 
 
+def _name_candidates(name: str) -> list[str]:
+    """All normalised forms worth trying for one player name against
+    by_player: the name as given, its suffix-stripped form, and — for
+    either — a first-name nickname/formal swap (see _NICKNAME_TO_FORMAL).
+    First hit wins at the call site; order here doesn't imply preference."""
+    bases = [_normalise(name)]
+    stripped = _strip_suffix(bases[0])
+    if stripped is not None:
+        bases.append(stripped)
+
+    candidates = list(bases)
+    for base in bases:
+        parts = base.split()
+        if not parts:
+            continue
+        first = parts[0]
+        swapped = _NICKNAME_TO_FORMAL.get(first) or _FORMAL_TO_NICKNAME.get(first)
+        if swapped:
+            candidates.append(" ".join([swapped, *parts[1:]]))
+    return candidates
+
+
+def _lookup_player_stats(
+    by_player: dict[str, dict[str, dict[str, float]]], player_name: str
+) -> dict[str, dict[str, float]] | None:
+    """Tries every name candidate (see _name_candidates) against one
+    season's pivoted CFBD data, returning the first hit."""
+    for candidate in _name_candidates(player_name):
+        if candidate in by_player:
+            return by_player[candidate]
+    return None
+
+
 def _extract_fields(player_stats: dict[str, dict[str, float]]) -> dict[str, int]:
     """Pulls the named DraftProfile fields out of one player's pivoted
     category/stat_type data, trying each candidate spelling in turn."""
@@ -173,12 +227,7 @@ def refresh_college_stats(sleeper_id: str | None = None) -> tuple[int, int]:
             season = draft_profile.draft_year - 1
             by_player = season_data.get(season, {})
 
-            # Same suffix ambiguity as fetch_draft_profiles.py's own
-            # matching: CFBD names, like nflverse's, typically omit
-            # generational suffixes our own Player.name keeps.
-            normalised = _normalise(player.name)
-            stripped = _strip_suffix(normalised)
-            player_stats = by_player.get(normalised) or (by_player.get(stripped) if stripped else None)
+            player_stats = _lookup_player_stats(by_player, player.name)
 
             if player_stats is None:
                 unmatched += 1
@@ -241,9 +290,7 @@ def main() -> None:
             for draft_profile, player in rows:
                 season = draft_profile.draft_year - 1
                 by_player = season_data.get(season, {})
-                normalised = _normalise(player.name)
-                stripped = _strip_suffix(normalised)
-                player_stats = by_player.get(normalised) or (by_player.get(stripped) if stripped else None)
+                player_stats = _lookup_player_stats(by_player, player.name)
                 fields = _extract_fields(player_stats) if player_stats else {}
                 status = fields if fields else "NO MATCH / NO USABLE STATS"
                 print(f"{player.name} ({player.position}, college season {season}) -> {status}")
