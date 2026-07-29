@@ -745,9 +745,19 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
     if not rec or not isinstance(rec, dict):
         return None
 
-    # Validate that the recommended player is actually in our available list
+    # Validate that the recommended player is actually in our available list.
+    # Coerce before comparing — Claude occasionally returns player_id as a
+    # JSON string ("3" instead of 3), and rejecting that to the ADP fallback
+    # would throw away an otherwise-valid recommendation over a type quirk.
     available_ids = {p["id"] for p in ctx.top_available}
-    if rec.get("player_id") not in available_ids:
+
+    def _as_id(value) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    if _as_id(rec.get("player_id")) not in available_ids:
         logger.warning("Claude recommended unavailable player id=%s", rec.get("player_id"))
         return None
 
@@ -769,7 +779,8 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
 
     alternatives = [
         s for d in data.get("alternatives", [])[:3]
-        if (s := _pick(d)) is not None
+        if isinstance(d, dict)
+        and (s := _pick(d)) is not None
         and s.player_id in available_ids
     ]
 
