@@ -41,6 +41,7 @@ export interface DraftHook {
     dst_slots?: number;
     sleeper_draft_id?: string;
   }) => Promise<void>;
+  endSession: () => Promise<void>;
   recordPick: (playerId: number) => Promise<void>;
   undoPick: () => Promise<void>;
   fetchRecommendation: () => Promise<void>;
@@ -181,6 +182,21 @@ export function useDraft(): DraftHook {
     [refreshBoard]
   );
 
+  const endSession = useCallback(async () => {
+    try {
+      await api.endSession();
+      // The backend broadcasts a "reset" event that clears this state via
+      // the WebSocket handler too — clearing locally as well makes the
+      // setup modal appear immediately even if the socket is mid-reconnect.
+      setSession(null);
+      setBoard(null);
+      setRecommendation(null);
+      setSyncStatus(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to end session");
+    }
+  }, []);
+
   // ------------------------------------------------------------------
   // Picks
   // ------------------------------------------------------------------
@@ -229,6 +245,7 @@ export function useDraft(): DraftHook {
     isLoadingRec,
     error,
     startSession,
+    endSession,
     recordPick,
     undoPick,
     fetchRecommendation,

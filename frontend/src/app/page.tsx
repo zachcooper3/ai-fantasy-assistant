@@ -6,7 +6,7 @@
  * Layout (mobile):   Tab-based: Board / Room / AI
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { LayoutGrid, Users, Lightbulb } from "lucide-react";
 
 import { useDraft } from "@/hooks/useDraft";
@@ -28,6 +28,7 @@ export default function DraftPage() {
     isLoadingRec,
     error,
     startSession,
+    endSession,
     recordPick,
     undoPick,
     fetchRecommendation,
@@ -35,6 +36,16 @@ export default function DraftPage() {
   } = useDraft();
 
   const [mobileTab, setMobileTab] = useState<MobileTab>("board");
+
+  // "Draft Complete!" overlay dismissal — lets you get back to the board
+  // to review picks after the draft. Re-arms whenever the session is no
+  // longer complete (i.e. a new draft started), so the next completion
+  // shows the overlay again.
+  const [completeDismissed, setCompleteDismissed] = useState(false);
+  const draftComplete = session?.draft_complete ?? false;
+  useEffect(() => {
+    if (!draftComplete) setCompleteDismissed(false);
+  }, [draftComplete]);
 
   // Show setup modal until a session is active
   if (!session?.is_active) {
@@ -144,9 +155,9 @@ export default function DraftPage() {
       </nav>
 
       {/* Draft complete banner */}
-      {session.draft_complete && (
+      {session.draft_complete && !completeDismissed && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-10 text-center max-w-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-10 text-center max-w-sm max-h-[85vh] overflow-y-auto">
             <div className="text-4xl mb-4">🏈</div>
             <h2 className="text-2xl font-bold text-white mb-2">Draft Complete!</h2>
             <p className="text-slate-400 mb-6">
@@ -160,6 +171,20 @@ export default function DraftPage() {
                   <span className="text-slate-500">{p.position}</span>
                 </div>
               ))}
+            </div>
+            <div className="flex flex-col gap-2 mt-8">
+              <button
+                onClick={endSession}
+                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-bold text-sm transition-colors"
+              >
+                Start New Draft
+              </button>
+              <button
+                onClick={() => setCompleteDismissed(true)}
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-sm transition-colors"
+              >
+                Review Board
+              </button>
             </div>
           </div>
         </div>
