@@ -267,6 +267,28 @@ async def auto_refresh(year: int = CURRENT_YEAR, teams: int = 12) -> None:
                 file=sys.stderr,
             )
 
+        # The same reingest above also reassigns every Player.id (delete +
+        # reinsert), which silently invalidates PlayerMetrics.player_id —
+        # confirmed live to misattribute one player's computed stats to a
+        # different one. Repair it the same way sleeper_id is repaired
+        # above: immediately, every time, rather than trusting someone to
+        # remember. See metrics_repo.relink_player_ids' docstring.
+        try:
+            from backend.db import metrics_repo
+            from backend.db.database import engine
+            from sqlmodel import Session
+            with Session(engine) as session:
+                relinked, orphaned = metrics_repo.relink_player_ids(session)
+            print(f"PlayerMetrics relink complete: {relinked} relinked, {orphaned} orphaned.")
+        except Exception as e:
+            print(
+                f"[WARN] PlayerMetrics relink failed after ADP refresh: {e}. "
+                "Existing metrics rows may now point at the wrong player until "
+                "this is re-run — treat AI-generated analysis as unverified "
+                "until it succeeds.",
+                file=sys.stderr,
+            )
+
     except httpx.HTTPStatusError as e:
         print(
             f"[WARN] ADP auto-refresh skipped: HTTP {e.response.status_code} "
@@ -330,6 +352,14 @@ def main() -> None:
         from backend.ingestion.sync_sleeper_ids import sync_sleeper_ids
         matched, unmatched = asyncio.run(sync_sleeper_ids())
         print(f"Done. {matched} matched, {unmatched} unmatched.")
+
+        print("Relinking PlayerMetrics to the reassigned Player IDs ...")
+        from backend.db import metrics_repo
+        from backend.db.database import engine
+        from sqlmodel import Session
+        with Session(engine) as session:
+            relinked, orphaned = metrics_repo.relink_player_ids(session)
+        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
 
     except httpx.HTTPStatusError as e:
         print(f"\nHTTP error: {e.response.status_code} {e.request.url}", file=sys.stderr)

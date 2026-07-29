@@ -55,11 +55,21 @@ SYNTHESIS_MODEL = os.getenv("SYNTHESIS_MODEL", os.getenv("CLAUDE_MODEL", "claude
 _SYSTEM_PROMPT = (
     "You are an expert NFL fantasy football analyst. You will be given one "
     "player's computed statistical profile (opportunity/volume, efficiency, "
-    "team context, consistency/risk, and forward-looking signals). "
+    "team context, consistency/risk, and forward-looking signals) — and "
+    "NOTHING else. You do not have outside knowledge about this player's "
+    "draft history, experience level (rookie, veteran, etc.), coaching "
+    "staff, or team situation beyond what's in this data block, and must "
+    "not state or imply any such fact unless it's explicitly present in the "
+    "data given to you — for example, never call a player a 'rookie' or "
+    "'veteran' unless a field literally says so. "
     "Write a concise 2-4 sentence scouting note synthesizing what this data "
     "means for a fantasy manager evaluating this player. "
     "Reference specific numbers you're given where useful. Do not invent "
-    "stats, injuries, or narratives that aren't in the data provided. "
+    "stats, injuries, or narratives that aren't in the data provided, and "
+    "do not attach a qualitative label (e.g. 'run-heavy', 'pass-heavy', "
+    "'high-powered') to a number unless that label is clearly and "
+    "unambiguously the correct read of it — when in doubt, state the number "
+    "plainly instead of characterizing it. "
     "If a category has no data, simply don't mention it — never guess or pad. "
     "Respond with plain text only: no markdown, no headers, no bullet points."
 )
@@ -201,6 +211,13 @@ def build_what_it_means_chunks(
     ready for vector_store.add_chunks(). Returns ([], []) — not an
     exception — if no Anthropic key is configured, matching the project's
     established "draft day shouldn't crash over a missing feature" stance.
+
+    Joins Player to PlayerMetrics via sleeper_id, not the player_id FK.
+    player_id can go stale the moment a Player reingest reassigns
+    autoincrement IDs (see metrics_repo.py's module docstring for the full
+    story — this is exactly the join that silently mismatched two players'
+    stats in practice). sleeper_id is re-resolved by name on every reingest,
+    so it's the one identity guaranteed to still point at the right person.
     """
     client = build_anthropic_client()
     if client is None:
@@ -210,7 +227,7 @@ def build_what_it_means_chunks(
         return [], []
 
     with Session(engine) as session:
-        query = select(Player, PlayerMetrics).where(PlayerMetrics.player_id == Player.id)
+        query = select(Player, PlayerMetrics).where(PlayerMetrics.sleeper_id == Player.sleeper_id)
         if sleeper_id:
             query = query.where(Player.sleeper_id == sleeper_id)
         rows = session.exec(query).all()

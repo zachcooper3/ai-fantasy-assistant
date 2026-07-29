@@ -112,6 +112,45 @@ def _num(row: dict, *candidates: str, default: float = 0.0) -> float:
         return default
 
 
+def _filter_regular_season(rows: list[dict]) -> list[dict]:
+    """
+    Keeps only regular-season rows, dropping preseason/postseason.
+
+    nflreadpy's week-level loaders (load_player_stats, load_snap_counts,
+    load_team_stats, load_pbp) return every season_type mixed together in
+    one table when called at week granularity — nothing filters this for
+    you. Every "season stats" figure this module computes (yards per
+    target, target share, fantasy points per game, etc.) is a sum or
+    average across whatever rows it's handed, so postseason games quietly
+    inflate/deflate those numbers relative to the regular-season-only
+    figures sites like ESPN report by default.
+
+    Confirmed live: a user found Jahmyr Gibbs's computed yards_per_target
+    (7.96) didn't match ESPN's regular-season figure (6.55). Root cause was
+    exactly this — his team made the playoffs, and those extra games got
+    summed into the same season totals with no way to separate them back
+    out after the fact.
+
+    "REG" is nflverse's standard season_type value; matched
+    case-insensitively since it's not worth breaking over capitalization.
+    Rows missing season_type entirely are kept rather than dropped — an
+    unrecognized/absent column is a "can't tell" situation, and silently
+    discarding otherwise-valid data on a defensive assumption would just
+    trade one kind of wrong number for another.
+
+    Deliberately NOT applied to injuries or depth charts (see
+    refresh_metrics) — a playoff injury is real, relevant risk signal for
+    next season, and depth-chart movement isn't a summed ratio that
+    "regular season only" convention applies to in the same way.
+    """
+    filtered = []
+    for row in rows:
+        season_type = _first(row, "season_type")
+        if season_type is None or str(season_type).strip().upper() == "REG":
+            filtered.append(row)
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Data loading — isolated so a failure in one source doesn't kill the rest
 # ---------------------------------------------------------------------------
@@ -348,13 +387,15 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
 
     try:
         stats_rows = _load_dicts("load_player_stats", seasons=season, summary_level="week")
+        stats_rows = _filter_regular_season(stats_rows)
         stats_by_player = _group_by_player(stats_rows, ("player_id", "gsis_id"))
-        logger.info(f"player_stats: {len(stats_rows):,} rows, {len(stats_by_player):,} players")
+        logger.info(f"player_stats: {len(stats_rows):,} regular-season rows, {len(stats_by_player):,} players")
     except Exception as e:
         logger.warning(f"Could not load player_stats — opportunity/efficiency/consistency metrics will be skipped: {e}")
 
     try:
         snap_rows = _load_dicts("load_snap_counts", seasons=season)
+        snap_rows = _filter_regular_season(snap_rows)
         snaps_by_player = _group_by_player(snap_rows, ("gsis_id", "player_id", "pfr_player_id"))
     except Exception as e:
         logger.warning(f"Could not load snap_counts — snap_pct will be unavailable: {e}")
@@ -373,6 +414,7 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
 
     try:
         team_rows = _load_dicts("load_team_stats", seasons=season, summary_level="week")
+        team_rows = _filter_regular_season(team_rows)
         pass_by_team: dict[str, list[float]] = defaultdict(list)
         for row in team_rows:
             team = _first(row, "team")
@@ -388,6 +430,7 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
     if include_redzone:
         try:
             pbp_rows = _load_dicts("load_pbp", seasons=season)
+            pbp_rows = _filter_regular_season(pbp_rows)
             redzone_by_player = _compute_red_zone_touches(pbp_rows)
             logger.info(f"Red zone touches computed for {len(redzone_by_player):,} players")
         except Exception as e:
@@ -443,7 +486,7 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                 except (TypeError, ValueError):
                     pass
 
-            metrics_repo.upsert_metrics(session, player_id=player.id, **fields)
+            metrics_repo.upsert_metrics(session, player_id=player.id, sleeper_id=sleeper_id, **fields)
             updated += 1
 
     logger.info(f"PlayerMetrics refresh complete: {updated} players updated.")

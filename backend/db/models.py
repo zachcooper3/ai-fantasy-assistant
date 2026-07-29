@@ -63,10 +63,27 @@ class PlayerMetrics(SQLModel, table=True):
     Five categories, per the project's original scope:
       Opportunity/Volume, Efficiency, Team Context, Consistency & Risk,
       Forward-looking/Prospect Signals.
+
+    player_id is NOT a stable cross-refresh identity, despite being a FK —
+    ingest_players.ingest_csv() does a full delete-and-reinsert of Player on
+    every ADP refresh, so autoincrement IDs get reassigned in whatever order
+    that CSV happens to list players *this time*. Two players close in ADP
+    (confirmed live: Jahmyr Gibbs and Bijan Robinson, ADP 1.7 vs 1.9) can
+    have their relative CSV order flip between two pulls, which flips which
+    one gets the lower ID — silently reattaching this row's stats to a
+    DIFFERENT real player after the next reingest, no error, no crash.
+    sleeper_id doesn't have this problem (sync_sleeper_ids.py re-resolves it
+    by name-matching on every refresh, so it always points at the same real
+    person) — that's why it's stored here too and why fetch_synthesis.py
+    joins on it instead of player_id. player_id is kept in sync by
+    metrics_repo.relink_player_ids(), called right after every Player
+    reingest, but treat sleeper_id as the source of truth if the two ever
+    disagree.
     """
 
     id: Optional[int] = Field(default=None, primary_key=True)
     player_id: int = Field(foreign_key="player.id", index=True, unique=True)
+    sleeper_id: Optional[str] = Field(default=None, index=True)
 
     season: int = Field(index=True)
     through_week: int          # last week of data included in this snapshot

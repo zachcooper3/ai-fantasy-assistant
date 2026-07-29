@@ -74,7 +74,8 @@ you don't have to guess or dig through logs.
 ./dev.sh
 ```
 
-Runs backend and frontend together in one terminal; `Ctrl+C` stops both.
+Runs backend and frontend together in one terminal; `Ctrl+C` stops both. Backend runs without
+auto-reload by default — see the note below before adding `--reload` back.
 
 ### Or, two terminals (useful if you want backend/frontend logs kept separate)
 
@@ -82,11 +83,21 @@ Runs backend and frontend together in one terminal; `Ctrl+C` stops both.
 
 ```bash
 venv/Scripts/activate
-uvicorn backend.app.main:app --reload
+uvicorn backend.app.main:app
 ```
 
 API runs at `http://localhost:8000`
 Interactive API docs at `http://localhost:8000/docs`
+
+**A note on `--reload`:** both commands above intentionally omit it. On Windows, `--reload` runs
+the app inside a child process spawned by uvicorn's reload supervisor — and the first real
+ChromaDB query (your first "Get pick" of a session) makes ChromaDB's embedding backend try to
+spawn its own worker process, a grandchild attaching across two layers of process supervision.
+Confirmed live: this crashed with a Windows multiprocessing `WinError 87` right after a
+recommendation. Since this app's real purpose is running live *during* a draft — not being
+edited while a draft is in progress — `--reload`'s only value is while actively developing.
+Add it back for that (`./dev.sh` via `DEV_RELOAD=1 ./dev.sh`, or `uvicorn backend.app.main:app
+--reload` directly) and drop it again once you're just running the app.
 
 **Terminal 2 — Frontend**
 
@@ -138,10 +149,16 @@ If you have a FantasyPros CSV you'd prefer to use instead, drop it into `data/ra
 ```bash
 py -m backend.ingestion.ingest_players
 py -m backend.ingestion.sync_sleeper_ids
+py -m backend.db.metrics_repo
 ```
 
-(Two steps here, not one — `ingest_players` alone doesn't know to re-sync Sleeper IDs the way
-`fetch_adp` does, since it's also used standalone for CSVs that have nothing to do with Sleeper.)
+(Three steps here, not one — `ingest_players` alone doesn't know to re-sync Sleeper IDs or
+relink PlayerMetrics the way `fetch_adp` does, since it's also used standalone for CSVs that
+have nothing to do with Sleeper. The third step only matters if you've already run
+`fetch_metrics`/`fetch_synthesis` — skip it on a fresh setup with no metrics yet. Don't skip it
+on a repeat run, though: `ingest_players` reassigns every player's internal ID on each reload,
+which silently detaches any existing PlayerMetrics rows from the right player until this step
+re-links them.)
 
 ---
 
@@ -242,3 +259,5 @@ and defaults) — nothing requires a code change to adjust, including for deploy
 - `DB_PATH` — SQLite file location (default: `data/fantasy.db`).
 - `CORS_ORIGINS` — comma-separated allowed frontend origins. Defaults to the local dev ports;
   set this to your deployed frontend URL when you go live instead of editing `main.py`.
+- `DEV_RELOAD` — set to `1` to have `./dev.sh` pass `--reload` to uvicorn (auto-restart on code
+  changes). Off by default — see the `--reload` note under "Running the App" for why.

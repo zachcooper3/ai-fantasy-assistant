@@ -133,8 +133,18 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
             sections.append(f"- {p['name']} ({p['position']}):\n" + "\n".join(player_lines))
 
     if not sections:
+        logger.info(
+            "Retrieved 0 player news/analysis chunks for this recommendation "
+            "(checked %d candidate(s) with a sleeper_id) — prompt built without that section.",
+            sum(1 for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")),
+        )
         return ""
 
+    logger.info(
+        "Retrieved player news/analysis for %d/%d candidate player(s) — included in prompt.",
+        len(sections),
+        sum(1 for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")),
+    )
     return "\n".join([
         "## Player News & Analysis (retrieved)",
         *sections,
@@ -444,3 +454,69 @@ class AIService:
         except anthropic.APIError as e:
             logger.error("Anthropic API error: %s", e)
             return _fallback(ctx, self._model)
+
+
+# ---------------------------------------------------------------------------
+# CLI — preview the exact prompt Claude would receive, without calling Claude
+# ---------------------------------------------------------------------------
+
+def _build_preview_context(top_n: int = 10) -> RecommendationContext:
+    """
+    Builds a RecommendationContext straight from the DB's top-available
+    players — no live draft session needed. Only for main() below; the real
+    app builds its context from actual draft state
+    (backend/app/api/recommendations.py::_build_context).
+    """
+    from sqlmodel import Session
+
+    from backend.db import player_repo as repo
+    from backend.db.database import engine
+
+    with Session(engine) as session:
+        top_available = [
+            {
+                "id": p.id, "rank": p.rank, "name": p.name, "position": p.position,
+                "team": p.team, "adp": p.adp, "sleeper_id": p.sleeper_id,
+            }
+            for p in repo.get_top_available(session, n=top_n)
+        ]
+        available_counts = repo.count_available_by_position(session)
+
+    return RecommendationContext(
+        pick_number=1, round_number=1, my_slot=1, league_size=12,
+        is_my_turn=True, picks_until_my_turn=0, my_next_pick_number=1,
+        top_available=top_available,
+        available_counts=available_counts,
+    )
+
+
+def main() -> None:
+    """
+    Prints the exact prompt a recommendation would send to Claude — including
+    the "## Player News & Analysis (retrieved)" section, if ChromaDB has
+    anything for the top candidates — WITHOUT calling the API. Zero cost;
+    the fastest way to confirm retrieval is actually reaching the prompt
+    before spending on a real recommendation.
+
+    Run manually:
+        py -m backend.app.services.ai_service
+    """
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    ctx = _build_preview_context()
+    prompt = _build_prompt(ctx)
+
+    print(prompt)
+    print("\n" + "=" * 70)
+    if "## Player News & Analysis (retrieved)" in prompt:
+        print("Confirmed: retrieved News/Analysis section IS present above.")
+    else:
+        print(
+            "No News/Analysis section in this prompt — either none of the top "
+            "candidates have a ChromaDB entry, or the vector store is unavailable "
+            "(check the INFO/WARNING log lines above for which)."
+        )
+
+
+if __name__ == "__main__":
+    main()
