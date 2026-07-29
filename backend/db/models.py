@@ -123,3 +123,39 @@ class PlayerMetrics(SQLModel, table=True):
     # --- Metadata ---
     source: str = Field(default="nflreadpy")
     last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DraftProfile(SQLModel, table=True):
+    """
+    NFL draft-day facts for a player — round, pick, team, college — sourced
+    from nflreadpy's load_draft_picks(). Unlike PlayerMetrics, this is a
+    static historical fact rather than a recomputed snapshot: it doesn't
+    change once a draft class is in the books.
+
+    This exists specifically to give rookies (and recent draftees generally)
+    *something* concrete to reason about before they have any NFL season to
+    generate a PlayerMetrics row from — draft capital (round/pick) is one of
+    the most predictive signals for a rookie's fantasy outlook, and ADP
+    alone doesn't carry it. See ai_service.py's Opportunity & Performance
+    Signals section, which falls back to this for exactly that case.
+
+    Keyed by sleeper_id, not just player_id, for the same reason as
+    PlayerMetrics (see its docstring above) — ingest_players.ingest_csv()
+    does a full delete-and-reinsert of Player on every ADP refresh, so
+    player_id is not a stable identity across refreshes. draft_profile_repo
+    .relink_player_ids() repairs this the same way metrics_repo's does.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    player_id: int = Field(foreign_key="player.id", index=True, unique=True)
+    sleeper_id: Optional[str] = Field(default=None, index=True)
+
+    draft_year: int = Field(index=True)
+    draft_round: Optional[int] = None
+    draft_pick: Optional[int] = None       # overall pick number
+    draft_team: Optional[str] = None       # NFL team abbreviation at draft time
+    college: Optional[str] = None
+
+    # --- Metadata ---
+    source: str = Field(default="nflreadpy")
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

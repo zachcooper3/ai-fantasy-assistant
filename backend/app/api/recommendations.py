@@ -15,6 +15,7 @@ from sqlmodel import Session
 from backend.db.database import get_session
 from backend.db import player_repo as repo
 from backend.db import metrics_repo
+from backend.db import draft_profile_repo
 from backend.app.schemas import PlayerResponse
 from backend.app.services.ai_service import AIService, RecommendationContext
 from backend.app.services.draft_state import DraftStateService
@@ -139,6 +140,22 @@ def _build_context(
     metrics_rows = metrics_repo.get_metrics_bulk(db, [p["id"] for p in top_available])
     player_metrics = {pid: _metrics_dict(m) for pid, m in metrics_rows.items()}
 
+    # Draft-day facts for the same players — exists for rookies/recent
+    # draftees specifically, who structurally can never appear in
+    # player_metrics above. See ai_service.py's RecommendationContext
+    # .draft_profiles docstring and DraftProfile in backend/db/models.py.
+    draft_profile_rows = draft_profile_repo.get_draft_profiles_bulk(db, [p["id"] for p in top_available])
+    draft_profiles = {
+        pid: {
+            "draft_year": dp.draft_year,
+            "draft_round": dp.draft_round,
+            "draft_pick": dp.draft_pick,
+            "draft_team": dp.draft_team,
+            "college": dp.college,
+        }
+        for pid, dp in draft_profile_rows.items()
+    }
+
     # My roster as plain dicts
     my_roster = [
         {"player_name": pick.player_name, "position": pick.position, "nfl_team": pick.nfl_team}
@@ -169,6 +186,7 @@ def _build_context(
         opponent_position_counts=opponent_position_counts,
         starting_lineup=svc.config.starting_lineup,
         player_metrics=player_metrics,
+        draft_profiles=draft_profiles,
     )
 
 

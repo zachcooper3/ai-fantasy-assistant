@@ -289,6 +289,23 @@ async def auto_refresh(year: int = CURRENT_YEAR, teams: int = 12) -> None:
                 file=sys.stderr,
             )
 
+        # Same player_id-instability problem, same fix, for DraftProfile
+        # (see draft_profile_repo.relink_player_ids' docstring).
+        try:
+            from backend.db import draft_profile_repo
+            from backend.db.database import engine
+            from sqlmodel import Session
+            with Session(engine) as session:
+                relinked, orphaned = draft_profile_repo.relink_player_ids(session)
+            print(f"DraftProfile relink complete: {relinked} relinked, {orphaned} orphaned.")
+        except Exception as e:
+            print(
+                f"[WARN] DraftProfile relink failed after ADP refresh: {e}. "
+                "Existing draft-profile rows may now point at the wrong player "
+                "until this is re-run.",
+                file=sys.stderr,
+            )
+
     except httpx.HTTPStatusError as e:
         print(
             f"[WARN] ADP auto-refresh skipped: HTTP {e.response.status_code} "
@@ -359,6 +376,12 @@ def main() -> None:
         from sqlmodel import Session
         with Session(engine) as session:
             relinked, orphaned = metrics_repo.relink_player_ids(session)
+        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+
+        print("Relinking DraftProfile to the reassigned Player IDs ...")
+        from backend.db import draft_profile_repo
+        with Session(engine) as session:
+            relinked, orphaned = draft_profile_repo.relink_player_ids(session)
         print(f"Done. {relinked} relinked, {orphaned} orphaned.")
 
     except httpx.HTTPStatusError as e:

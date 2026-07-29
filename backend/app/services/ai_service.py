@@ -100,6 +100,15 @@ class RecommendationContext:
     # section entirely — see _format_metrics_section).
     player_metrics: dict[int, dict] = field(default_factory=dict)
 
+    # Draft-day facts (draft_year, draft_round, draft_pick, draft_team,
+    # college) keyed by Player.id, sourced from DraftProfile (see
+    # backend/db/models.py) — exists specifically for players who will
+    # never have a player_metrics entry (rookies), so they aren't a total
+    # blank slate. Populated in recommendations.py::_build_context via
+    # draft_profile_repo.get_draft_profiles_bulk(); most veterans simply
+    # won't have a key here, which is expected, not an error.
+    draft_profiles: dict[int, dict] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Starting lineup gaps — gives Claude a concrete target, not just "consider
@@ -389,7 +398,33 @@ def _format_metrics_line(m: dict) -> str | None:
     return line
 
 
-def _format_metrics_section(top_available: list[dict], player_metrics: dict[int, dict]) -> str:
+def _format_draft_profile_line(dp: dict) -> str | None:
+    """
+    Builds one compact line from a DraftProfile — draft capital (round/pick)
+    is one of the strongest predictors of a rookie's fantasy outlook, and
+    it's the one thing this app can say about a player with zero NFL snaps.
+    Returns None if the row exists but nothing in it actually resolved
+    (see fetch_draft_profiles.py's column-resolution disclaimer).
+    """
+    bits = []
+    if dp.get("draft_round") is not None and dp.get("draft_pick") is not None:
+        bits.append(f"{dp['draft_year']} NFL Draft: Round {dp['draft_round']}, Pick {dp['draft_pick']}")
+    elif dp.get("draft_year") is not None:
+        bits.append(f"{dp['draft_year']} NFL Draft class")
+    if dp.get("draft_team"):
+        bits.append(f"drafted by {dp['draft_team']}")
+    if dp.get("college"):
+        bits.append(f"college: {dp['college']}")
+    if not bits:
+        return None
+    return ", ".join(bits)
+
+
+def _format_metrics_section(
+    top_available: list[dict],
+    player_metrics: dict[int, dict],
+    draft_profiles: dict[int, dict] | None = None,
+) -> str:
     """
     Renders a prior-season opportunity/efficiency/consistency snapshot for
     the top candidates, so "upside"/"breakout" reasoning is grounded in
@@ -404,7 +439,13 @@ def _format_metrics_section(top_available: list[dict], player_metrics: dict[int,
     meaning for a team defense or a kicker), so they never have a row and
     that's not a coverage gap to explain away, it's just the wrong table.
     Confirmed live: every DST in the DB has zero PlayerMetrics rows.
+
+    A player with no PlayerMetrics row but a known DraftProfile (see
+    backend/db/models.py) is almost certainly a rookie or recent draftee —
+    they get draft capital (round/pick/college) instead of the generic
+    "no data" line, since that's real, concrete signal rather than nothing.
     """
+    draft_profiles = draft_profiles or {}
     sections: list[str] = []
     for p in top_available[:_MAX_CONTEXT_PLAYERS]:
         m = player_metrics.get(p["id"])
@@ -414,6 +455,16 @@ def _format_metrics_section(top_available: list[dict], player_metrics: dict[int,
                     f"- {p['name']} ({p['position']}): Not modeled by this metrics table "
                     f"(built for individual offensive usage) — evaluate by matchup, "
                     f"scheme, and ADP instead."
+                )
+                continue
+
+            dp = draft_profiles.get(p["id"])
+            dp_line = _format_draft_profile_line(dp) if dp else None
+            if dp_line:
+                sections.append(
+                    f"- {p['name']} ({p['position']}): No NFL performance data yet "
+                    f"(rookie/recent draftee) — {dp_line}. Evaluate on draft capital, "
+                    f"landing spot, and role expectations rather than prior production."
                 )
             else:
                 sections.append(
@@ -554,7 +605,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         lines.append("")
 
     # Opportunity/performance signals (best-effort; omitted if no metrics at all)
-    metrics_section = _format_metrics_section(ctx.top_available, ctx.player_metrics)
+    metrics_section = _format_metrics_section(ctx.top_available, ctx.player_metrics, ctx.draft_profiles)
     if metrics_section:
         lines.append(metrics_section)
 
@@ -625,8 +676,13 @@ _SYSTEM_PROMPT = (
     "Some players — especially rookies — will show 'No retrieved data' or 'No "
     "prior-season metrics' in the sections above. That reflects a gap in available "
     "statistics (no prior NFL season to compute from), not a judgment about the player. "
-    "Do not treat a missing data section as a reason to avoid a player; judge them on "
-    "ADP/consensus value and whatever other context you do have. "
+    "Do not treat a missing data section as a reason to avoid a player. A rookie with no "
+    "NFL track record will often instead show draft capital (round/pick, college) in the "
+    "Opportunity & Performance Signals section — treat that as real signal, not a "
+    "consolation prize: early-round draft capital is one of the strongest predictors of a "
+    "rookie's eventual role, and a Day 1-2 pick landing in a favorable offense can be a "
+    "legitimate breakout call even with zero NFL stats yet. Weigh it alongside ADP and "
+    "whatever other context you have, the same as any other signal. "
     "You always respond with valid JSON and nothing else."
 )
 
