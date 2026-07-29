@@ -401,10 +401,14 @@ def _format_metrics_line(m: dict) -> str | None:
 def _format_draft_profile_line(dp: dict) -> str | None:
     """
     Builds one compact line from a DraftProfile — draft capital (round/pick)
-    is one of the strongest predictors of a rookie's fantasy outlook, and
-    it's the one thing this app can say about a player with zero NFL snaps.
-    Returns None if the row exists but nothing in it actually resolved
-    (see fetch_draft_profiles.py's column-resolution disclaimer).
+    and final-college-season production are the two things this app can say
+    about a player with zero NFL snaps. Returns None if the row exists but
+    nothing in it actually resolved (see fetch_draft_profiles.py's and
+    fetch_college_stats.py's column-resolution disclaimers).
+
+    College production is raw counting stats, not a share-of-team-offense
+    metric like a true "Dominator Rating" — see DraftProfile's docstring
+    for why that's deliberately out of scope for now.
     """
     bits = []
     if dp.get("draft_round") is not None and dp.get("draft_pick") is not None:
@@ -415,6 +419,35 @@ def _format_draft_profile_line(dp: dict) -> str | None:
         bits.append(f"drafted by {dp['draft_team']}")
     if dp.get("college"):
         bits.append(f"college: {dp['college']}")
+
+    college_bits = []
+    if dp.get("passing_yards") is not None:
+        passing = f"{dp['passing_yards']} pass yds"
+        if dp.get("passing_td") is not None:
+            passing += f", {dp['passing_td']} TD"
+        if dp.get("interceptions_thrown") is not None:
+            passing += f", {dp['interceptions_thrown']} INT"
+        college_bits.append(passing)
+    if dp.get("rushing_yards") is not None:
+        rushing = f"{dp['rushing_yards']} rush yds"
+        if dp.get("carries") is not None:
+            rushing += f" on {dp['carries']} car"
+        if dp.get("rushing_td") is not None:
+            rushing += f", {dp['rushing_td']} TD"
+        college_bits.append(rushing)
+    if dp.get("receiving_yards") is not None:
+        receiving = f"{dp['receiving_yards']} rec yds"
+        if dp.get("receptions") is not None:
+            receiving += f" on {dp['receptions']} rec"
+        if dp.get("receiving_td") is not None:
+            receiving += f", {dp['receiving_td']} TD"
+        college_bits.append(receiving)
+
+    if college_bits:
+        season = dp.get("college_season")
+        season_str = f"{season} college season" if season is not None else "final college season"
+        bits.append(f"{season_str}: " + "; ".join(college_bits))
+
     if not bits:
         return None
     return ", ".join(bits)

@@ -127,17 +127,34 @@ class PlayerMetrics(SQLModel, table=True):
 
 class DraftProfile(SQLModel, table=True):
     """
-    NFL draft-day facts for a player — round, pick, team, college — sourced
-    from nflreadpy's load_draft_picks(). Unlike PlayerMetrics, this is a
-    static historical fact rather than a recomputed snapshot: it doesn't
-    change once a draft class is in the books.
+    Pre-NFL prospect facts for a player — draft capital (round/pick/team,
+    college) plus final-college-season production — for players who
+    structurally can never have a PlayerMetrics row (see that model's
+    docstring) because they haven't played an NFL down yet. Unlike
+    PlayerMetrics, these are static historical facts rather than a
+    recomputed snapshot: they don't change once a draft class and college
+    career are in the books.
 
-    This exists specifically to give rookies (and recent draftees generally)
-    *something* concrete to reason about before they have any NFL season to
-    generate a PlayerMetrics row from — draft capital (round/pick) is one of
-    the most predictive signals for a rookie's fantasy outlook, and ADP
-    alone doesn't carry it. See ai_service.py's Opportunity & Performance
-    Signals section, which falls back to this for exactly that case.
+    Two independent sources populate this one row over time, upserting
+    different field subsets (see upsert_draft_profile — it only touches
+    fields explicitly passed, so one source never clobbers the other's
+    columns):
+      - fetch_draft_profiles.py   — draft_year/round/pick/team/college,
+        via nflreadpy's load_draft_picks().
+      - fetch_college_stats.py    — the college production fields below,
+        via CollegeFootballData.com's get_player_season_stats(). Only
+        enriches players who already have a row from the source above
+        (i.e., were actually drafted) — an undrafted rookie with real
+        college production is a real but rare gap this doesn't cover yet.
+
+    This exists specifically to give rookies *something* concrete to
+    reason about before they have any NFL season to generate a
+    PlayerMetrics row from — draft capital (round/pick) is one of the most
+    predictive signals for a rookie's fantasy outlook, and college
+    production is the closest thing to a performance track record they
+    have. ADP alone carries neither. See ai_service.py's Opportunity &
+    Performance Signals section, which falls back to this for exactly
+    that case.
 
     Keyed by sleeper_id, not just player_id, for the same reason as
     PlayerMetrics (see its docstring above) — ingest_players.ingest_csv()
@@ -155,6 +172,22 @@ class DraftProfile(SQLModel, table=True):
     draft_pick: Optional[int] = None       # overall pick number
     draft_team: Optional[str] = None       # NFL team abbreviation at draft time
     college: Optional[str] = None
+
+    # --- College production (final college season — typically draft_year
+    # minus 1) — see fetch_college_stats.py. A true "Dominator Rating"
+    # (share of team's total yards/TDs) would need team-level college
+    # totals too, which this doesn't pull yet; these are raw counting
+    # stats only, deliberately simpler for a first pass.
+    college_season: Optional[int] = None
+    passing_yards: Optional[int] = None
+    passing_td: Optional[int] = None
+    interceptions_thrown: Optional[int] = None
+    rushing_yards: Optional[int] = None
+    rushing_td: Optional[int] = None
+    carries: Optional[int] = None
+    receiving_yards: Optional[int] = None
+    receiving_td: Optional[int] = None
+    receptions: Optional[int] = None
 
     # --- Metadata ---
     source: str = Field(default="nflreadpy")

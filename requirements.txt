@@ -23,8 +23,18 @@ nflreadpy>=0.1.5
 # AI
 anthropic>=0.102.0
 
-# HTTP client (Sleeper API calls, RotoWire RSS)
+# HTTP client (Sleeper API calls, RotoWire RSS, CollegeFootballData.com)
 httpx>=0.28.0
+
+# NOTE on college football stats (rookie college production — see
+# backend/ingestion/fetch_college_stats.py, backend/app/services/cfbd_client.py):
+# deliberately NOT using the official `cfbd` PyPI package here. As of
+# 2026-07, its latest release (5.20.1) hard-pins pydantic<2, which would
+# downgrade this project's pydantic and break FastAPI/SQLModel/
+# pydantic-settings, all of which require pydantic 2.x — confirmed by
+# actually installing it. CollegeFootballData.com is a plain REST API, so
+# cfbd_client.py just calls it directly with httpx (already a dependency)
+# instead, same pattern as sleeper_client.py.
 
 # Config / settings
 pydantic>=2.13.0

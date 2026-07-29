@@ -152,6 +152,16 @@ def _build_context(
             "draft_pick": dp.draft_pick,
             "draft_team": dp.draft_team,
             "college": dp.college,
+            "college_season": dp.college_season,
+            "passing_yards": dp.passing_yards,
+            "passing_td": dp.passing_td,
+            "interceptions_thrown": dp.interceptions_thrown,
+            "rushing_yards": dp.rushing_yards,
+            "rushing_td": dp.rushing_td,
+            "carries": dp.carries,
+            "receiving_yards": dp.receiving_yards,
+            "receiving_td": dp.receiving_td,
+            "receptions": dp.receptions,
         }
         for pid, dp in draft_profile_rows.items()
     }
