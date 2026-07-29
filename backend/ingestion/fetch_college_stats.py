@@ -83,6 +83,15 @@ def _fetch_season(season: int) -> dict[str, dict[str, dict[str, float]]]:
     Pulls all three stat categories for one college season and pivots
     CFBD's long/narrow rows into {normalised_player_name: {category:
     {stat_type_lower: value}}}.
+
+    Stores each player under BOTH their raw normalised name and a
+    suffix-stripped variant (when they have one) — same fix as
+    fetch_draft_profiles.py's _build_player_index, applied here for the
+    same reason: confirmed via live nflreadpy data that generational
+    suffixes ("Jr.", "III") aren't reliably present on only one side of a
+    name match. Whichever side (CFBD's or our own Player.name) carries the
+    suffix, widening this index to hold both forms covers it regardless of
+    which direction the mismatch runs.
     """
     by_player: dict[str, dict[str, dict[str, float]]] = {}
 
@@ -101,7 +110,14 @@ def _fetch_season(season: int) -> dict[str, dict[str, dict[str, float]]]:
                 continue
 
             key = _normalise(name)
-            by_player.setdefault(key, {}).setdefault(category, {})[str(stat_type).lower()] = stat
+            entry = by_player.setdefault(key, {}).setdefault(category, {})
+            entry[str(stat_type).lower()] = stat
+
+            stripped = _strip_suffix(key)
+            if stripped is not None:
+                by_player.setdefault(stripped, {}).setdefault(category, {}).update(
+                    {str(stat_type).lower(): stat}
+                )
 
         logger.info(f"{season} {category}: {len(rows):,} raw rows")
 

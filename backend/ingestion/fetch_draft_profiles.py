@@ -125,8 +125,27 @@ def _match_player(index: dict[tuple[str, str], Player], name: str, position: str
     drafted this year should already be in our Player table (FantasyPros
     ADP lists draft-eligible rookies before the season starts) with
     sleeper_id already resolved by sync_sleeper_ids.py — this just needs to
-    find which row is them."""
-    return index.get((_normalise(name), position.upper()))
+    find which row is them.
+
+    Tries both the raw and suffix-stripped forms of the QUERY name, not
+    just the local side. Confirmed against live nflreadpy data (2026-07-29
+    dry-run) that the original assumption — "the suffix only ever lives on
+    our side" — was wrong: nflreadpy's pfr_player_name includes "Jr."/"III"
+    for some players (e.g. "Emmanuel Henderson Jr.") but our FantasyPros-
+    sourced Player.name doesn't always carry the same suffix. Whichever
+    side has it, trying both forms here (against an index that already
+    holds both forms for the local side — see _build_player_index) covers
+    it regardless of which direction the mismatch runs.
+    """
+    pos = position.upper()
+    normalised = _normalise(name)
+    player = index.get((normalised, pos))
+    if player is not None:
+        return player
+    stripped = _strip_suffix(normalised)
+    if stripped is not None:
+        return index.get((stripped, pos))
+    return None
 
 
 # ---------------------------------------------------------------------------
