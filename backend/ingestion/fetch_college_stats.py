@@ -228,6 +228,13 @@ def main() -> None:
                 query = query.where(DraftProfile.sleeper_id == args.sleeper_id)
             rows = session.exec(query).all()
 
+            if not rows:
+                print(
+                    "No DraftProfile rows found — run fetch_draft_profiles.py "
+                    "(without --dry-run) first so there's something to enrich."
+                )
+                return
+
             needed_seasons = {dp.draft_year - 1 for dp, _ in rows}
             season_data = {season: _fetch_season(season) for season in needed_seasons}
 
