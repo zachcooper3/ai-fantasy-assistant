@@ -9,7 +9,7 @@ Author: Zach Cooper
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.app.services.draft_sync import DraftSyncService
 from backend.app.services.draft_state import DraftStateService
@@ -33,7 +33,11 @@ def get_draft_service(request: Request) -> DraftStateService:
 # ---------------------------------------------------------------------------
 
 class SyncStartRequest(BaseModel):
-    draft_id: str
+    # Digits only — Sleeper draft IDs are numeric snowflakes, and this is
+    # interpolated into a Sleeper API URL path downstream (sleeper_client
+    # validates again as defense in depth; rejecting here gives the user a
+    # 422 up front instead of a poll-loop error 2 seconds later).
+    draft_id: str = Field(pattern=r"^\d{1,32}$")
 
 
 class SyncStatusResponse(BaseModel):

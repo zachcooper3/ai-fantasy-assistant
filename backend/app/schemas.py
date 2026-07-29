@@ -4,7 +4,9 @@ These are separate from the SQLModel DB models in backend/db/models.py.
 Author: Zach Cooper
 """
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -54,13 +56,25 @@ class DraftConfigRequest(BaseModel):
     league_size: int = Field(default=12, ge=8, le=16)
     my_draft_position: int = Field(default=1, ge=1, le=16)
     total_rounds: int = Field(default=15, ge=10, le=20)
-    scoring_format: str = Field(default="ppr")
+    scoring_format: Literal["ppr", "half_ppr", "standard"] = "ppr"
     qb_slots: int = Field(default=1, ge=0, le=4)
     rb_slots: int = Field(default=2, ge=0, le=6)
     wr_slots: int = Field(default=2, ge=0, le=6)
     te_slots: int = Field(default=1, ge=0, le=4)
     flex_slots: int = Field(default=1, ge=0, le=4)
     dst_slots: int = Field(default=1, ge=0, le=2)
+
+    @model_validator(mode="after")
+    def _draft_position_within_league(self) -> "DraftConfigRequest":
+        """Slot 14 in a 12-team league passed the per-field bounds but broke
+        everything downstream: is_my_turn could never be true and the UI
+        showed '-1 picks away'. Cross-field rules need a model validator."""
+        if self.my_draft_position > self.league_size:
+            raise ValueError(
+                f"my_draft_position ({self.my_draft_position}) can't exceed "
+                f"league_size ({self.league_size})."
+            )
+        return self
 
 
 class SleeperPrefillResponse(BaseModel):

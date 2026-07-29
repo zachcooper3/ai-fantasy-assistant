@@ -26,8 +26,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+from backend.app.auth import auth_enabled, require_auth
 
 from sqlmodel import Session
 
@@ -59,10 +61,16 @@ def _print_startup_banner(ai_service: AIService) -> None:
         if ai_service.is_configured
         else "NOT SET — recommendations will use ADP fallback"
     )
+    auth_status = (
+        "enabled (APP_AUTH_TOKEN set)"
+        if auth_enabled()
+        else "DISABLED — fine locally; set APP_AUTH_TOKEN before deploying"
+    )
     db_path = os.getenv("DB_PATH", "data/fantasy.db")
     print("=" * 64)
     print("  Fantasy Draft Assistant — startup configuration")
     print(f"    Claude API : {claude_status}")
+    print(f"    API auth   : {auth_status}")
     print(f"    Database   : {db_path}")
     print(f"    ADP data   : {adp_age_str(OUT_PATH)}")
     print("=" * 64)
@@ -148,12 +156,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Routers
-app.include_router(players.router)
-app.include_router(draft.router)
-app.include_router(recommendations.router)
-app.include_router(sync.router)
-app.include_router(sleeper.router)
+# Routers — every /api route requires the shared bearer token when
+# APP_AUTH_TOKEN is set (no-op otherwise; see backend/app/auth.py).
+# Applied here at include time rather than per-route so a future router
+# can't be added unprotected by accident. The WebSocket router handles
+# auth itself (browsers can't set headers on a WS handshake — it checks
+# a ?token= query param inside the endpoint), and /health stays open on
+# purpose (Render's health checks need it, and it exposes nothing).
+_protected = {"dependencies": [Depends(require_auth)]}
+app.include_router(players.router, **_protected)
+app.include_router(draft.router, **_protected)
+app.include_router(recommendations.router, **_protected)
+app.include_router(sync.router, **_protected)
+app.include_router(sleeper.router, **_protected)
 app.include_router(websocket.router)
 
 

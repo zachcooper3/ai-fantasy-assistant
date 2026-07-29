@@ -11,11 +11,15 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, Board, DraftState, Recommendation, SyncStatus, WsEvent } from "@/lib/api";
+import { api, API_TOKEN, Board, DraftState, Recommendation, SyncStatus, WsEvent } from "@/lib/api";
 
+// Browsers can't set an Authorization header on a WebSocket handshake, so
+// the shared token (if configured) rides a query param instead — checked
+// server-side in backend/app/api/websocket.py.
 const WS_URL =
   (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000")
-    .replace(/^http/, "ws") + "/ws/draft";
+    .replace(/^http/, "ws") + "/ws/draft" +
+  (API_TOKEN ? `?token=${encodeURIComponent(API_TOKEN)}` : "");
 
 export interface DraftHook {
   session: DraftState | null;

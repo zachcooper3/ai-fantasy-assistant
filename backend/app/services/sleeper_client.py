@@ -14,8 +14,10 @@ Author: Zach Cooper
 """
 
 import logging
+import re
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -23,6 +25,22 @@ logger = logging.getLogger(__name__)
 
 BASE = "https://api.sleeper.app/v1"
 TIMEOUT = 10.0  # seconds
+
+# Sleeper draft/league IDs are numeric snowflakes. These values come from
+# user input (setup form, /api/sync/start, /api/sleeper/prefill) and get
+# interpolated into a URL *path* — without validation, a value containing
+# "/", "..", or "?" reaches arbitrary Sleeper endpoints and breaks
+# _get()'s bust_cache separator logic (httpx does not encode "/" in a
+# path you hand it). Digits-only is both the real format and the fix.
+_NUMERIC_ID = re.compile(r"^\d{1,32}$")
+
+
+def _validate_numeric_id(value: str, kind: str) -> str:
+    if not _NUMERIC_ID.fullmatch(value or ""):
+        raise ValueError(
+            f"Invalid Sleeper {kind}: {value!r} — expected a numeric ID."
+        )
+    return value
 
 # ---------------------------------------------------------------------------
 # Persistent client — one connection pool for all Sleeper API calls
@@ -73,7 +91,10 @@ async def _get(path: str, bust_cache: bool = False) -> Any:
 # ---------------------------------------------------------------------------
 
 async def get_user(username: str) -> dict:
-    return await _get(f"/user/{username}")
+    # Usernames aren't numeric, so they can't be format-validated like the
+    # IDs below — percent-encode instead (safe="" also encodes "/") so a
+    # crafted value can't traverse into a different API path.
+    return await _get(f"/user/{quote(username or '', safe='')}")
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +102,11 @@ async def get_user(username: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def get_league(league_id: str) -> dict:
-    return await _get(f"/league/{league_id}")
+    return await _get(f"/league/{_validate_numeric_id(league_id, 'league_id')}")
 
 
 async def get_league_drafts(league_id: str) -> list[dict]:
-    return await _get(f"/league/{league_id}/drafts")
+    return await _get(f"/league/{_validate_numeric_id(league_id, 'league_id')}/drafts")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +121,7 @@ async def get_draft(draft_id: str) -> dict:
     - status: "pre_draft" | "drafting" | "complete"
     - slot_to_roster_id: {slot: roster_id}
     """
-    return await _get(f"/draft/{draft_id}")
+    return await _get(f"/draft/{_validate_numeric_id(draft_id, 'draft_id')}")
 
 
 async def get_draft_picks(draft_id: str) -> list[dict]:
@@ -117,7 +138,7 @@ async def get_draft_picks(draft_id: str) -> list[dict]:
       pick_no     — overall pick number (1-indexed)
       metadata    — {first_name, last_name, position, team, ...}
     """
-    return await _get(f"/draft/{draft_id}/picks", bust_cache=True)
+    return await _get(f"/draft/{_validate_numeric_id(draft_id, 'draft_id')}/picks", bust_cache=True)
 
 
 # ---------------------------------------------------------------------------

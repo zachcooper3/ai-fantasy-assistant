@@ -8,6 +8,18 @@
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
 
+// Shared API token — must match the backend's APP_AUTH_TOKEN. Empty (the
+// local-dev default) sends no header, matching a backend with auth
+// disabled. NOTE: NEXT_PUBLIC_* values are baked into the public JS
+// bundle, so anyone who can load the deployed frontend can extract this —
+// it protects the backend from scanners and strangers, not from someone
+// you've shared the frontend URL with. See backend/app/auth.py.
+export const API_TOKEN = process.env.NEXT_PUBLIC_API_TOKEN ?? "";
+
+function authHeaders(): Record<string, string> {
+  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {};
+}
+
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
@@ -156,7 +168,7 @@ export type WsEvent =
 // ---------------------------------------------------------------------------
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`);
+  const res = await fetch(`${BASE}${path}`, { headers: authHeaders() });
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json();
 }
@@ -164,7 +176,7 @@ async function get<T>(path: string): Promise<T> {
 async function post<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: body != null ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
@@ -175,7 +187,10 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
 }
 
 async function del<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: "DELETE" });
+  const res = await fetch(`${BASE}${path}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail ?? `DELETE ${path} → ${res.status}`);

@@ -12,6 +12,7 @@ Author: Zach Cooper
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
 
+from backend.app.auth import ws_token_valid
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.draft_state import DraftStateService
 
@@ -37,6 +38,13 @@ async def draft_websocket(websocket: WebSocket):
     """
     svc: DraftStateService = websocket.app.state.draft_service
     mgr: ConnectionManager = websocket.app.state.connection_manager
+
+    # Auth (no-op when APP_AUTH_TOKEN is unset): browsers can't set an
+    # Authorization header on a WebSocket handshake, so the token arrives
+    # as ?token= (see useDraft.ts). 1008 = policy violation.
+    if not ws_token_valid(websocket):
+        await websocket.close(code=1008, reason="Invalid or missing API token.")
+        return
 
     await mgr.connect(websocket)
 
