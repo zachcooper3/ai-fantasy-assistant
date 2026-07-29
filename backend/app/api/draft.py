@@ -27,8 +27,10 @@ from backend.app.schemas import (
     PlayerResponse,
     ScarcityResponse,
 )
+from backend.app.serializers import build_pick_response, build_state_response
 from backend.app.services.draft_state import DraftConfig, DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
+from backend.app.services.draft_sync import DraftSyncService
 
 router = APIRouter(prefix="/api/draft", tags=["draft"])
 
@@ -45,47 +47,16 @@ def get_connection_manager(request: Request) -> ConnectionManager:
     return request.app.state.connection_manager
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _pick_response(pick, my_slot: int) -> PickResponse:
-    return PickResponse(
-        pick_number=pick.pick_number,
-        round_number=pick.round_number,
-        team_slot=pick.team_slot,
-        player_id=pick.player_id,
-        player_name=pick.player_name,
-        position=pick.position,
-        nfl_team=pick.nfl_team,
-        is_mine=(pick.team_slot == my_slot),
-    )
+def get_sync_service(request: Request) -> DraftSyncService:
+    return request.app.state.sync_service
 
 
-def _state_response(svc: DraftStateService) -> DraftStateResponse:
-    my_slot = svc.config.my_draft_position
-    return DraftStateResponse(
-        is_active=svc.is_active,
-        league_size=svc.config.league_size,
-        my_draft_position=my_slot,
-        total_rounds=svc.config.total_rounds,
-        scoring_format=svc.config.scoring_format,
-        qb_slots=svc.config.qb_slots,
-        rb_slots=svc.config.rb_slots,
-        wr_slots=svc.config.wr_slots,
-        te_slots=svc.config.te_slots,
-        flex_slots=svc.config.flex_slots,
-        dst_slots=svc.config.dst_slots,
-        current_pick_number=svc.current_pick_number,
-        current_round=svc.current_round,
-        current_team_slot=svc.current_team_slot,
-        is_my_turn=svc.is_my_turn,
-        picks_until_my_turn=svc.picks_until_my_turn,
-        my_next_pick_number=svc.my_next_pick_number,
-        draft_complete=svc.draft_complete,
-        picks=[_pick_response(p, my_slot) for p in svc.picks],
-        my_roster=[_pick_response(p, my_slot) for p in svc.my_roster],
-    )
+# NOTE: the _pick_response/_state_response helpers that used to live here
+# moved to backend/app/serializers.py (as build_pick_response /
+# build_state_response) — they're shared with draft_sync.py and
+# websocket.py, and a service importing them from a route module was a
+# layering inversion that turned into a circular import once this module
+# needed DraftSyncService for the session-lifecycle sync.stop() calls.
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +68,16 @@ async def start_session(
     body: DraftConfigRequest,
     svc: DraftStateService = Depends(get_draft_service),
     mgr: ConnectionManager = Depends(get_connection_manager),
+    sync: DraftSyncService = Depends(get_sync_service),
     db: Session = Depends(get_session),
 ):
     """
     Creates or resets a draft session.
-    Also resets all player availability in SQLite so you start with a clean board.
+    Also stops any running Sleeper sync (a poller left over from a previous
+    session would pump the OLD draft's picks into this fresh one) and resets
+    all player availability in SQLite so you start with a clean board.
     """
+    await sync.stop()
     config = DraftConfig(
         league_size=body.league_size,
         my_draft_position=body.my_draft_position,
@@ -118,7 +93,7 @@ async def start_session(
     svc.start_session(config)
     repo.reset_draft_availability(db)
     await mgr.broadcast({"type": "reset"})
-    return _state_response(svc)
+    return build_state_response(svc)
 
 
 @router.get("/session", response_model=DraftStateResponse)
@@ -126,16 +101,19 @@ def get_session_state(svc: DraftStateService = Depends(get_draft_service)):
     """Returns the current draft state."""
     if not svc.is_active:
         raise HTTPException(status_code=404, detail="No active draft session.")
-    return _state_response(svc)
+    return build_state_response(svc)
 
 
 @router.delete("/session", status_code=204)
 async def end_session(
     svc: DraftStateService = Depends(get_draft_service),
     mgr: ConnectionManager = Depends(get_connection_manager),
+    sync: DraftSyncService = Depends(get_sync_service),
     db: Session = Depends(get_session),
 ):
-    """Ends the session and resets all player availability."""
+    """Ends the session, stops any running Sleeper sync, and resets all
+    player availability."""
+    await sync.stop()
     svc.reset()
     repo.reset_draft_availability(db)
     await mgr.broadcast({"type": "reset"})
@@ -182,12 +160,12 @@ async def record_pick(
     repo.mark_as_drafted(db, player.id)
 
     my_slot = svc.config.my_draft_position
-    pick_resp = _pick_response(pick, my_slot)
+    pick_resp = build_pick_response(pick, my_slot)
 
     await mgr.broadcast({
         "type": "pick",
         "pick": pick_resp.model_dump(),
-        "state": _state_response(svc).model_dump(),
+        "state": build_state_response(svc).model_dump(),
     })
 
     return pick_resp
@@ -214,12 +192,12 @@ async def undo_pick(
     repo.mark_available(db, pick.player_id)
 
     my_slot = svc.config.my_draft_position
-    pick_resp = _pick_response(pick, my_slot)
+    pick_resp = build_pick_response(pick, my_slot)
 
     await mgr.broadcast({
         "type": "undo",
         "pick": pick_resp.model_dump(),
-        "state": _state_response(svc).model_dump(),
+        "state": build_state_response(svc).model_dump(),
     })
 
     return pick_resp

@@ -43,10 +43,10 @@ async def draft_websocket(websocket: WebSocket):
     try:
         # Send current state immediately on connect so the client hydrates
         if svc.is_active:
-            from backend.app.api.draft import _state_response
+            from backend.app.serializers import build_state_response
             await websocket.send_json({
                 "type": "connected",
-                "state": _state_response(svc).model_dump(),
+                "state": build_state_response(svc).model_dump(),
             })
         else:
             await websocket.send_json({"type": "connected", "state": None})

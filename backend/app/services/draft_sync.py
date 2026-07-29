@@ -2,8 +2,9 @@
 Background Sleeper draft sync service.
 
 Polls GET /draft/{draft_id}/picks every POLL_INTERVAL seconds.
-For each new pick, looks up the player in SQLite by sleeper_id and
-calls record_pick — which updates draft state and broadcasts via WebSocket.
+For each new pick, looks up the player in SQLite by sleeper_id and calls
+record_synced_pick with Sleeper's own pick_no/round/draft_slot attribution
+— which updates draft state and broadcasts via WebSocket.
 
 Author: Zach Cooper
 """
@@ -18,7 +19,7 @@ from backend.db import player_repo as repo
 from backend.app.services import sleeper_client
 from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
-from backend.app.api.draft import _pick_response, _state_response
+from backend.app.serializers import build_pick_response, build_state_response
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,14 @@ class DraftSyncService:
         logger.info(f"Sleeper sync started for draft {draft_id}")
 
     async def stop(self) -> None:
-        """Cancel the polling task."""
+        """Cancel the polling task and return to a clean idle state.
+
+        Always resets status/error (not just from "syncing") — stop() is
+        now part of the session lifecycle (called on every session create/
+        reset, see backend/app/api/draft.py), and a new session should
+        never inherit a stale "error"/"complete" marker from a previous
+        draft's sync.
+        """
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -78,8 +86,9 @@ class DraftSyncService:
                 pass
         self._task = None
         self._draft_id = None
-        if self.status == "syncing":
-            self.status = "idle"
+        self._synced_pick_count = 0
+        self.status = "idle"
+        self.error = None
         logger.info("Sleeper sync stopped")
 
     # -----------------------------------------------------------------------
@@ -151,10 +160,33 @@ class DraftSyncService:
                 logger.info("Sleeper draft complete — sync finished")
 
     async def _process_pick(self, sleeper_pick: dict, db: Session) -> None:
-        """Resolves a single Sleeper pick to a local player and records it."""
+        """Resolves a single Sleeper pick to a local player and records it.
+
+        Attribution (pick number / round / team slot) comes from Sleeper's
+        own pick_no / round / draft_slot fields rather than local snake
+        inference — see DraftStateService.record_synced_pick for why
+        (traded picks, third-round reversal, and manual/live-sync mixing
+        all break the inferred math and misattribute every later pick).
+        """
         pick_no = sleeper_pick.get("pick_no", 0)
         sleeper_player_id = str(sleeper_pick.get("player_id", ""))
         metadata = sleeper_pick.get("metadata", {})
+        # Explicit attribution from Sleeper; None if absent so
+        # record_synced_pick falls back to local inference per-field.
+        draft_slot = sleeper_pick.get("draft_slot")
+        round_number = sleeper_pick.get("round")
+
+        if self._draft_svc.draft_complete:
+            # More picks than league_size x total_rounds can hold — the
+            # local session config doesn't match the real Sleeper draft.
+            # Don't let record_* raise on every poll (5 consecutive errors
+            # would kill the sync); log once per pick and move on.
+            logger.warning(
+                f"Pick #{pick_no} from Sleeper ignored — local draft is already "
+                f"complete. Check league_size/total_rounds in the session config."
+            )
+            self._synced_pick_count = pick_no
+            return
 
         # Try to find the player by sleeper_id
         player = repo.get_player_by_sleeper_id(db, sleeper_player_id)
@@ -175,24 +207,53 @@ class DraftSyncService:
             )
             # Still advance the draft state with a placeholder
             # so pick numbers stay in sync
-            pick = self._draft_svc.record_pick(
+            pick = self._draft_svc.record_synced_pick(
                 player_id=-1,
                 player_name=f"{metadata.get('first_name', '?')} {metadata.get('last_name', '?')}",
                 position=metadata.get("position", "?"),
                 nfl_team=metadata.get("team", "?"),
+                pick_number=pick_no or None,
+                round_number=round_number,
+                team_slot=draft_slot,
             )
         else:
             if not player.is_available:
-                # Already recorded (e.g. entered manually before sync started)
+                # Already recorded (e.g. entered manually before sync
+                # started). Cross-check the manual entry's attribution
+                # against Sleeper's — a mismatch means the local board has
+                # this pick under the wrong slot/number, which corrupts
+                # roster views and AI context downstream.
+                local = next(
+                    (p for p in self._draft_svc.picks if p.player_id == player.id),
+                    None,
+                )
+                if local is None:
+                    logger.warning(
+                        f"Pick #{pick_no}: {player.name} is marked unavailable in "
+                        f"the DB but has no local pick record — availability may "
+                        f"be stale from a previous session."
+                    )
+                elif (draft_slot is not None and local.team_slot != draft_slot) or (
+                    pick_no and local.pick_number != pick_no
+                ):
+                    logger.warning(
+                        f"Pick #{pick_no}: {player.name} was entered manually as "
+                        f"pick #{local.pick_number} (slot {local.team_slot}), but "
+                        f"Sleeper reports pick #{pick_no} (slot {draft_slot}) — "
+                        f"local attribution has diverged from the real draft."
+                    )
                 self._synced_pick_count = pick_no
                 return
 
             repo.mark_as_drafted(db, player.id)
-            pick = self._draft_svc.record_pick(
+            pick = self._draft_svc.record_synced_pick(
                 player_id=player.id,
                 player_name=player.name,
                 position=player.position,
                 nfl_team=player.team,
+                pick_number=pick_no or None,
+                round_number=round_number,
+                team_slot=draft_slot,
             )
 
         self._synced_pick_count = pick_no
@@ -201,8 +262,8 @@ class DraftSyncService:
         my_slot = self._draft_svc.config.my_draft_position
         await self._conn_mgr.broadcast({
             "type": "pick",
-            "pick": _pick_response(pick, my_slot).model_dump(),
-            "state": _state_response(self._draft_svc).model_dump(),
+            "pick": build_pick_response(pick, my_slot).model_dump(),
+            "state": build_state_response(self._draft_svc).model_dump(),
         })
 
         logger.info(

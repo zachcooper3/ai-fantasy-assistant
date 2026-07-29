@@ -12,8 +12,11 @@ operates on plain Python objects and delegates DB writes to the caller
 Author: Zach Cooper
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +220,61 @@ class DraftStateService:
             pick_number=self.current_pick_number,
             round_number=self.current_round,
             team_slot=self.current_team_slot,
+            player_id=player_id,
+            player_name=player_name,
+            position=position,
+            nfl_team=nfl_team,
+        )
+        self._picks.append(pick)
+        return pick
+
+    def record_synced_pick(
+        self,
+        *,
+        player_id: int,
+        player_name: str,
+        position: str,
+        nfl_team: str,
+        pick_number: int | None = None,
+        round_number: int | None = None,
+        team_slot: int | None = None,
+    ) -> PickRecord:
+        """
+        Records a pick using explicit attribution from the platform
+        (Sleeper's pick_no / round / draft_slot), falling back to local
+        snake-math inference for any field the caller couldn't provide.
+
+        Exists because record_pick's inference is only correct for a pure
+        snake draft with no manual/live-sync mixing: traded picks and
+        third-round-reversal orders don't follow slot_for_pick's math, and
+        a single divergence there silently misattributes every subsequent
+        pick — corrupting my_roster, roster-gap math, and therefore AI
+        recommendations. When the platform tells us exactly who picked at
+        which slot, trust it over our own model.
+
+        Logs a warning when the platform's pick number disagrees with the
+        local count — the signal that manual entries and live sync have
+        drifted apart and the board should be double-checked.
+
+        Raises RuntimeError if the draft is already complete, same
+        contract as record_pick.
+        """
+        if self.draft_complete:
+            raise RuntimeError("Draft is already complete.")
+
+        local_pick_number = self.current_pick_number
+        if pick_number is not None and pick_number != local_pick_number:
+            logger.warning(
+                f"Sleeper pick #{pick_number} arrived while local state expected "
+                f"#{local_pick_number} — manual entries and live sync may have "
+                f"diverged; recording with Sleeper's numbering."
+            )
+
+        pick_number = pick_number if pick_number is not None else local_pick_number
+        pick = PickRecord(
+            pick_number=pick_number,
+            round_number=round_number if round_number is not None else self.round_for_pick(pick_number),
+            team_slot=team_slot if team_slot is not None else self.slot_for_pick(pick_number),
             player_id=player_id,
             player_name=player_name,
             position=position,
