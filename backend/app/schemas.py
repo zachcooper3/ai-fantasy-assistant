@@ -63,6 +63,38 @@ class DraftConfigRequest(BaseModel):
     dst_slots: int = Field(default=1, ge=0, le=2)
 
 
+class SleeperPrefillResponse(BaseModel):
+    """
+    Best-effort settings detected from a Sleeper draft/league, for the setup
+    form to use as suggestions — never a silent override. Any field that
+    couldn't be confidently detected (API failure, league setting we don't
+    model) is left as None; the frontend leaves the user's existing/manual
+    value untouched in that case rather than clobbering it with something
+    made up.
+
+    detected_scoring_format is informational only. This app's ADP data,
+    player metrics, and AI system prompt are all PPR-specific regardless of
+    what a given league actually scores (see ingestion/fetch_adp.py,
+    ai_service.py's _SYSTEM_PROMPT) — there's no code path today that
+    changes behavior based on scoring_format. So this field is surfaced to
+    warn the user if their league isn't PPR, but is deliberately never
+    written into DraftConfigRequest.scoring_format; doing so would just
+    relabel the UI without making anything underneath actually accurate for
+    a non-PPR league.
+    """
+    league_size: int | None = None
+    total_rounds: int | None = None
+    my_draft_position: int | None = None
+    qb_slots: int | None = None
+    rb_slots: int | None = None
+    wr_slots: int | None = None
+    te_slots: int | None = None
+    flex_slots: int | None = None
+    dst_slots: int | None = None
+    detected_scoring_format: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
 class PickRequest(BaseModel):
     """Request body for POST /api/draft/pick."""
     player_id: int
@@ -85,6 +117,15 @@ class DraftStateResponse(BaseModel):
     my_draft_position: int
     total_rounds: int
     scoring_format: str
+    # Echoed back so the frontend's "reset with current settings" flow (see
+    # page.tsx's onReset) can re-POST the league's actual roster config
+    # instead of silently falling back to DraftConfigRequest's defaults.
+    qb_slots: int
+    rb_slots: int
+    wr_slots: int
+    te_slots: int
+    flex_slots: int
+    dst_slots: int
     current_pick_number: int
     current_round: int
     current_team_slot: int

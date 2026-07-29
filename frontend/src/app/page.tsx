@@ -57,6 +57,12 @@ export default function DraftPage() {
           league_size: session.league_size,
           my_draft_position: session.my_draft_position,
           total_rounds: session.total_rounds,
+          qb_slots: session.qb_slots,
+          rb_slots: session.rb_slots,
+          wr_slots: session.wr_slots,
+          te_slots: session.te_slots,
+          flex_slots: session.flex_slots,
+          dst_slots: session.dst_slots,
         })}
       />
 

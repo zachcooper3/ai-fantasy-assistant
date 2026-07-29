@@ -5,14 +5,79 @@
  */
 
 import { useState } from "react";
+import { api, SleeperPrefill } from "@/lib/api";
 
 interface Props {
   onStart: (config: {
     league_size: number;
     my_draft_position: number;
     total_rounds: number;
+    qb_slots: number;
+    rb_slots: number;
+    wr_slots: number;
+    te_slots: number;
+    flex_slots: number;
+    dst_slots: number;
     sleeper_draft_id?: string;
   }) => void;
+}
+
+// Today's implicit standard 1-QB PPR lineup — matches DraftConfig's own
+// field defaults on the backend. Selecting these in the UI changes nothing
+// from current behavior; only deviating from them does.
+const DEFAULT_LINEUP = { qb: 1, rb: 2, wr: 2, te: 1, flex: 1, dst: 1 };
+
+// Mirrors the ge/le bounds on DraftConfigRequest in backend/app/schemas.py —
+// kept in sync manually since there's no shared schema between front and
+// back end yet.
+const SLOT_BOUNDS = {
+  qb: { min: 0, max: 4 },
+  rb: { min: 0, max: 6 },
+  wr: { min: 0, max: 6 },
+  te: { min: 0, max: 4 },
+  flex: { min: 0, max: 4 },
+  dst: { min: 0, max: 2 },
+};
+
+function Stepper({
+  label,
+  value,
+  onChange,
+  min,
+  max,
+}: {
+  label: string;
+  value: number;
+  onChange: (n: number) => void;
+  min: number;
+  max: number;
+}) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-sm text-slate-300">{label}</span>
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => onChange(Math.max(min, value - 1))}
+          disabled={value <= min}
+          className="w-7 h-7 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 font-bold"
+        >
+          −
+        </button>
+        <span className="w-4 text-center text-sm font-semibold text-slate-100">
+          {value}
+        </span>
+        <button
+          type="button"
+          onClick={() => onChange(Math.min(max, value + 1))}
+          disabled={value >= max}
+          className="w-7 h-7 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 font-bold"
+        >
+          +
+        </button>
+      </div>
+    </div>
+  );
 }
 
 export default function SetupModal({ onStart }: Props) {
@@ -20,6 +85,66 @@ export default function SetupModal({ onStart }: Props) {
   const [draftPos, setDraftPos] = useState(1);
   const [rounds, setRounds] = useState(15);
   const [sleeperDraftId, setSleeperDraftId] = useState("");
+  const [sleeperUsername, setSleeperUsername] = useState("");
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [detectWarnings, setDetectWarnings] = useState<string[]>([]);
+  const [detectError, setDetectError] = useState<string | null>(null);
+  const [detectedScoring, setDetectedScoring] = useState<string | null>(null);
+
+  const [showRosterSettings, setShowRosterSettings] = useState(false);
+  const [qbSlots, setQbSlots] = useState(DEFAULT_LINEUP.qb);
+  const [rbSlots, setRbSlots] = useState(DEFAULT_LINEUP.rb);
+  const [wrSlots, setWrSlots] = useState(DEFAULT_LINEUP.wr);
+  const [teSlots, setTeSlots] = useState(DEFAULT_LINEUP.te);
+  const [flexSlots, setFlexSlots] = useState(DEFAULT_LINEUP.flex);
+  const [dstSlots, setDstSlots] = useState(DEFAULT_LINEUP.dst);
+
+  const isDefaultLineup =
+    qbSlots === DEFAULT_LINEUP.qb &&
+    rbSlots === DEFAULT_LINEUP.rb &&
+    wrSlots === DEFAULT_LINEUP.wr &&
+    teSlots === DEFAULT_LINEUP.te &&
+    flexSlots === DEFAULT_LINEUP.flex &&
+    dstSlots === DEFAULT_LINEUP.dst;
+
+  // Best-effort — populates whatever Sleeper reports as suggestions, never
+  // blocks manual entry. See SleeperPrefillResponse's docstring in
+  // backend/app/schemas.py for why detected_scoring_format isn't applied
+  // to any field here (this app is PPR-only regardless of league scoring).
+  async function handleDetect() {
+    if (!sleeperDraftId) return;
+    setIsDetecting(true);
+    setDetectError(null);
+    setDetectWarnings([]);
+    setDetectedScoring(null);
+    try {
+      const r: SleeperPrefill = await api.getSleeperPrefill(
+        sleeperDraftId,
+        sleeperUsername || undefined
+      );
+      if (r.league_size != null) setLeagueSize(r.league_size);
+      if (r.total_rounds != null) setRounds(r.total_rounds);
+      if (r.my_draft_position != null) setDraftPos(r.my_draft_position);
+
+      let rosterChanged = false;
+      if (r.qb_slots != null) { setQbSlots(r.qb_slots); rosterChanged = true; }
+      if (r.rb_slots != null) { setRbSlots(r.rb_slots); rosterChanged = true; }
+      if (r.wr_slots != null) { setWrSlots(r.wr_slots); rosterChanged = true; }
+      if (r.te_slots != null) { setTeSlots(r.te_slots); rosterChanged = true; }
+      if (r.flex_slots != null) { setFlexSlots(r.flex_slots); rosterChanged = true; }
+      if (r.dst_slots != null) { setDstSlots(r.dst_slots); rosterChanged = true; }
+      if (rosterChanged) setShowRosterSettings(true);
+
+      setDetectedScoring(r.detected_scoring_format);
+      setDetectWarnings(r.warnings);
+    } catch (e) {
+      setDetectError(
+        e instanceof Error ? e.message : "Couldn't detect settings from Sleeper."
+      );
+    } finally {
+      setIsDetecting(false);
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
@@ -98,6 +223,55 @@ export default function SetupModal({ onStart }: Props) {
             </div>
           </div>
 
+          {/* Roster settings — advanced, collapsed by default */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowRosterSettings((v) => !v)}
+              className="flex items-center gap-1.5 text-sm font-medium text-slate-400 hover:text-slate-300 transition-colors"
+            >
+              <span className={`transition-transform ${showRosterSettings ? "rotate-90" : ""}`}>
+                ›
+              </span>
+              Advanced: Roster settings
+              {!isDefaultLineup && (
+                <span className="text-xs font-normal text-emerald-400">(customized)</span>
+              )}
+            </button>
+
+            {showRosterSettings && (
+              <div className="mt-3 p-4 rounded-xl bg-slate-800/60 border border-slate-700 space-y-2.5">
+                <p className="text-xs text-slate-500 mb-3">
+                  How many starters at each position. Defaults match a standard
+                  1-QB PPR lineup — only change these if your league's roster
+                  settings are different.
+                </p>
+                <Stepper label="QB" value={qbSlots} onChange={setQbSlots} {...SLOT_BOUNDS.qb} />
+                <Stepper label="RB" value={rbSlots} onChange={setRbSlots} {...SLOT_BOUNDS.rb} />
+                <Stepper label="WR" value={wrSlots} onChange={setWrSlots} {...SLOT_BOUNDS.wr} />
+                <Stepper label="TE" value={teSlots} onChange={setTeSlots} {...SLOT_BOUNDS.te} />
+                <Stepper label="FLEX" value={flexSlots} onChange={setFlexSlots} {...SLOT_BOUNDS.flex} />
+                <Stepper label="DST" value={dstSlots} onChange={setDstSlots} {...SLOT_BOUNDS.dst} />
+                {!isDefaultLineup && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQbSlots(DEFAULT_LINEUP.qb);
+                      setRbSlots(DEFAULT_LINEUP.rb);
+                      setWrSlots(DEFAULT_LINEUP.wr);
+                      setTeSlots(DEFAULT_LINEUP.te);
+                      setFlexSlots(DEFAULT_LINEUP.flex);
+                      setDstSlots(DEFAULT_LINEUP.dst);
+                    }}
+                    className="text-xs text-slate-500 hover:text-slate-300 underline mt-1"
+                  >
+                    Reset to standard
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Sleeper draft ID — optional */}
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-1">
@@ -115,6 +289,42 @@ export default function SetupModal({ onStart }: Props) {
               onChange={(e) => setSleeperDraftId(e.target.value.trim())}
               className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-600 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:border-slate-400"
             />
+
+            {sleeperDraftId && (
+              <div className="mt-3 space-y-2">
+                <input
+                  type="text"
+                  placeholder="Sleeper username (optional — to auto-detect your draft slot)"
+                  value={sleeperUsername}
+                  onChange={(e) => setSleeperUsername(e.target.value.trim())}
+                  className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-600 text-slate-200 text-sm placeholder-slate-500 focus:outline-none focus:border-slate-400"
+                />
+                <button
+                  type="button"
+                  onClick={handleDetect}
+                  disabled={isDetecting}
+                  className="w-full py-2 rounded-lg bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 text-sm font-semibold transition-colors"
+                >
+                  {isDetecting ? "Detecting…" : "Autofill from Sleeper"}
+                </button>
+
+                {detectError && (
+                  <p className="text-xs text-red-400">{detectError}</p>
+                )}
+                {detectWarnings.length > 0 && (
+                  <ul className="text-xs text-amber-400 space-y-1 list-disc list-inside">
+                    {detectWarnings.map((w, i) => (
+                      <li key={i}>{w}</li>
+                    ))}
+                  </ul>
+                )}
+                {!detectError && detectWarnings.length === 0 && detectedScoring && (
+                  <p className="text-xs text-emerald-400">
+                    ✓ Settings detected ({detectedScoring.replace("_", " ")} scoring)
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -123,6 +333,12 @@ export default function SetupModal({ onStart }: Props) {
           <div>
             {leagueSize}-team PPR · Slot {draftPos} of {leagueSize} · {rounds} rounds
           </div>
+          {!isDefaultLineup && (
+            <div className="mt-1 text-xs text-slate-400">
+              Lineup: {qbSlots} QB, {rbSlots} RB, {wrSlots} WR, {teSlots} TE,{" "}
+              {flexSlots} FLEX, {dstSlots} DST
+            </div>
+          )}
           {sleeperDraftId && (
             <div className="text-emerald-400 mt-1 text-xs">
               ✓ Sleeper sync enabled — picks will update automatically
@@ -136,6 +352,12 @@ export default function SetupModal({ onStart }: Props) {
               league_size: leagueSize,
               my_draft_position: draftPos,
               total_rounds: rounds,
+              qb_slots: qbSlots,
+              rb_slots: rbSlots,
+              wr_slots: wrSlots,
+              te_slots: teSlots,
+              flex_slots: flexSlots,
+              dst_slots: dstSlots,
               ...(sleeperDraftId ? { sleeper_draft_id: sleeperDraftId } : {}),
             })
           }

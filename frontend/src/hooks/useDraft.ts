@@ -29,6 +29,12 @@ export interface DraftHook {
     league_size: number;
     my_draft_position: number;
     total_rounds: number;
+    qb_slots?: number;
+    rb_slots?: number;
+    wr_slots?: number;
+    te_slots?: number;
+    flex_slots?: number;
+    dst_slots?: number;
     sleeper_draft_id?: string;
   }) => Promise<void>;
   recordPick: (playerId: number) => Promise<void>;
@@ -120,6 +126,12 @@ export function useDraft(): DraftHook {
       league_size: number;
       my_draft_position: number;
       total_rounds: number;
+      qb_slots?: number;
+      rb_slots?: number;
+      wr_slots?: number;
+      te_slots?: number;
+      flex_slots?: number;
+      dst_slots?: number;
       sleeper_draft_id?: string;
     }) => {
       try {

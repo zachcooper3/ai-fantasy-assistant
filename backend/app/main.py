@@ -35,7 +35,7 @@ from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.ai_service import AIService
 from backend.app.services.draft_sync import DraftSyncService
 from backend.app.services import sleeper_client
-from backend.app.api import players, draft, websocket, recommendations, sync
+from backend.app.api import players, draft, websocket, recommendations, sync, sleeper
 from backend.ingestion.fetch_adp import auto_refresh as _refresh_adp, adp_age_str, OUT_PATH
 
 
@@ -119,6 +119,7 @@ app.include_router(players.router)
 app.include_router(draft.router)
 app.include_router(recommendations.router)
 app.include_router(sync.router)
+app.include_router(sleeper.router)
 app.include_router(websocket.router)
 
 
