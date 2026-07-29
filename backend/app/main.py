@@ -29,7 +29,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.db.database import create_db_and_tables
+from sqlmodel import Session
+
+from backend.db.database import create_db_and_tables, engine
+from backend.db import draft_session_repo
+from backend.db import player_repo
 from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.ai_service import AIService
@@ -69,8 +73,20 @@ async def lifespan(app: FastAPI):
     # Startup: create DB tables and attach services to app state
     create_db_and_tables()
 
-    # Auto-refresh ADP data if the CSV is older than 7 days
-    await _refresh_adp()
+    # Check for a persisted draft session BEFORE the ADP auto-refresh.
+    # If one exists, this boot is (or may be) a mid-draft restart, and the
+    # refresh must be skipped: ingest_csv() does a full delete-and-reinsert
+    # of Player, which reassigns every Player.id out from under the
+    # journaled picks and resets is_available on the whole board. Two-day-
+    # old ADP is a far smaller cost than a corrupted live draft.
+    with Session(engine) as db:
+        persisted = draft_session_repo.load_state(db)
+
+    if persisted is None:
+        # Auto-refresh ADP data if the CSV is older than the threshold
+        await _refresh_adp()
+    else:
+        print("Persisted draft session found — skipping ADP auto-refresh (mid-draft restart).")
 
     draft_service = DraftStateService()
     connection_manager = ConnectionManager()
@@ -78,6 +94,24 @@ async def lifespan(app: FastAPI):
     app.state.connection_manager = connection_manager
     app.state.ai_service = AIService()
     app.state.sync_service = DraftSyncService(draft_service, connection_manager)
+
+    if persisted is not None:
+        config, picks = persisted
+        draft_service.restore_session(config, picks)
+        # Re-assert availability flags from the journal. Normally already
+        # correct (both are written per-pick), but this heals the one bad
+        # case: a crash landing between the two writes, or an availability
+        # reset that happened without the journal being cleared.
+        with Session(engine) as db:
+            for p in picks:
+                if p.player_id != -1:
+                    player_repo.mark_as_drafted(db, p.player_id)
+        print(
+            f"Recovered active draft session: {len(picks)} pick(s), "
+            f"round {draft_service.current_round}, "
+            f"pick #{draft_service.current_pick_number} on the clock. "
+            "Note: Sleeper live sync does not auto-resume — POST /api/sync/start again if needed."
+        )
 
     _print_startup_banner(app.state.ai_service)
     print("Fantasy Draft Assistant API is ready.")

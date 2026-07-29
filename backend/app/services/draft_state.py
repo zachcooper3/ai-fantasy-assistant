@@ -105,6 +105,16 @@ class DraftStateService:
         self._config = None
         self._picks = []
 
+    def restore_session(self, config: DraftConfig, picks: list[PickRecord]) -> None:
+        """
+        Rehydrates a session from persisted state (see
+        backend/db/draft_session_repo.py) — used by main.py's lifespan on
+        startup so a backend restart mid-draft resumes where it left off
+        instead of losing every pick.
+        """
+        self._config = config
+        self._picks = list(picks)
+
     @property
     def is_active(self) -> bool:
         return self._config is not None

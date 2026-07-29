@@ -44,6 +44,68 @@ class Player(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class DraftSession(SQLModel, table=True):
+    """
+    Single-row persistence of the active draft session's configuration.
+
+    Exists so a backend crash/restart mid-draft is recoverable: before this
+    table, all draft state lived in DraftStateService's process memory, and
+    a restart on draft day lost every pick with no recovery path (the
+    frontend dropped to the setup modal, and starting over wiped
+    Player.is_available too). Config lives here; the pick journal is the
+    DraftPick table below. Rehydration happens in main.py's lifespan via
+    draft_session_repo.load_state().
+
+    At most one row ever exists (fixed id=1 — this app manages exactly one
+    draft at a time, same assumption as DraftStateService itself). Created
+    on POST /api/draft/session, deleted on DELETE /api/draft/session.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    league_size: int
+    my_draft_position: int
+    total_rounds: int
+    scoring_format: str = "ppr"
+    qb_slots: int = 1
+    rb_slots: int = 2
+    wr_slots: int = 2
+    te_slots: int = 1
+    flex_slots: int = 1
+    dst_slots: int = 1
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DraftPick(SQLModel, table=True):
+    """
+    Append-only journal of picks in the active draft session — the
+    persistence counterpart of DraftStateService._picks (see DraftSession
+    above for why this exists). One row per recorded pick; rows are removed
+    on undo and cleared wholesale on session create/reset.
+
+    player_id is deliberately NOT a foreign key: sync records unresolvable
+    players with the placeholder id -1 (see draft_sync._process_pick), and
+    Player.id itself isn't reingest-stable (see PlayerMetrics' docstring).
+    The denormalized name/position/team fields make a journaled pick
+    self-describing even if the Player table shifts underneath it — and
+    startup rehydration deliberately skips the ADP auto-refresh while a
+    session exists, precisely so that shift can't happen mid-draft.
+
+    pick_number is indexed but not unique: manual entry and live sync can
+    disagree on numbering (logged as a divergence warning in
+    record_synced_pick), and refusing to journal the pick would be worse
+    than journaling the disagreement.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    pick_number: int = Field(index=True)
+    round_number: int
+    team_slot: int
+    player_id: int
+    player_name: str
+    position: str
+    nfl_team: str
+
+
 class PlayerMetrics(SQLModel, table=True):
     """
     Analytics for a player, computed from nflverse stats (via nflreadpy) —

@@ -18,6 +18,7 @@ from sqlmodel import Session
 
 from backend.db.database import get_session
 from backend.db import player_repo as repo
+from backend.db import draft_session_repo
 from backend.app.schemas import (
     BoardResponse,
     DraftConfigRequest,
@@ -91,6 +92,7 @@ async def start_session(
         dst_slots=body.dst_slots,
     )
     svc.start_session(config)
+    draft_session_repo.save_config(db, config)  # persist for crash recovery
     repo.reset_draft_availability(db)
     await mgr.broadcast({"type": "reset"})
     return build_state_response(svc)
@@ -115,6 +117,7 @@ async def end_session(
     player availability."""
     await sync.stop()
     svc.reset()
+    draft_session_repo.clear(db)
     repo.reset_draft_availability(db)
     await mgr.broadcast({"type": "reset"})
 
@@ -158,6 +161,7 @@ async def record_pick(
         nfl_team=player.team,
     )
     repo.mark_as_drafted(db, player.id)
+    draft_session_repo.append_pick(db, pick)  # journal for crash recovery
 
     my_slot = svc.config.my_draft_position
     pick_resp = build_pick_response(pick, my_slot)
@@ -190,6 +194,7 @@ async def undo_pick(
         raise HTTPException(status_code=400, detail="No picks to undo.")
 
     repo.mark_available(db, pick.player_id)
+    draft_session_repo.remove_pick(db, pick.pick_number)
 
     my_slot = svc.config.my_draft_position
     pick_resp = build_pick_response(pick, my_slot)

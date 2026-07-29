@@ -16,6 +16,7 @@ from sqlmodel import Session
 
 from backend.db.database import engine
 from backend.db import player_repo as repo
+from backend.db import draft_session_repo
 from backend.app.services import sleeper_client
 from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
@@ -257,6 +258,7 @@ class DraftSyncService:
             )
 
         self._synced_pick_count = pick_no
+        draft_session_repo.append_pick(db, pick)  # journal for crash recovery
 
         # Broadcast to all WebSocket clients
         my_slot = self._draft_svc.config.my_draft_position
