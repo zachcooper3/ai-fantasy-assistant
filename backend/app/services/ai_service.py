@@ -90,6 +90,16 @@ class RecommendationContext:
     # (see backend/app/api/recommendations.py::_build_context).
     starting_lineup: dict[str, int] = field(default_factory=lambda: dict(_STANDARD_STARTING_LINEUP))
 
+    # Per-player analytics keyed by Player.id, sourced from PlayerMetrics
+    # (see backend/db/models.py) — opportunity/volume, efficiency, team
+    # context, consistency/risk, and forward-looking signals computed from
+    # nflverse stats. A missing key or a None field both mean "unknown,"
+    # not zero. Populated in recommendations.py::_build_context via
+    # metrics_repo.get_metrics_bulk(); defaults empty so callers/tests that
+    # predate this field still work unchanged (prompt just omits the
+    # section entirely — see _format_metrics_section).
+    player_metrics: dict[int, dict] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Starting lineup gaps — gives Claude a concrete target, not just "consider
@@ -281,6 +291,157 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Opportunity & performance signals — grounds "upside"/"breakout" reasoning
+# in actual usage data instead of ADP and name recognition alone
+# ---------------------------------------------------------------------------
+
+# Rendered in a fixed order regardless of which fields a given player has.
+# (display label, PlayerMetrics dict key, format spec). Fields that are None
+# are skipped entirely rather than printed as "N/A" clutter — see
+# PlayerMetrics' docstring in backend/db/models.py for why a missing field
+# means "unknown," not zero.
+# Fields where an exact 0 is a structural non-event (a QB has 0.0
+# targets/gm by definition — that's not a signal, it's just the wrong
+# stat for that position) rather than meaningful data. Suppressed like
+# None for these specific fields only; a true 0% catch rate or 0 games
+# missed elsewhere is still worth showing.
+_SUPPRESS_ZERO = {"targets_per_game", "carries_per_game", "red_zone_touches_per_game"}
+
+_METRIC_FIELDS: list[tuple[str, str, str]] = [
+    ("tgt/gm", "targets_per_game", "{:.1f}"),
+    ("car/gm", "carries_per_game", "{:.1f}"),
+    ("RZ touches/gm", "red_zone_touches_per_game", "{:.1f}"),
+    ("snap %", "snap_pct", "{:.0%}"),
+    ("tgt share", "target_share", "{:.0%}"),
+    ("carry share", "carry_share", "{:.0%}"),
+    ("Y/tgt", "yards_per_target", "{:.1f}"),
+    ("Y/carry", "yards_per_carry", "{:.1f}"),
+    ("YAC/rec", "yac_per_reception", "{:.1f}"),
+    ("RACR", "racr", "{:.2f}"),
+    ("catch rate", "catch_rate", "{:.0%}"),
+    ("team pass rate", "team_pass_rate", "{:.0%}"),
+    ("depth chart rank", "depth_chart_rank", "{}"),
+]
+
+# Forward-looking signals are the clearest "breakout" indicators (a rising
+# role vs. earlier in the season) so they're called out in their own
+# trailing clause rather than blended into the raw volume list above.
+#
+# NOTE (2026-07-29): these three, plus is_rookie_or_second_year below, are
+# unpopulated for every player in the DB right now — fetch_metrics.py logs
+# "Could not load snap_counts — snap_pct will be unavailable" during
+# ingestion, so the snap/depth-chart data these depend on never lands.
+# This code is correct and will start rendering automatically once that
+# ingestion gap is fixed; until then, expect this clause to be silent for
+# every player. Worth a separate look — see fetch_metrics.py.
+_TREND_FIELDS: list[tuple[str, str, str]] = [
+    ("target share trend", "target_share_trend", "{:+.0%}"),
+    ("snap % trend", "snap_pct_trend", "{:+.0%}"),
+    ("depth chart Δ (neg=moving up)", "depth_chart_trend", "{:+d}"),
+]
+
+
+def _format_metrics_line(m: dict) -> str | None:
+    """
+    Builds one compact line from whichever metrics are actually populated
+    for a player. Returns None if nothing at all is usable — the caller
+    renders an explicit "no data" line in that case (see
+    _format_metrics_section), same reasoning as _retrieve_player_context's
+    "no retrieved data" line: silence reads as "nothing good to say" to an
+    LLM, which is not the message a data-coverage gap should send.
+    """
+    parts = [
+        f"{label} {fmt.format(m[key])}"
+        for label, key, fmt in _METRIC_FIELDS
+        if m.get(key) is not None and not (key in _SUPPRESS_ZERO and m[key] == 0)
+    ]
+
+    if m.get("fantasy_points_avg") is not None:
+        consistency = f"{m['fantasy_points_avg']:.1f} PPR pts/gm"
+        if m.get("fantasy_points_stdev") is not None:
+            consistency += f" (±{m['fantasy_points_stdev']:.1f} stdev)"
+        if m.get("games_played") is not None:
+            consistency += f" over {m['games_played']} gm"
+        parts.append(consistency)
+
+    risk_bits = []
+    if m.get("injury_report_appearances"):
+        risk_bits.append(f"{m['injury_report_appearances']} wks on injury report")
+    if m.get("games_missed"):
+        risk_bits.append(f"{m['games_missed']} games missed")
+    if risk_bits:
+        parts.append(", ".join(risk_bits))
+
+    trend_parts = [
+        f"{label} {fmt.format(m[key])}"
+        for label, key, fmt in _TREND_FIELDS
+        if m.get(key) is not None
+    ]
+    if m.get("is_rookie_or_second_year"):
+        trend_parts.append("rookie/2nd-year")
+
+    if not parts and not trend_parts:
+        return None
+
+    line = ", ".join(parts)
+    if trend_parts:
+        line += (" | " if line else "") + ", ".join(trend_parts)
+    return line
+
+
+def _format_metrics_section(top_available: list[dict], player_metrics: dict[int, dict]) -> str:
+    """
+    Renders a prior-season opportunity/efficiency/consistency snapshot for
+    the top candidates, so "upside"/"breakout" reasoning is grounded in
+    real usage data instead of just ADP and name recognition. Labeled
+    "prior season" deliberately — this is trailing-year data, not a 2026
+    projection, and the prompt shouldn't read it as a guarantee.
+
+    Same "explicit absence" pattern as _retrieve_player_context: a checked
+    player with no PlayerMetrics row gets a stated reason, not silence —
+    with one exception: DST/K aren't individual-usage positions at all
+    (PlayerMetrics is built around targets/carries/snaps, which have no
+    meaning for a team defense or a kicker), so they never have a row and
+    that's not a coverage gap to explain away, it's just the wrong table.
+    Confirmed live: every DST in the DB has zero PlayerMetrics rows.
+    """
+    sections: list[str] = []
+    for p in top_available[:_MAX_CONTEXT_PLAYERS]:
+        m = player_metrics.get(p["id"])
+        if m is None:
+            if p["position"] in ("DST", "K"):
+                sections.append(
+                    f"- {p['name']} ({p['position']}): Not modeled by this metrics table "
+                    f"(built for individual offensive usage) — evaluate by matchup, "
+                    f"scheme, and ADP instead."
+                )
+            else:
+                sections.append(
+                    f"- {p['name']} ({p['position']}): No prior-season metrics on file "
+                    f"(likely a rookie, or minimal snaps last season) — a data-coverage "
+                    f"gap, not a signal against the player."
+                )
+            continue
+        line = _format_metrics_line(m)
+        if line is None:
+            sections.append(
+                f"- {p['name']} ({p['position']}): Metrics on file but nothing usable "
+                f"was computed for this player."
+            )
+        else:
+            sections.append(f"- {p['name']} ({p['position']}) [{m.get('season')} season]: {line}")
+
+    if not sections:
+        return ""
+
+    return "\n".join([
+        "## Opportunity & Performance Signals (prior season — top candidates)",
+        *sections,
+        "",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Prompt builder
 # ---------------------------------------------------------------------------
 
@@ -330,15 +491,20 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # Built from ctx.starting_lineup (not hardcoded) so this line reflects
     # this league's actual configured roster, e.g. via /api/draft/session.
     _slot_order = ["QB", "RB", "WR", "TE", "FLEX", "DST"]
-    required_str = ", ".join(
+    roster_str = ", ".join(
         f"{ctx.starting_lineup[pos]} {pos}"
         for pos in _slot_order
         if ctx.starting_lineup.get(pos, 0) > 0
     )
     if gaps:
         gap_total = sum(gaps.values())
-        lines.append(f"## Starting Lineup Status (required: {required_str})")
-        lines.append(f"Still need to fill: {lineup_str}")
+        lines.append(f"## League's Configured Starting Roster Shape ({roster_str})")
+        # Informational, not imperative — this is roster awareness, not an
+        # instruction to fill these before a better value/upside pick. See
+        # the Task section and _SYSTEM_PROMPT below for the actual
+        # prioritization: value/upside first, gap-filling only escalates to
+        # a hard priority once the URGENT line below appears.
+        lines.append(f"Open slots (not yet on your roster): {lineup_str}")
         if gap_total >= rounds_remaining and rounds_remaining > 0:
             lines.append(
                 f"URGENT: {gap_total} required starting slot(s) still open with only "
@@ -348,7 +514,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         lines.append("")
     else:
         lines += [
-            f"## Starting Lineup Status (required: {required_str})",
+            f"## League's Configured Starting Roster Shape ({roster_str})",
             "All required starting slots filled.",
             "",
         ]
@@ -387,6 +553,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                 lines.append(f"  Slot {slot:>2}: {pos_str}")
         lines.append("")
 
+    # Opportunity/performance signals (best-effort; omitted if no metrics at all)
+    metrics_section = _format_metrics_section(ctx.top_available, ctx.player_metrics)
+    if metrics_section:
+        lines.append(metrics_section)
+
     # Retrieved player news/analysis (best-effort; omitted if unavailable)
     retrieved = _retrieve_player_context(ctx.top_available)
     if retrieved:
@@ -396,10 +567,15 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     lines += [
         "## Task",
         "Recommend the best pick for my team right now.",
-        "Consider: roster needs, positional scarcity, ADP value, and how long until my next turn. "
-        "If the Starting Lineup Status above shows an open required slot with few rounds left, "
-        "that takes priority over a marginally-better value pick at a position you've already filled — "
-        "an empty starting slot is a bigger problem than a slightly-worse ADP value.",
+        "Weigh ADP as one input among several, not the deciding factor. Prioritize "
+        "long-term value and upside: use the Opportunity & Performance Signals section "
+        "to judge real usage and efficiency, and call out any candidate whose underlying "
+        "opportunity looks stronger than their ADP suggests as a potential breakout. Use "
+        "the roster shape section above for awareness of which starting slots are still "
+        "open, but don't let that alone override a clearly better value/upside pick — the "
+        "exception is when that section includes an URGENT line, at which point rounds "
+        "are genuinely running out to complete a legal starting lineup, and filling the "
+        "open slot(s) takes priority.",
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
@@ -419,7 +595,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                     "reasoning": "<brief>",
                 }
             ],
-            "alerts": ["<any scarcity warnings, handcuff notes, or tier drop-off flags>"],
+            "alerts": ["<any scarcity warnings, handcuff notes, tier drop-off flags, or breakout/value calls>"],
         }, indent=2),
     ]
 
@@ -427,16 +603,30 @@ def _build_prompt(ctx: RecommendationContext) -> str:
 
 
 _SYSTEM_PROMPT = (
-    "You are an expert fantasy football draft advisor for a PPR Sleeper league. "
-    "You give concise, data-driven recommendations grounded in ADP, positional scarcity, "
-    "and roster construction strategy. A team with an empty required starting slot (see "
-    "Starting Lineup Status) is incomplete no matter how good its other picks are — do not "
-    "let general positional-scarcity reasoning (e.g. 'QB is deep, plenty of value left') "
-    "cause you to leave a required slot unfilled as rounds run out. "
-    "Some players — especially rookies — will show 'No retrieved data' in the Player News & "
-    "Analysis section. That reflects a gap in available statistics (no prior NFL season to "
-    "compute from), not a judgment about the player. Do not treat missing retrieved data as a "
-    "reason to avoid a player; judge them on ADP/consensus value like anyone else. "
+    "You are an expert fantasy football draft advisor for a PPR Sleeper league. You give "
+    "concise, data-driven recommendations and draw on standard fantasy football draft "
+    "strategy: value-based drafting (the best player relative to positional replacement "
+    "level, not just the next recognizable name), taking on more boom/bust upside as the "
+    "draft moves past the first few rounds, and not overpaying for reputation or last "
+    "season's box score over a player's actual current opportunity. "
+    "ADP is one input, not the deciding one — weigh it alongside the Opportunity & "
+    "Performance Signals section (real usage, efficiency, and week-to-week consistency "
+    "from last season) and the Player News & Analysis section (current role and injury "
+    "context). A player whose underlying opportunity — targets, carries, red zone usage, "
+    "snap share — looks stronger than their ADP suggests is a potential breakout; call "
+    "that out explicitly in your reasoning or alerts rather than defaulting to the "
+    "safest name-brand pick. "
+    "Favor long-term value and upside over reflexively filling a roster gap — a marginal "
+    "'need' edge is rarely worth passing on the better player, especially early in a "
+    "draft. Use the roster shape section to stay aware of which starting slots remain "
+    "open, but only let that override a better value/upside pick once that section "
+    "includes an URGENT line — at that point rounds are genuinely running out to "
+    "complete a legal starting lineup, and filling it takes priority. "
+    "Some players — especially rookies — will show 'No retrieved data' or 'No "
+    "prior-season metrics' in the sections above. That reflects a gap in available "
+    "statistics (no prior NFL season to compute from), not a judgment about the player. "
+    "Do not treat a missing data section as a reason to avoid a player; judge them on "
+    "ADP/consensus value and whatever other context you do have. "
     "You always respond with valid JSON and nothing else."
 )
 

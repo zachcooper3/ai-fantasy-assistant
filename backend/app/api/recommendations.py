@@ -14,6 +14,7 @@ from sqlmodel import Session
 
 from backend.db.database import get_session
 from backend.db import player_repo as repo
+from backend.db import metrics_repo
 from backend.app.schemas import PlayerResponse
 from backend.app.services.ai_service import AIService, RecommendationContext
 from backend.app.services.draft_state import DraftStateService
@@ -72,6 +73,43 @@ class ScarcityAnalysisResponse(BaseModel):
 # Context builder — assembles data from draft state + DB
 # ---------------------------------------------------------------------------
 
+def _metrics_dict(m) -> dict:
+    """
+    Flattens a PlayerMetrics row into a plain dict — decouples ai_service.py
+    from the SQLModel/DB layer, matching how top_available/my_roster below
+    are already built as plain dicts rather than passed as ORM rows.
+    Every field can legitimately be None (see PlayerMetrics' docstring in
+    backend/db/models.py); ai_service.py's formatting is expected to treat
+    a missing/None field as "unknown," never as zero.
+    """
+    return {
+        "season": m.season,
+        "through_week": m.through_week,
+        "games_played": m.games_played,
+        "targets_per_game": m.targets_per_game,
+        "carries_per_game": m.carries_per_game,
+        "red_zone_touches_per_game": m.red_zone_touches_per_game,
+        "snap_pct": m.snap_pct,
+        "target_share": m.target_share,
+        "carry_share": m.carry_share,
+        "yards_per_target": m.yards_per_target,
+        "yards_per_carry": m.yards_per_carry,
+        "yac_per_reception": m.yac_per_reception,
+        "racr": m.racr,
+        "catch_rate": m.catch_rate,
+        "team_pass_rate": m.team_pass_rate,
+        "depth_chart_rank": m.depth_chart_rank,
+        "fantasy_points_avg": m.fantasy_points_avg,
+        "fantasy_points_stdev": m.fantasy_points_stdev,
+        "injury_report_appearances": m.injury_report_appearances,
+        "games_missed": m.games_missed,
+        "target_share_trend": m.target_share_trend,
+        "snap_pct_trend": m.snap_pct_trend,
+        "depth_chart_trend": m.depth_chart_trend,
+        "is_rookie_or_second_year": m.is_rookie_or_second_year,
+    }
+
+
 def _build_context(
     svc: DraftStateService,
     db: Session,
@@ -92,6 +130,14 @@ def _build_context(
         }
         for p in repo.get_top_available(db, n=top_n)
     ]
+
+    # Analytics for the same players, keyed by Player.id — see
+    # ai_service.py's RecommendationContext.player_metrics docstring and
+    # PlayerMetrics in backend/db/models.py. Missing from this dict simply
+    # means "never computed for this player" (e.g. a rookie with no prior
+    # NFL season), not zero.
+    metrics_rows = metrics_repo.get_metrics_bulk(db, [p["id"] for p in top_available])
+    player_metrics = {pid: _metrics_dict(m) for pid, m in metrics_rows.items()}
 
     # My roster as plain dicts
     my_roster = [
@@ -122,6 +168,7 @@ def _build_context(
         available_counts=repo.count_available_by_position(db),
         opponent_position_counts=opponent_position_counts,
         starting_lineup=svc.config.starting_lineup,
+        player_metrics=player_metrics,
     )
 
 
