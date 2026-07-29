@@ -16,6 +16,7 @@ Usage:
 Author: Zach Cooper
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -829,15 +830,11 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
 _PLACEHOLDER_KEYS = {"your_key_here"}
 
 
-def build_anthropic_client(api_key_env: str = "ANTHROPIC_API_KEY") -> anthropic.Anthropic | None:
+def _resolve_api_key(api_key_env: str = "ANTHROPIC_API_KEY") -> str | None:
     """
-    Reads an API key from the given env var and returns a configured client,
-    or None if the key is unset or still the .env.example placeholder.
-
-    Shared by AIService (live per-pick recommendations) and
-    backend/ingestion/fetch_synthesis.py (batch "what it means" note
-    generation) so the placeholder-key guard — the part actually worth
-    not duplicating — only has to live in one place.
+    Reads an API key from the given env var, returning None if it's unset or
+    still the .env.example placeholder. The placeholder-key guard lives here,
+    once, shared by both client builders below.
     """
     api_key = (os.getenv(api_key_env) or "").strip()
 
@@ -851,7 +848,31 @@ def build_anthropic_client(api_key_env: str = "ANTHROPIC_API_KEY") -> anthropic.
         logger.warning(f"{api_key_env} not set.")
         return None
 
-    return anthropic.Anthropic(api_key=api_key)
+    return api_key
+
+
+def build_anthropic_client(api_key_env: str = "ANTHROPIC_API_KEY") -> anthropic.Anthropic | None:
+    """
+    Returns a configured *synchronous* client, or None if no real key is set.
+
+    Used by backend/ingestion/fetch_synthesis.py (batch, offline — blocking
+    is fine there). The live app uses build_async_anthropic_client instead:
+    a sync client inside FastAPI's event loop blocks every other coroutine
+    (WebSocket pushes, the Sleeper sync poll loop, all other requests) for
+    the full duration of each multi-second Claude call.
+    """
+    api_key = _resolve_api_key(api_key_env)
+    return anthropic.Anthropic(api_key=api_key) if api_key else None
+
+
+def build_async_anthropic_client(api_key_env: str = "ANTHROPIC_API_KEY") -> anthropic.AsyncAnthropic | None:
+    """
+    Async variant of build_anthropic_client, for use inside the FastAPI
+    event loop (AIService.recommend). Same key resolution and placeholder
+    guard; the API call is awaited instead of blocking the loop.
+    """
+    api_key = _resolve_api_key(api_key_env)
+    return anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
 
 
 class AIService:
@@ -861,7 +882,11 @@ class AIService:
     """
 
     def __init__(self) -> None:
-        self._client = build_anthropic_client()
+        # Async client — recommend() runs inside FastAPI's event loop, and a
+        # sync client there would freeze the whole server (WebSocket pushes,
+        # the 2s Sleeper sync poll, every other request) for the full
+        # duration of each Claude call.
+        self._client = build_async_anthropic_client()
         if self._client is None:
             logger.warning("AI recommendations will use fallback mode until a real key is set.")
         self._model = _DEFAULT_MODEL
@@ -883,10 +908,17 @@ class AIService:
         if self._client is None:
             return _fallback(ctx, self._model)
 
-        prompt = _build_prompt(ctx)
+        # _build_prompt is sync on purpose (it's also used by the CLI
+        # preview in main() below), but it contains the ChromaDB retrieval —
+        # up to _MAX_CONTEXT_PLAYERS embedding+query round trips on a cache
+        # miss. Run it in a worker thread so those blocking calls don't
+        # stall the event loop the same way the sync Anthropic client used
+        # to. Thread safety: it only touches SQLite-free plain dicts, the
+        # GIL-safe _retrieval_cache, and Chroma's own client.
+        prompt = await asyncio.to_thread(_build_prompt, ctx)
 
         try:
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=1024,
                 system=_SYSTEM_PROMPT,
