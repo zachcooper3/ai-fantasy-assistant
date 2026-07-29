@@ -116,6 +116,7 @@ def _build_context(
         picks_until_my_turn=svc.picks_until_my_turn,
         my_next_pick_number=svc.my_next_pick_number,
         scoring_format=svc.config.scoring_format,
+        total_rounds=svc.config.total_rounds,
         my_roster=my_roster,
         top_available=top_available,
         available_counts=repo.count_available_by_position(db),

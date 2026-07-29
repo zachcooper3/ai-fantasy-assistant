@@ -65,6 +65,7 @@ class RecommendationContext:
     picks_until_my_turn: int
     my_next_pick_number: int | None
     scoring_format: str = "ppr"
+    total_rounds: int = 15
 
     # My roster — list of {player_name, position, nfl_team}
     my_roster: list[dict] = field(default_factory=list)
@@ -82,6 +83,61 @@ class RecommendationContext:
 
 
 # ---------------------------------------------------------------------------
+# Starting lineup gaps — gives Claude a concrete target, not just "consider
+# roster needs"
+# ---------------------------------------------------------------------------
+
+# Standard PPR starting lineup for a 12-team, 15-round league (this app's
+# defaults — see DraftConfig). There's no per-league roster-construction
+# config anywhere in this app yet, so this is a reasonable fixed assumption
+# rather than something read from user settings.
+#
+# This exists because a real gap was found live: the AI never once
+# recommended a QB across a full draft. Root cause wasn't a bad prompt
+# instruction, it was a missing one — nothing anywhere in RecommendationContext
+# told Claude how many of each position it actually needs to start, so
+# "consider roster needs" had nothing concrete to check against, and
+# generic positional-scarcity reasoning (QB is deep, plenty of value left)
+# never got overridden even deep into the draft when a starter was still
+# needed.
+_STANDARD_STARTING_LINEUP = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1}
+_FLEX_ELIGIBLE_POSITIONS = {"RB", "WR", "TE"}
+
+
+def _compute_roster_gaps(
+    my_roster: list[dict],
+    lineup: dict[str, int] = _STANDARD_STARTING_LINEUP,
+) -> dict[str, int]:
+    """
+    Returns {position: still_needed} for every starting slot not yet filled,
+    treating extra RB/WR/TE beyond their required minimums as satisfying the
+    FLEX slot. Positions already fully covered are omitted entirely (empty
+    dict = a complete starting lineup).
+    """
+    have: dict[str, int] = {}
+    for p in my_roster:
+        have[p["position"]] = have.get(p["position"], 0) + 1
+
+    gaps: dict[str, int] = {}
+    flex_surplus = 0
+    for pos, required in lineup.items():
+        if pos == "FLEX":
+            continue
+        have_count = have.get(pos, 0)
+        shortfall = max(0, required - have_count)
+        if shortfall:
+            gaps[pos] = shortfall
+        if pos in _FLEX_ELIGIBLE_POSITIONS:
+            flex_surplus += max(0, have_count - required)
+
+    flex_needed = max(0, lineup.get("FLEX", 0) - flex_surplus)
+    if flex_needed:
+        gaps["FLEX"] = flex_needed
+
+    return gaps
+
+
+# ---------------------------------------------------------------------------
 # Retrieval — grounds the prompt in real news/analysis from ChromaDB
 # ---------------------------------------------------------------------------
 
@@ -89,7 +145,47 @@ class RecommendationContext:
 # for all 25 listed players would balloon both latency and prompt size for
 # players near the bottom of the list that are unlikely to be picked anyway.
 _MAX_CONTEXT_PLAYERS = 10
-_MAX_CHUNKS_PER_PLAYER_PER_TYPE = 2
+_MAX_CHUNKS_PER_PLAYER = 3
+
+# Chroma content is only ever updated by the offline ingestion scripts
+# (chunker.py / fetch_synthesis.py), never by anything a live draft session
+# does — so it's safe to cache a player's retrieved chunks for the lifetime
+# of this process. Confirmed live: without this, every single "Get pick"
+# repeated the same ~10-20 embedding round trips for whichever players
+# still happened to be near the top of the board, which barely changes
+# pick to pick, and was a large share of a reported 10+ second latency per
+# recommendation. Unbounded is fine — a season's player pool is a few
+# hundred entries at most, trivial memory for a single draft session.
+_retrieval_cache: dict[str, list[str]] = {}
+
+
+def _query_player_chunks(vector_query, sleeper_id: str, player_name: str) -> list[str]:
+    """
+    One query per player instead of two — what_happened and what_it_means
+    are pulled together via a chunk_type $in filter rather than as separate
+    round trips, halving the embedding/query cost per candidate. Cached by
+    sleeper_id so repeat lookups across a draft session (very common — the
+    top of the board barely changes pick to pick) are free after the first.
+
+    player_name is still passed as the query text (not left blank) — the
+    `where` filter already narrows results to one player's own chunks, so
+    it mostly only affects tie-breaking when a player has more chunks than
+    _MAX_CHUNKS_PER_PLAYER, but there's no reason to introduce an untested
+    empty-string-embedding edge case when this is already proven to work.
+    """
+    if sleeper_id in _retrieval_cache:
+        return _retrieval_cache[sleeper_id]
+
+    results = vector_query(
+        player_name,
+        n_results=_MAX_CHUNKS_PER_PLAYER,
+        where={"$and": [
+            {"sleeper_id": sleeper_id},
+            {"chunk_type": {"$in": ["what_happened", "what_it_means"]}},
+        ]},
+    )
+    _retrieval_cache[sleeper_id] = results
+    return results
 
 
 def _retrieve_player_context(top_available: list[dict]) -> str:
@@ -98,6 +194,17 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
     it means" (Claude-synthesized analysis) chunks for the top candidate
     players out of ChromaDB, so the recommendation is grounded in more than
     ADP and roster math alone.
+
+    Players that were checked but have nothing in ChromaDB get an explicit
+    "no data" line instead of silently vanishing from this section. This
+    matters: rookies and other players with no 2025 season data structurally
+    can't have anything retrieved for them (see fetch_metrics.py), which
+    means without this line, every veteran shows up with a rich, specific
+    paragraph and every rookie shows up with nothing at all — confirmed
+    live to correlate with the AI never recommending rookies, likely
+    because "nothing to say" reads as "nothing good to say" to an LLM
+    asked to justify its pick. Making the absence explicit and explained
+    (see _SYSTEM_PROMPT) is meant to break that correlation.
 
     Best-effort and silent on failure: if ChromaDB isn't installed, the
     collection is empty, or a query errors, this returns "" and the prompt
@@ -111,39 +218,41 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
         return ""
 
     sections: list[str] = []
+    hits = 0
+    checked = 0
     for p in top_available[:_MAX_CONTEXT_PLAYERS]:
         sleeper_id = p.get("sleeper_id")
         if not sleeper_id:
             continue
+        checked += 1
 
-        player_lines: list[str] = []
-        for chunk_type, label in (("what_happened", "News"), ("what_it_means", "Analysis")):
-            try:
-                results = vector_query(
-                    p["name"],
-                    n_results=_MAX_CHUNKS_PER_PLAYER_PER_TYPE,
-                    where={"$and": [{"sleeper_id": sleeper_id}, {"chunk_type": chunk_type}]},
-                )
-            except Exception as e:
-                logger.warning(f"Vector query failed for {p['name']} ({chunk_type}): {e}")
-                continue
-            player_lines += [f"  [{label}] {r}" for r in results]
+        try:
+            results = _query_player_chunks(vector_query, sleeper_id, p["name"])
+        except Exception as e:
+            logger.warning(f"Vector query failed for {p['name']}: {e}")
+            continue
 
-        if player_lines:
-            sections.append(f"- {p['name']} ({p['position']}):\n" + "\n".join(player_lines))
+        if results:
+            hits += 1
+            lines = "\n".join(f"  {r}" for r in results)
+            sections.append(f"- {p['name']} ({p['position']}):\n{lines}")
+        else:
+            sections.append(
+                f"- {p['name']} ({p['position']}): No retrieved data (likely a rookie or "
+                f"a player with no 2025 season stats) — this is a data-coverage gap, not a "
+                f"signal that the player is a worse pick."
+            )
 
     if not sections:
         logger.info(
-            "Retrieved 0 player news/analysis chunks for this recommendation "
-            "(checked %d candidate(s) with a sleeper_id) — prompt built without that section.",
-            sum(1 for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")),
+            "No candidates with a sleeper_id to check (checked 0) — prompt built without a "
+            "Player News & Analysis section."
         )
         return ""
 
     logger.info(
-        "Retrieved player news/analysis for %d/%d candidate player(s) — included in prompt.",
-        len(sections),
-        sum(1 for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")),
+        "Player News & Analysis: %d/%d candidate(s) had retrieved content, %d had none — included in prompt.",
+        hits, checked, checked - hits,
     )
     return "\n".join([
         "## Player News & Analysis (retrieved)",
@@ -167,7 +276,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     )
     lines += [
         "## Draft State",
-        f"- Overall pick: #{ctx.pick_number} (Round {ctx.round_number} of 15)",
+        f"- Overall pick: #{ctx.pick_number} (Round {ctx.round_number} of {ctx.total_rounds})",
         f"- My draft slot: {ctx.my_slot} of {ctx.league_size}",
         f"- {turn_info}",
         f"- Scoring: {ctx.scoring_format.upper()}",
@@ -191,6 +300,27 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         ]
     else:
         lines += ["## My Current Roster", "Empty — no picks yet.", ""]
+
+    # Starting lineup gaps — explicit, computed, unambiguous (see
+    # _compute_roster_gaps' docstring for why this exists: without it,
+    # nothing told Claude it still needed a starting QB, and it never
+    # once got recommended across a full draft as a result)
+    gaps = _compute_roster_gaps(ctx.my_roster)
+    rounds_remaining = max(0, ctx.total_rounds - ctx.round_number)
+    lineup_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(gaps.items()))
+    if gaps:
+        gap_total = sum(gaps.values())
+        lines.append("## Starting Lineup Status (standard: 1 QB, 2 RB, 2 WR, 1 TE, 1 FLEX, 1 DST)")
+        lines.append(f"Still need to fill: {lineup_str}")
+        if gap_total >= rounds_remaining and rounds_remaining > 0:
+            lines.append(
+                f"URGENT: {gap_total} required starting slot(s) still open with only "
+                f"{rounds_remaining} round(s) left — prioritize filling these over upside/"
+                f"value picks at positions you've already covered."
+            )
+        lines.append("")
+    else:
+        lines += ["## Starting Lineup Status", "All standard starting slots filled.", ""]
 
     # Top available players (cap at 25 to keep prompt tight)
     lines.append("## Top Available Players (by ADP)")
@@ -235,7 +365,10 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     lines += [
         "## Task",
         "Recommend the best pick for my team right now.",
-        "Consider: roster needs, positional scarcity, ADP value, and how long until my next turn.",
+        "Consider: roster needs, positional scarcity, ADP value, and how long until my next turn. "
+        "If the Starting Lineup Status above shows an open required slot with few rounds left, "
+        "that takes priority over a marginally-better value pick at a position you've already filled — "
+        "an empty starting slot is a bigger problem than a slightly-worse ADP value.",
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
@@ -265,7 +398,14 @@ def _build_prompt(ctx: RecommendationContext) -> str:
 _SYSTEM_PROMPT = (
     "You are an expert fantasy football draft advisor for a PPR Sleeper league. "
     "You give concise, data-driven recommendations grounded in ADP, positional scarcity, "
-    "and roster construction strategy. "
+    "and roster construction strategy. A team with an empty required starting slot (see "
+    "Starting Lineup Status) is incomplete no matter how good its other picks are — do not "
+    "let general positional-scarcity reasoning (e.g. 'QB is deep, plenty of value left') "
+    "cause you to leave a required slot unfilled as rounds run out. "
+    "Some players — especially rookies — will show 'No retrieved data' in the Player News & "
+    "Analysis section. That reflects a gap in available statistics (no prior NFL season to "
+    "compute from), not a judgment about the player. Do not treat missing retrieved data as a "
+    "reason to avoid a player; judge them on ADP/consensus value like anyone else. "
     "You always respond with valid JSON and nothing else."
 )
 
