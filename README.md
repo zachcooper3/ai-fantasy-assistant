@@ -197,6 +197,44 @@ Once populated, `backend/app/services/ai_service.py` automatically retrieves bot
 for the top candidate players on every recommendation — no extra step needed. If ChromaDB is
 empty or unavailable, recommendations just proceed without that section.
 
+**Rookies** structurally can never have a `PlayerMetrics` row (no prior NFL season to compute
+it from), so steps 4-6 below give them their own equivalent data instead: draft capital and
+college production stand in for the metrics a veteran would have, and get their own
+Claude-written note. Run these once per draft class (i.e. once a year, right after the NFL
+draft) — same "doesn't change intra-day" reasoning as steps 1-3 don't run on every server boot.
+
+**4. Fetch rookie draft capital** (round/pick/team/college) from `nflreadpy`:
+
+```bash
+py -m backend.ingestion.fetch_draft_profiles --dry-run   # preview matches first
+py -m backend.ingestion.fetch_draft_profiles             # write to the database
+```
+
+**5. Enrich with final-college-season production** (passing/rushing/receiving) from
+CollegeFootballData.com. Requires a free `CFBD_API_KEY` (see `.env.example` — no credit card,
+just an email signup); no-ops with a clear message if unset. Must run *after* step 4 — it only
+enriches players who already have a draft profile to attach stats to:
+
+```bash
+py -m backend.ingestion.fetch_college_stats --dry-run   # preview matches first
+py -m backend.ingestion.fetch_college_stats             # write to the database
+```
+
+**6. Generate rookie-specific "what it means" notes** — same idea as step 3, but grounded only
+in draft capital + college production instead of NFL metrics, for players who don't have a
+`PlayerMetrics` row yet. Requires `ANTHROPIC_API_KEY`; one real Claude call per eligible rookie
+— note that `--dry-run` here only skips the ChromaDB write, **not** the API call, so use
+`--limit`/`--sleeper-id` for a cheap smoke test before running the full batch:
+
+```bash
+py -m backend.ingestion.fetch_rookie_synthesis --limit 3 --dry-run   # preview a few (still costs tokens)
+py -m backend.ingestion.fetch_rookie_synthesis                       # generate for everyone, write to Chroma
+```
+
+Once a rookie's first real NFL season lands and `fetch_metrics.py`/`fetch_synthesis.py` produce
+a real `PlayerMetrics` row and note for them, that note automatically takes over — both scripts
+share the same dedupe key, so no manual "graduation" step is needed.
+
 You can sanity-check what's actually in the collection with:
 
 ```bash
@@ -229,7 +267,7 @@ ai-fantasy-assistant/
 ├── backend/
 │   ├── app/          # FastAPI routes, services, AI layer
 │   ├── db/           # SQLite models and player repo
-│   ├── ingestion/    # CSV → SQLite ingestion, Sleeper ID sync, metrics/RAG pipeline
+│   ├── ingestion/    # CSV → SQLite ingestion, Sleeper ID sync, metrics/rookie/RAG pipeline
 │   └── rag/          # ChromaDB vector store, wired into ai_service.py's recommendation prompt
 ├── data/             # gitignored — created by first-time setup, not cloned
 │   ├── raw/          # Source CSVs (fantasypros_adp.csv)
@@ -254,8 +292,12 @@ and defaults) — nothing requires a code change to adjust, including for deploy
   you're in.
 - `CLAUDE_MODEL` — override the recommendation model (default: `claude-haiku-4-5-20251001`).
 - `SYNTHESIS_MODEL` — override the model used for batch "what it means" note generation
-  (`fetch_synthesis.py`). Defaults to `CLAUDE_MODEL`; safe to point at a pricier model since
-  it runs offline, not on the clock.
+  (`fetch_synthesis.py` and `fetch_rookie_synthesis.py`). Defaults to `CLAUDE_MODEL`; safe to
+  point at a pricier model since it runs offline, not on the clock.
+- `CFBD_API_KEY` — CollegeFootballData.com key for rookie college production
+  (`fetch_college_stats.py`). Free, no credit card — request at
+  https://collegefootballdata.com/key. Unset → that step no-ops with a clear message; rookies
+  still get a note from draft capital alone.
 - `DB_PATH` — SQLite file location (default: `data/fantasy.db`).
 - `CORS_ORIGINS` — comma-separated allowed frontend origins. Defaults to the local dev ports;
   set this to your deployed frontend URL when you go live instead of editing `main.py`.
