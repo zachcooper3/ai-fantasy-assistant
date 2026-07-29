@@ -935,7 +935,20 @@ class AIService:
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = response.content[0].text
+
+            # Take the first text block rather than indexing content[0]
+            # blindly — an empty content list or a non-text first block
+            # (both possible API responses) raised IndexError/
+            # AttributeError here before, turning into a 500 on draft day
+            # instead of the fallback this method promises (audit W7).
+            raw = next(
+                (block.text for block in response.content if hasattr(block, "text")),
+                None,
+            )
+            if raw is None:
+                logger.warning("Falling back to ADP — Claude response had no text content.")
+                return _fallback(ctx, self._model)
+
             result = _parse_response(raw, ctx)
 
             if result is None:
@@ -946,6 +959,12 @@ class AIService:
 
         except anthropic.APIError as e:
             logger.error("Anthropic API error: %s", e)
+            return _fallback(ctx, self._model)
+        except Exception:
+            # This method's contract is "never fail on draft day" — any
+            # unexpected error (network weirdness the SDK didn't wrap,
+            # response-shape surprises) degrades to ADP, never a 500.
+            logger.exception("Unexpected error during recommendation — falling back to ADP.")
             return _fallback(ctx, self._model)
 
 

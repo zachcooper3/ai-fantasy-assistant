@@ -87,6 +87,7 @@ def client(engine):
     from fastapi.testclient import TestClient
 
     from backend.app.api import draft, players, recommendations, sync as sync_api
+    from backend.app.services.ai_service import AIService
     from backend.app.services.connection_manager import ConnectionManager
     from backend.app.services.draft_state import DraftStateService
     from backend.app.services.draft_sync import DraftSyncService
@@ -103,6 +104,14 @@ def client(engine):
     app.state.draft_service = draft_service
     app.state.connection_manager = conn_mgr
     app.state.sync_service = DraftSyncService(draft_service, conn_mgr)
+    # Build the AIService WITHOUT __init__ — the constructor reads
+    # ANTHROPIC_API_KEY from the environment, and a developer shell (or CI)
+    # with a real key set would construct a live client and make these
+    # tests env-dependent. Fallback mode, deterministically, always.
+    ai = AIService.__new__(AIService)
+    ai._client = None
+    ai._model = "test-model"
+    app.state.ai_service = ai
 
     def _get_session_override():
         with Session(engine) as session:

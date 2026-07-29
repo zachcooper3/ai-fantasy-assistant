@@ -41,7 +41,10 @@ class Player(SQLModel, table=True):
     is_available: bool = Field(default=True, index=True) # False once the player is drafted
 
     # --- Metadata ---
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    # Timezone-aware, matching every other model here — the old naive
+    # datetime.utcnow is deprecated and mixed aware/naive timestamps
+    # across tables.
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class DraftSession(SQLModel, table=True):

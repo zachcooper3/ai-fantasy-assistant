@@ -77,7 +77,14 @@ export function useDraft(): DraftHook {
   // ------------------------------------------------------------------
 
   useEffect(() => {
-    let retryTimeout: ReturnType<typeof setTimeout>;
+    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+    // Reconnect-leak guard (audit W9): closing the socket in the effect
+    // cleanup fires onclose, which used to schedule a fresh connect()
+    // whose timer id overwrote the one the cleanup had already cleared —
+    // leaving a ghost socket reconnecting forever after unmount (visible
+    // under React StrictMode's dev double-mount). `disposed` makes the
+    // cleanup's close terminal.
+    let disposed = false;
 
     function connect() {
       const ws = new WebSocket(WS_URL);
@@ -86,7 +93,12 @@ export function useDraft(): DraftHook {
       ws.onopen = () => setIsConnected(true);
 
       ws.onmessage = (event) => {
-        const msg: WsEvent = JSON.parse(event.data);
+        let msg: WsEvent;
+        try {
+          msg = JSON.parse(event.data);
+        } catch {
+          return; // one malformed frame shouldn't kill the handler
+        }
 
         if (msg.type === "connected") {
           if (msg.state) {
@@ -107,7 +119,9 @@ export function useDraft(): DraftHook {
 
       ws.onclose = () => {
         setIsConnected(false);
-        retryTimeout = setTimeout(connect, 3000);
+        if (!disposed) {
+          retryTimeout = setTimeout(connect, 3000);
+        }
       };
 
       ws.onerror = () => ws.close();
@@ -116,6 +130,7 @@ export function useDraft(): DraftHook {
     connect();
 
     return () => {
+      disposed = true;
       clearTimeout(retryTimeout);
       wsRef.current?.close();
     };

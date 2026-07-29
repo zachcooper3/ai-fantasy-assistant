@@ -222,6 +222,11 @@ async def recommend_pick(
         raise HTTPException(status_code=400, detail="Draft is complete.")
 
     ctx = _build_context(svc, db)
+    if not ctx.top_available:
+        # Without this, an empty board reached _fallback's RuntimeError
+        # and surfaced as a 500 (audit W7) — a clean 404 tells the client
+        # what actually happened.
+        raise HTTPException(status_code=404, detail="No available players left to recommend.")
     result = await ai.recommend(ctx)
 
     return RecommendationResponse(
@@ -267,23 +272,48 @@ def recommend_handcuff(
 
 
 @router.get("/scarcity", response_model=ScarcityAnalysisResponse)
-def analyze_scarcity(db: Session = Depends(get_session)):
+def analyze_scarcity(
+    svc: DraftStateService = Depends(get_draft_service),
+    db: Session = Depends(get_session),
+):
     """
     Returns a positional scarcity analysis with tiered alerts.
 
-    Thresholds (based on a 12-team, 15-round PPR draft):
-      critical  — fewer players than half the league has at that position
-      low       — fewer than 1.5x the league size
+    Thresholds derive from the ACTIVE session's league size and configured
+    starting lineup when one exists (audit W11 — this used to hardcode a
+    12-team standard roster, producing live-wrong output for 8/10/14-team
+    or custom-lineup leagues); the 12-team standard shape remains only as
+    the no-session fallback. FLEX demand is approximated by adding
+    flex_slots to both RB and WR — the same "a flex is usually an RB or
+    WR" assumption the original hardcoded 3/3 encoded.
+
+      critical  — fewer players left than half the league's demand
+      low       — fewer than 1.5x the demand
       ok        — above that
 
     These thresholds are approximate guides, not hard rules.
     """
     counts = repo.count_available_by_position(db)
 
-    # Expected starter counts per team for a standard PPR roster
-    # (1 QB, 2 RB, 2 WR, 1 TE, 1 FLEX ~= 1 RB or WR, 1 K, 1 DST)
-    starter_slots = {"QB": 1, "RB": 3, "WR": 3, "TE": 1, "DST": 1, "K": 1}
-    league_size = 12  # default; in future read from draft config
+    if svc.is_active:
+        cfg = svc.config
+        league_size = cfg.league_size
+        starter_slots = {
+            "QB": cfg.qb_slots,
+            "RB": cfg.rb_slots + cfg.flex_slots,
+            "WR": cfg.wr_slots + cfg.flex_slots,
+            "TE": cfg.te_slots,
+            "DST": cfg.dst_slots,
+            "K": 1,
+        }
+        # A position this league doesn't start at all can't be scarce —
+        # dropping it also avoids nonsense "critical: 0 needed" alerts.
+        starter_slots = {pos: n for pos, n in starter_slots.items() if n > 0}
+    else:
+        # No session — fall back to the standard 12-team PPR shape
+        # (1 QB, 2 RB, 2 WR, 1 TE, 1 FLEX ~= 1 RB or WR, 1 K, 1 DST).
+        starter_slots = {"QB": 1, "RB": 3, "WR": 3, "TE": 1, "DST": 1, "K": 1}
+        league_size = 12
 
     alerts: list[ScarcityAlert] = []
     for pos, slots in starter_slots.items():

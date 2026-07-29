@@ -13,7 +13,7 @@ GET    /api/draft/board          — big board: top available players + scarcity
 Author: Zach Cooper
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session
 
 from backend.db.database import get_session
@@ -179,15 +179,31 @@ async def record_pick(
 async def undo_pick(
     svc: DraftStateService = Depends(get_draft_service),
     mgr: ConnectionManager = Depends(get_connection_manager),
+    sync: DraftSyncService = Depends(get_sync_service),
     db: Session = Depends(get_session),
 ):
     """
     Undoes the most recent pick.
     - Restores player availability in SQLite.
     - Broadcasts an "undo" event over the WebSocket.
+
+    Blocked while Sleeper live sync is active (audit W12): the pick still
+    exists in the real Sleeper draft, and the sync cursor has already moved
+    past it, so undoing locally creates a permanent divergence — the player
+    shows available here while actually drafted, and sync will never
+    re-record them. Stop sync first if a synced pick truly needs fixing.
     """
     if not svc.is_active:
         raise HTTPException(status_code=400, detail="No active draft session.")
+    if sync.status == "syncing":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Undo is disabled while Sleeper live sync is active — the pick "
+                "exists in the real draft and local state would permanently "
+                "diverge. Stop sync first (DELETE /api/sync/stop)."
+            ),
+        )
 
     pick = svc.undo_last_pick()
     if pick is None:
@@ -214,7 +230,7 @@ async def undo_pick(
 
 @router.get("/board", response_model=BoardResponse)
 def get_board(
-    limit: int = 30,
+    limit: int = Query(default=30, ge=1, le=400),
     svc: DraftStateService = Depends(get_draft_service),
     db: Session = Depends(get_session),
 ):

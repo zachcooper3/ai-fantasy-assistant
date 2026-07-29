@@ -193,12 +193,18 @@ class DraftSyncService:
         player = repo.get_player_by_sleeper_id(db, sleeper_player_id)
 
         if player is None:
-            # Fallback: match by name from pick metadata
+            # Fallback: match by name from pick metadata, constrained to the
+            # position Sleeper reports so a shared/similar name at another
+            # position can't be marked drafted by mistake (audit W4).
+            # Sleeper says "DEF" where this app says "DST".
             full_name = (
                 f"{metadata.get('first_name', '')} {metadata.get('last_name', '')}".strip()
             )
+            meta_pos = (metadata.get("position") or "").upper()
+            if meta_pos == "DEF":
+                meta_pos = "DST"
             if full_name:
-                player = repo.get_player_by_name(db, full_name)
+                player = repo.get_player_by_name(db, full_name, position=meta_pos or None)
 
         if player is None:
             logger.warning(

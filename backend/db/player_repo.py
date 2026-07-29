@@ -4,8 +4,31 @@ All functions take an explicit Session argument — no globals, easy to test.
 Author: Zach Cooper
 """
 
+import re
+
 from sqlmodel import Session, select
 from backend.db.models import Player
+
+
+# --- Name normalization — same idea as sync_sleeper_ids.py's normalizer,
+# duplicated here rather than imported (a db-layer module importing from
+# ingestion would be an odd dependency direction for ~10 lines; chunker.py
+# made the same call for the same reason). ---
+
+_GENERATIONAL_SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
+
+def _normalise_name(name: str) -> str:
+    name = name.lower()
+    name = re.sub(r"[^\w\s]", "", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _strip_suffix(normalised: str) -> str:
+    parts = normalised.split()
+    if len(parts) > 1 and parts[-1] in _GENERATIONAL_SUFFIXES:
+        return " ".join(parts[:-1])
+    return normalised
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +74,44 @@ def get_player_by_id(session: Session, player_id: int) -> Player | None:
     return session.get(Player, player_id)
 
 
-def get_player_by_name(session: Session, name: str) -> Player | None:
+def get_player_by_name(
+    session: Session,
+    name: str,
+    position: str | None = None,
+) -> Player | None:
     """
-    Returns the first player whose name matches (case-insensitive).
-    Useful for resolving manual pick inputs like "Ja'Marr Chase".
+    Resolves a player by name — exact match after normalization (lowercase,
+    punctuation stripped, generational suffix dropped), optionally
+    constrained by position. Returns None on no match OR an ambiguous one:
+    this is used by live sync's fallback path to mark players as drafted,
+    where tagging the wrong player is strictly worse than a placeholder.
+
+    This replaced an unanchored `ilike('%name%')` substring match (audit
+    W4), which could hit the wrong player entirely — a substring of a
+    longer name, a duplicate name at another position, or anything when
+    the input contained SQL wildcard characters (%/_).
+
+    Suffixes are stripped from BOTH sides before comparing because the two
+    data sources disagree: Sleeper's names omit "Jr./III" entirely while
+    the ADP data keeps them (see sync_sleeper_ids.py's module docstring).
+
+    position, when given, should be this app's convention ("DST", not
+    Sleeper's "DEF") — callers translate first (see draft_sync.py).
     """
-    return session.exec(
-        select(Player).where(Player.name.ilike(f"%{name}%"))
-    ).first()
+    target = _strip_suffix(_normalise_name(name or ""))
+    if not target:
+        return None
+
+    query = select(Player)
+    if position:
+        query = query.where(Player.position == position.upper())
+    candidates = session.exec(query).all()
+
+    matches = [
+        p for p in candidates
+        if _strip_suffix(_normalise_name(p.name)) == target
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def get_players_by_position(session: Session, position: str) -> list[Player]:

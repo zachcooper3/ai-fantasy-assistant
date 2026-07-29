@@ -38,7 +38,11 @@ if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 FFC_URL = "https://fantasyfootballcalculator.com/api/v1/adp/ppr"
-OUT_PATH = Path("data/raw/fantasypros_adp.csv")
+# Anchored to the repo root, not the CWD — same reasoning as DB_PATH in
+# backend/db/database.py (audit W10): a CWD-relative path here meant the
+# staleness check, the CSV write, and the startup banner could all be
+# looking at a different file depending on where the process was launched.
+OUT_PATH = Path(__file__).resolve().parents[2] / "data" / "raw" / "fantasypros_adp.csv"
 CURRENT_YEAR = datetime.now().year
 
 # Positions to include — matches what ingest_players.py and the app expect

@@ -24,13 +24,13 @@ def make_sync(league_size=12, my_pos=1, rounds=15):
     return DraftSyncService(draft_svc, ConnectionManager()), draft_svc
 
 
-def sleeper_pick(pick_no, sleeper_id="s1", slot=None, rnd=None, first="Alpha", last="Back"):
+def sleeper_pick(pick_no, sleeper_id="s1", slot=None, rnd=None, first="Alpha", last="Back", pos="RB"):
     return {
         "pick_no": pick_no,
         "player_id": sleeper_id,
         "draft_slot": slot,
         "round": rnd,
-        "metadata": {"first_name": first, "last_name": last, "position": "RB", "team": "DET"},
+        "metadata": {"first_name": first, "last_name": last, "position": pos, "team": "DET"},
     }
 
 
@@ -68,9 +68,20 @@ def test_unknown_player_records_placeholder(db, seeded_players):
 
 def test_name_fallback_when_sleeper_id_unmatched(db, seeded_players):
     sync, svc = make_sync()
-    # sleeper_id unknown, but metadata name matches a local player exactly
-    process(sync, sleeper_pick(1, "not-in-db", slot=1, rnd=1, first="Delta", last="Quarter"), db)
+    # sleeper_id unknown, but metadata name+position match a local player
+    process(sync, sleeper_pick(1, "not-in-db", slot=1, rnd=1,
+                               first="Delta", last="Quarter", pos="QB"), db)
     assert svc.picks[0].player_id == 4  # matched by name, not placeholder
+
+
+def test_name_fallback_respects_position(db, seeded_players):
+    """Audit W4: a matching name at the WRONG position must not be marked
+    drafted — placeholder instead."""
+    sync, svc = make_sync()
+    process(sync, sleeper_pick(1, "not-in-db", slot=1, rnd=1,
+                               first="Delta", last="Quarter", pos="RB"), db)
+    assert svc.picks[0].player_id == -1
+    assert db.get(Player, 4).is_available is True
 
 
 def test_manually_recorded_pick_is_skipped_not_duplicated(db, seeded_players):

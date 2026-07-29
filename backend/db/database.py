@@ -4,11 +4,22 @@ Author: Zach Cooper
 """
 
 import os
+from pathlib import Path
+
 from sqlmodel import SQLModel, Session, create_engine
 
+# Repo root — backend/db/database.py is two levels below it.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # Path to the SQLite database file. Override via DB_PATH env var if needed.
-_DB_PATH = os.getenv("DB_PATH", "data/fantasy.db")
-_DB_URL = f"sqlite:///{_DB_PATH}"
+# A relative path (including the default) is resolved against the REPO
+# ROOT, not the process CWD — launching uvicorn from any other directory
+# used to silently create a fresh empty DB wherever you happened to be
+# standing (audit W10). Absolute overrides are used as-is.
+_DB_PATH = Path(os.getenv("DB_PATH", "data/fantasy.db"))
+if not _DB_PATH.is_absolute():
+    _DB_PATH = _REPO_ROOT / _DB_PATH
+_DB_URL = f"sqlite:///{_DB_PATH.as_posix()}"
 
 # connect_args required for SQLite to work with FastAPI's threaded request handling
 engine = create_engine(

@@ -13,6 +13,7 @@ Author: Zach Cooper
 
 import hashlib
 import logging
+from pathlib import Path
 
 import chromadb
 from backend.rag.embedder import embedding_fn
@@ -20,7 +21,12 @@ from backend.rag.embedder import embedding_fn
 logger = logging.getLogger(__name__)
 
 _COLLECTION_NAME = "nfl_collection"
-_CHROMA_PATH = "./chroma_db"
+# Anchored to the repo root (backend/rag/vector_store.py is two levels
+# below it) rather than the process CWD — same reasoning as DB_PATH in
+# backend/db/database.py (audit W10): a CWD-relative "./chroma_db" quietly
+# creates a second, empty vector store when the app is launched from
+# anywhere but the repo root.
+_CHROMA_PATH = str(Path(__file__).resolve().parents[2] / "chroma_db")
 
 _collection = None
 
