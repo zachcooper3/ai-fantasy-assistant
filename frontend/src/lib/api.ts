@@ -100,13 +100,21 @@ export interface PickSuggestion {
   position: string;
   adp: number;
   reasoning: string;
+  /** Alternatives only: what this player gains and costs vs. the main pick. */
+  tradeoff: string;
 }
+
+export type Confidence = "high" | "medium" | "low";
 
 export interface Recommendation {
   recommendation: PickSuggestion;
   alternatives: PickSuggestion[];
   alerts: string[];
   model: string;
+  /** One sentence on the roster's shape and what this pick does about it. */
+  strategy: string;
+  /** How clear-cut the call is. The no-AI ADP fallback always reports "low". */
+  confidence: Confidence;
   pick_number: number;
   is_my_turn: boolean;
   picks_until_my_turn: number;

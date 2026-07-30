@@ -6,7 +6,7 @@
  * Layout (mobile):   Tab-based: Board / Room / AI
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { LayoutGrid, Users, Lightbulb } from "lucide-react";
 
 import { useDraft } from "@/hooks/useDraft";
@@ -23,6 +23,7 @@ export default function DraftPage() {
     session,
     board,
     recommendation,
+    recHistory,
     syncStatus,
     isSyncing,
     isConnected,
@@ -47,6 +48,15 @@ export default function DraftPage() {
   useEffect(() => {
     if (!draftComplete) setCompleteDismissed(false);
   }, [draftComplete]);
+
+  // Lookup for team/bye, which the recommendation payload doesn't carry — the
+  // AI response has only id/name/position/adp. Built once per board refresh
+  // rather than scanning the array per suggestion.
+  // Declared before the early return below: hooks can't run conditionally.
+  const playersById = useMemo(
+    () => new Map((board?.players ?? []).map((p) => [p.id, p])),
+    [board]
+  );
 
   // Show setup modal until a session is active
   if (!session?.is_active) {
@@ -105,11 +115,13 @@ export default function DraftPage() {
         <DraftRoom session={session} />
         <AIPanel
           recommendation={recommendation}
+          recHistory={recHistory}
           scarcity={scarcity}
           isLoading={isLoadingRec}
           isMyTurn={session.is_my_turn}
           onFetch={fetchRecommendation}
           onDraftRecommended={recordPick}
+          playersById={playersById}
           isSyncing={isSyncing}
         />
       </div>
@@ -129,11 +141,13 @@ export default function DraftPage() {
         {mobileTab === "ai" && (
           <AIPanel
             recommendation={recommendation}
+            recHistory={recHistory}
             scarcity={scarcity}
             isLoading={isLoadingRec}
             isMyTurn={session.is_my_turn}
             onFetch={fetchRecommendation}
             onDraftRecommended={recordPick}
+            playersById={playersById}
             isSyncing={isSyncing}
           />
         )}

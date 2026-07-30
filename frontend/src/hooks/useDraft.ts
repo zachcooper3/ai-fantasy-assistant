@@ -39,10 +39,27 @@ function sameSyncStatus(a: SyncStatus | null, b: SyncStatus | null): boolean {
   );
 }
 
+/** How many past recommendations to keep for review. */
+const REC_HISTORY_LIMIT = 3;
+
+/** A recommendation plus the pick it was given for, so history can be labelled. */
+export interface PastRecommendation {
+  recommendation: Recommendation;
+  /** Overall pick number the advice was requested at. */
+  pickNumber: number;
+}
+
 export interface DraftHook {
   session: DraftState | null;
   board: Board | null;
   recommendation: Recommendation | null;
+  /**
+   * Previous recommendations, newest first. The live recommendation used to be
+   * discarded outright on every pick event, so the moment anyone drafted you
+   * lost both the advice and the reasoning behind it — including your own pick,
+   * where you'd most want to re-read what it said.
+   */
+  recHistory: PastRecommendation[];
   syncStatus: SyncStatus | null;
   /**
    * True while picks are flowing in from Sleeper. When this is set the UI must
@@ -80,6 +97,7 @@ export function useDraft(): DraftHook {
   const [session, setSession] = useState<DraftState | null>(null);
   const [board, setBoard] = useState<Board | null>(null);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
+  const [recHistory, setRecHistory] = useState<PastRecommendation[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isLoadingRec, setIsLoadingRec] = useState(false);
@@ -93,6 +111,14 @@ export function useDraft(): DraftHook {
   const [syncNonce, setSyncNonce] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Mirrors `recommendation` so the WebSocket handler — which is created once
+  // per connection and would otherwise close over a stale value — can read the
+  // live one when retiring it into history.
+  const recommendationRef = useRef<Recommendation | null>(null);
+  useEffect(() => {
+    recommendationRef.current = recommendation;
+  }, [recommendation]);
 
   // ------------------------------------------------------------------
   // Board refresh — fetch ALL available players so position filters
@@ -144,11 +170,31 @@ export function useDraft(): DraftHook {
         } else if (msg.type === "pick" || msg.type === "undo") {
           setSession(msg.state);
           refreshBoard();
+          // Retire the current recommendation into history rather than
+          // dropping it — it was computed for a board state that no longer
+          // exists, so it must not stay presented as live advice, but it's
+          // still worth being able to read back.
+          //
+          // Read via ref, not inside a setRecommendation updater: updaters
+          // must stay pure, and StrictMode double-invokes them, which would
+          // push the same entry into history twice.
+          const retiring = recommendationRef.current;
+          if (retiring) {
+            setRecHistory((prev) =>
+              [
+                { recommendation: retiring, pickNumber: retiring.pick_number },
+                ...prev.filter((h) => h.pickNumber !== retiring.pick_number),
+              ].slice(0, REC_HISTORY_LIMIT)
+            );
+          }
           setRecommendation(null);
         } else if (msg.type === "reset") {
           setSession(null);
           setBoard(null);
           setRecommendation(null);
+          // History belongs to the draft that just ended — carrying it into a
+          // new session would show advice about a different board.
+          setRecHistory([]);
           setSyncStatus(null);
           setSyncNonce((n) => n + 1);
         }
@@ -239,6 +285,7 @@ export function useDraft(): DraftHook {
         const state = await api.startSession(sessionConfig);
         setSession(state);
         setRecommendation(null);
+        setRecHistory([]);
         setSyncStatus(null);
         await refreshBoard();
 
@@ -275,6 +322,7 @@ export function useDraft(): DraftHook {
       setSession(null);
       setBoard(null);
       setRecommendation(null);
+      setRecHistory([]);
       setSyncStatus(null);
       setSyncNonce((n) => n + 1);
     } catch (e) {
@@ -344,6 +392,7 @@ export function useDraft(): DraftHook {
     session,
     board,
     recommendation,
+    recHistory,
     syncStatus,
     isSyncing: syncStatus?.status === "syncing",
     isConnected,

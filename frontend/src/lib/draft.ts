@@ -62,6 +62,31 @@ export function slotsBeforeMyNextPick(session: DraftState): number[] {
  * Everything past the starters is bench ("BN"), sized so the placeholders
  * account for every remaining round rather than stopping at the starters.
  */
+export interface AdpValue {
+  /** Positive = falling past ADP (value); negative = taken early (reach). */
+  delta: number;
+  label: "value" | "reach" | "even";
+  /** e.g. "+7 vs pick 31" */
+  text: string;
+}
+
+/**
+ * How a player's ADP compares to the pick you'd spend on them.
+ *
+ * Consensus ADP is where the field drafts a player on average, so `adp - pick`
+ * is the surplus (or premium) of taking them here. The neutral band exists
+ * because ADP is an average over noisy inputs — a point or two either way is
+ * not a signal, and colouring it as one would make almost every player look
+ * like a value or a reach.
+ */
+export function adpValue(adp: number, pickNumber: number, neutralBand = 3): AdpValue {
+  const delta = Math.round(adp - pickNumber);
+  const label: AdpValue["label"] =
+    delta > neutralBand ? "value" : delta < -neutralBand ? "reach" : "even";
+  const sign = delta > 0 ? "+" : "";
+  return { delta, label, text: `${sign}${delta} vs pick ${pickNumber}` };
+}
+
 export function rosterSlots(session: DraftState): string[] {
   const starters: string[] = [
     ...Array<string>(session.qb_slots).fill("QB"),
