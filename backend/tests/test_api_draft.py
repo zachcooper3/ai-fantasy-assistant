@@ -60,7 +60,7 @@ def test_pick_flow_and_journal_write_through(client, seeded_players, engine):
 
     with Session(engine) as db:
         assert db.get(Player, 1).is_available is False
-        _, journal = jrepo.load_state(db)
+        _, journal, _ = jrepo.load_state(db)
         assert [p.player_id for p in journal] == [1]
 
 
@@ -90,7 +90,7 @@ def test_undo_restores_availability_and_journal(client, seeded_players, engine):
 
     with Session(engine) as db:
         assert db.get(Player, 2).is_available is True
-        _, journal = jrepo.load_state(db)
+        _, journal, _ = jrepo.load_state(db)
         assert [p.player_id for p in journal] == [1]
 
 

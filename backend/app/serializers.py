@@ -50,6 +50,8 @@ def build_state_response(svc: DraftStateService) -> DraftStateResponse:
         picks_until_my_turn=svc.picks_until_my_turn,
         my_next_pick_number=svc.my_next_pick_number,
         draft_complete=svc.draft_complete,
+        was_restored=svc.was_restored,
+        started_at=svc.started_at,
         picks=[build_pick_response(p, my_slot) for p in svc.picks],
         my_roster=[build_pick_response(p, my_slot) for p in svc.my_roster],
     )

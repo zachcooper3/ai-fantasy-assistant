@@ -15,6 +15,7 @@ Author: Zach Cooper
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,12 @@ class DraftStateService:
     def __init__(self) -> None:
         self._config: DraftConfig | None = None
         self._picks: list[PickRecord] = []
+        # True when the live session came off disk at boot rather than being
+        # started by someone. Sessions are persisted and rehydrated (see
+        # restore_session), so a backend restart silently resumes the previous
+        # draft — the client needs to be able to say so out loud.
+        self._was_restored: bool = False
+        self._started_at: datetime | None = None
 
     # -----------------------------------------------------------------------
     # Session lifecycle
@@ -99,21 +106,46 @@ class DraftStateService:
         """
         self._config = config
         self._picks = []
+        self._was_restored = False
+        self._started_at = datetime.now(timezone.utc)
 
     def reset(self) -> None:
         """Clears the active session entirely."""
         self._config = None
         self._picks = []
+        self._was_restored = False
+        self._started_at = None
 
-    def restore_session(self, config: DraftConfig, picks: list[PickRecord]) -> None:
+    @property
+    def was_restored(self) -> bool:
+        """True if this session was rehydrated from disk rather than started."""
+        return self._was_restored
+
+    @property
+    def started_at(self) -> datetime | None:
+        """When the session began — preserved across a restore."""
+        return self._started_at
+
+    def restore_session(
+        self,
+        config: DraftConfig,
+        picks: list[PickRecord],
+        started_at: datetime | None = None,
+    ) -> None:
         """
         Rehydrates a session from persisted state (see
         backend/db/draft_session_repo.py) — used by main.py's lifespan on
         startup so a backend restart mid-draft resumes where it left off
         instead of losing every pick.
+
+        `started_at` is the original session's creation time, carried through so
+        the client can say *which* draft it resumed rather than just that it
+        resumed one.
         """
         self._config = config
         self._picks = list(picks)
+        self._was_restored = True
+        self._started_at = started_at
 
     @property
     def is_active(self) -> bool:

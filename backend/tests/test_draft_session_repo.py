@@ -31,12 +31,18 @@ def test_full_round_trip_restores_config_and_picks(db):
 
     restored = jrepo.load_state(db)
     assert restored is not None
-    rcfg, rpicks = restored
+    rcfg, rpicks, rstarted_at = restored
     assert rcfg == CFG
+    assert rstarted_at is not None
 
     svc2 = DraftStateService()
-    svc2.restore_session(rcfg, rpicks)
+    svc2.restore_session(rcfg, rpicks, started_at=rstarted_at)
     assert svc2.is_active
+    # A rehydrated session must announce itself — the UI shows a resume banner
+    # off this flag, and without it a backend restart silently resumes an old
+    # draft with no indication anything happened.
+    assert svc2.was_restored is True
+    assert svc2.started_at == rstarted_at
     assert svc2.current_pick_number == 4
     assert [p.pick_number for p in svc2.picks] == [1, 2, 3]
     assert svc2.picks[1].player_id == -1
@@ -50,12 +56,12 @@ def test_remove_pick_by_number(db):
     journal_picks(db, svc, [(1, "A", "RB", "X"), (2, "B", "WR", "Y"), (3, "C", "TE", "Z")])
 
     jrepo.remove_pick(db, 3)
-    _, picks = jrepo.load_state(db)
+    _, picks, _ = jrepo.load_state(db)
     assert [p.pick_number for p in picks] == [1, 2]
 
     # Removing a nonexistent pick is a no-op, not an error
     jrepo.remove_pick(db, 99)
-    _, picks = jrepo.load_state(db)
+    _, picks, _ = jrepo.load_state(db)
     assert len(picks) == 2
 
 
@@ -68,7 +74,7 @@ def test_save_config_replaces_previous_session_and_journal(db):
     cfg2 = DraftConfig(league_size=12, my_draft_position=1, total_rounds=15)
     jrepo.save_config(db, cfg2)
 
-    restored_cfg, picks = jrepo.load_state(db)
+    restored_cfg, picks, _ = jrepo.load_state(db)
     assert restored_cfg.league_size == 12
     assert picks == []
 

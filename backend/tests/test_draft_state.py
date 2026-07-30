@@ -158,3 +158,34 @@ def test_restore_session_rehydrates_state():
     assert svc.config == cfg
     assert svc.current_pick_number == 3
     assert svc.picks[1].player_id == -1
+
+
+# ---------------------------------------------------------------------------
+# was_restored / started_at
+#
+# The UI shows a "resumed draft" banner off was_restored. A stale True would
+# announce a resume on a draft the user just started by hand.
+# ---------------------------------------------------------------------------
+
+def test_new_session_is_not_marked_restored():
+    svc = DraftStateService()
+    svc.start_session(DraftConfig(league_size=12, my_draft_position=1))
+    assert svc.was_restored is False
+    assert svc.started_at is not None
+
+
+def test_start_session_clears_a_previous_restore_flag():
+    svc = DraftStateService()
+    svc.restore_session(DraftConfig(league_size=12, my_draft_position=1), [])
+    assert svc.was_restored is True
+
+    svc.start_session(DraftConfig(league_size=10, my_draft_position=2))
+    assert svc.was_restored is False
+
+
+def test_reset_clears_restore_state():
+    svc = DraftStateService()
+    svc.restore_session(DraftConfig(league_size=12, my_draft_position=1), [])
+    svc.reset()
+    assert svc.was_restored is False
+    assert svc.started_at is None

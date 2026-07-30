@@ -19,6 +19,8 @@ dataclasses) just spreads the same coupling across more files.
 Author: Zach Cooper
 """
 
+from datetime import datetime
+
 from sqlmodel import Session, delete, select
 
 from backend.app.services.draft_state import DraftConfig, PickRecord
@@ -102,11 +104,16 @@ def remove_pick(session: Session, pick_number: int) -> None:
 # Rehydration
 # ---------------------------------------------------------------------------
 
-def load_state(session: Session) -> tuple[DraftConfig, list[PickRecord]] | None:
+def load_state(
+    session: Session,
+) -> tuple[DraftConfig, list[PickRecord], datetime] | None:
     """
-    Returns (config, picks-in-pick-number-order) for a persisted session,
-    or None if no session was active. Feed straight into
+    Returns (config, picks-in-pick-number-order, created_at) for a persisted
+    session, or None if no session was active. Feed straight into
     DraftStateService.restore_session().
+
+    created_at is the original session's start time, so a resumed draft can be
+    identified to the user by *when* it started rather than just "some draft".
     """
     row = session.get(DraftSession, _SESSION_ROW_ID)
     if row is None:
@@ -141,4 +148,4 @@ def load_state(session: Session) -> tuple[DraftConfig, list[PickRecord]] | None:
         for p in pick_rows
     ]
 
-    return config, picks
+    return config, picks, row.created_at

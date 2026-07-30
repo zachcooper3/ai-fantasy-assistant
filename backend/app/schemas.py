@@ -4,6 +4,7 @@ These are separate from the SQLModel DB models in backend/db/models.py.
 Author: Zach Cooper
 """
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -147,6 +148,13 @@ class DraftStateResponse(BaseModel):
     picks_until_my_turn: int
     my_next_pick_number: int | None
     draft_complete: bool
+    # True when this session was rehydrated from disk at boot rather than
+    # started by a user. Sessions persist across restarts by design, so without
+    # this the app silently resumes an old draft with no indication it did.
+    was_restored: bool = False
+    # When the session originally began — preserved through a restore, so the
+    # client can name the draft it resumed rather than just announcing one.
+    started_at: datetime | None = None
     picks: list[PickResponse]
     my_roster: list[PickResponse]
 

@@ -104,8 +104,8 @@ async def lifespan(app: FastAPI):
     app.state.sync_service = DraftSyncService(draft_service, connection_manager)
 
     if persisted is not None:
-        config, picks = persisted
-        draft_service.restore_session(config, picks)
+        config, picks, started_at = persisted
+        draft_service.restore_session(config, picks, started_at=started_at)
         # Re-assert availability flags from the journal. Normally already
         # correct (both are written per-pick), but this heals the one bad
         # case: a crash landing between the two writes, or an availability
