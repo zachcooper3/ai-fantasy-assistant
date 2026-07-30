@@ -156,6 +156,11 @@ activemq-data/
 
 # Environments
 .env
+# Next.js local env files (frontend/.env.local holds NEXT_PUBLIC_API_TOKEN —
+# a secret; the create-next-app default .gitignore that would normally cover
+# this lives per-project, and this repo tracks the frontend as a subfolder)
+.env.local
+.env*.local
 .envrc
 .venv
 env/
