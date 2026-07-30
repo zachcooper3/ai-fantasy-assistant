@@ -21,11 +21,39 @@ const WS_URL =
     .replace(/^http/, "ws") + "/ws/draft" +
   (API_TOKEN ? `?token=${encodeURIComponent(API_TOKEN)}` : "");
 
+// How often to re-poll GET /api/sync/status while a Sleeper sync is live.
+// The endpoint is a pure in-memory read on the backend (no Sleeper call), so
+// this is cheap; it exists to keep synced_pick_count fresh and to notice the
+// poller dying (status → "error") without waiting for a user action.
+const SYNC_POLL_MS = 5000;
+
+/** Field-wise equality, so an unchanged poll response doesn't trigger a render. */
+function sameSyncStatus(a: SyncStatus | null, b: SyncStatus | null): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  return (
+    a.status === b.status &&
+    a.draft_id === b.draft_id &&
+    a.synced_pick_count === b.synced_pick_count &&
+    a.error === b.error
+  );
+}
+
 export interface DraftHook {
   session: DraftState | null;
   board: Board | null;
   recommendation: Recommendation | null;
   syncStatus: SyncStatus | null;
+  /**
+   * True while picks are flowing in from Sleeper. When this is set the UI must
+   * not offer manual pick controls: a manual pick races the 2-second poll loop
+   * and local pick numbers are inferred from the pick count, so an interleaved
+   * manual entry misattributes every subsequent pick to the wrong team slot
+   * (audit W2). Undo is worse still — it restores availability locally while
+   * Sleeper still has the pick, and the synced-pick counter isn't rewound, so
+   * sync never re-records it (audit W12).
+   */
+  isSyncing: boolean;
   isConnected: boolean;
   isLoadingRec: boolean;
   error: string | null;
@@ -56,6 +84,13 @@ export function useDraft(): DraftHook {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoadingRec, setIsLoadingRec] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Bumping this restarts the sync-status poll loop immediately. Anything that
+  // changes sync state locally (starting a session with a Sleeper draft id,
+  // ending the session, a reset arriving over the WebSocket) bumps it, which
+  // also cancels any in-flight poll whose stale response would otherwise
+  // clobber the fresh value.
+  const [syncNonce, setSyncNonce] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -115,6 +150,7 @@ export function useDraft(): DraftHook {
           setBoard(null);
           setRecommendation(null);
           setSyncStatus(null);
+          setSyncNonce((n) => n + 1);
         }
       };
 
@@ -136,6 +172,50 @@ export function useDraft(): DraftHook {
       wsRef.current?.close();
     };
   }, [refreshBoard]);
+
+  // ------------------------------------------------------------------
+  // Sleeper sync status
+  //
+  // This used to be set exactly once, by startSession(). That meant a page
+  // reload mid-draft dropped syncStatus to null while the backend poller was
+  // still happily pulling picks from Sleeper — and a null sync status is
+  // indistinguishable from "no sync", so the UI re-offered the manual pick
+  // controls that corrupt a synced draft. Polling the backend makes the
+  // client's view of sync derive from server truth instead of from whatever
+  // happened to occur in this browser tab's lifetime.
+  // ------------------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    async function poll() {
+      try {
+        const status = await api.getSyncStatus();
+        if (cancelled) return;
+        // Normalise "idle" to null so consumers can treat null as "no sync"
+        // without also having to special-case the idle string.
+        const next = status.status === "idle" ? null : status;
+        // Only commit when something actually changed. The response is a fresh
+        // object every poll, so setting it unconditionally would re-render the
+        // whole draft room (including a several-hundred-row board) every 5
+        // seconds for no reason.
+        setSyncStatus((prev) => (sameSyncStatus(prev, next) ? prev : next));
+      } catch {
+        // Non-fatal: keep the last known status rather than flapping the UI
+        // (and, more importantly, rather than re-enabling manual pick
+        // controls) because one status request failed.
+      }
+      if (!cancelled) timer = setTimeout(poll, SYNC_POLL_MS);
+    }
+
+    poll();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [syncNonce]);
 
   // ------------------------------------------------------------------
   // Session management
@@ -166,7 +246,11 @@ export function useDraft(): DraftHook {
         if (sleeper_draft_id) {
           try {
             const status = await api.startSync(sleeper_draft_id);
-            setSyncStatus(status);
+            setSyncStatus(status.status === "idle" ? null : status);
+            // Restart the poll loop so it tracks the new sync from here on
+            // (and so any in-flight poll from before the sync started can't
+            // land afterwards and clobber this with a stale "idle").
+            setSyncNonce((n) => n + 1);
           } catch (e) {
             setError(
               `Session started, but Sleeper sync failed: ${
@@ -192,6 +276,7 @@ export function useDraft(): DraftHook {
       setBoard(null);
       setRecommendation(null);
       setSyncStatus(null);
+      setSyncNonce((n) => n + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to end session");
     }
@@ -201,7 +286,22 @@ export function useDraft(): DraftHook {
   // Picks
   // ------------------------------------------------------------------
 
+  // Hiding the pick controls (see the isSyncing docs above) is the primary
+  // defence, but these guards close the gap for anything that can reach the
+  // callbacks without going through a rendered button — keyboard shortcuts,
+  // an in-flight click that lands just as sync starts, a stale component.
+  // A ref rather than the state value so the callbacks can stay dep-free and
+  // never read a stale closure.
+  const isSyncingRef = useRef(false);
+  useEffect(() => {
+    isSyncingRef.current = syncStatus?.status === "syncing";
+  }, [syncStatus]);
+
   const recordPick = useCallback(async (playerId: number) => {
+    if (isSyncingRef.current) {
+      setError("Picks are syncing from Sleeper — manual picks are disabled.");
+      return;
+    }
     try {
       await api.recordPick(playerId);
     } catch (e) {
@@ -210,6 +310,10 @@ export function useDraft(): DraftHook {
   }, []);
 
   const undoPick = useCallback(async () => {
+    if (isSyncingRef.current) {
+      setError("Undo is disabled while syncing — Sleeper is the source of truth.");
+      return;
+    }
     try {
       await api.undoPick();
     } catch (e) {
@@ -241,6 +345,7 @@ export function useDraft(): DraftHook {
     board,
     recommendation,
     syncStatus,
+    isSyncing: syncStatus?.status === "syncing",
     isConnected,
     isLoadingRec,
     error,

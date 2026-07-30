@@ -27,6 +27,13 @@ const POS_COLORS: Record<string, string> = {
 export default function StatusBar({ session, isConnected, syncStatus, onUndo, onReset }: Props) {
   const myTurn = session.is_my_turn;
 
+  // Undoing a sync-recorded pick restores the player locally while Sleeper
+  // still has the pick, and the backend's synced-pick counter isn't rewound —
+  // so sync never re-records it and the two boards diverge permanently
+  // (audit W12). Sleeper is the source of truth while it's live; undo there.
+  const isSyncing = syncStatus?.status === "syncing";
+  const undoDisabled = session.picks.length === 0 || isSyncing;
+
   return (
     <div
       className={`flex items-center gap-4 px-4 py-3 border-b text-sm font-medium transition-colors ${
@@ -93,8 +100,12 @@ export default function StatusBar({ session, isConnected, syncStatus, onUndo, on
       {/* Controls */}
       <button
         onClick={onUndo}
-        disabled={session.picks.length === 0}
-        title="Undo last pick"
+        disabled={undoDisabled}
+        title={
+          isSyncing
+            ? "Undo is disabled while Sleeper sync is live — undo the pick in Sleeper instead"
+            : "Undo last pick"
+        }
         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
       >
         <Undo2 size={14} />

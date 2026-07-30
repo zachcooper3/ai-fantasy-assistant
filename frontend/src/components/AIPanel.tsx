@@ -26,6 +26,13 @@ interface Props {
   isMyTurn: boolean;
   onFetch: () => void;
   onDraftRecommended: (playerId: number) => void;
+  /**
+   * True while picks are streaming in from Sleeper. The recommendation stays
+   * fully visible — reading the advice is the whole point — but every control
+   * that would *record* a pick is removed, matching BigBoard. See the
+   * isSyncing docs in useDraft for why a manual pick is destructive here.
+   */
+  isSyncing?: boolean;
 }
 
 export default function AIPanel({
@@ -35,6 +42,7 @@ export default function AIPanel({
   isMyTurn,
   onFetch,
   onDraftRecommended,
+  isSyncing = false,
 }: Props) {
 
   return (
@@ -82,12 +90,15 @@ export default function AIPanel({
                     ADP {recommendation.recommendation.adp}
                   </span>
                 </div>
-                <button
-                  onClick={() => onDraftRecommended(recommendation.recommendation.player_id)}
-                  className="shrink-0 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors"
-                >
-                  Draft
-                </button>
+                {!isSyncing && (
+                  <button
+                    onClick={() => onDraftRecommended(recommendation.recommendation.player_id)}
+                    aria-label={`Draft ${recommendation.recommendation.player_name}`}
+                    className="shrink-0 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-colors"
+                  >
+                    Draft
+                  </button>
+                )}
               </div>
               <p className="text-slate-400 text-sm leading-relaxed">
                 {recommendation.recommendation.reasoning}
@@ -104,25 +115,50 @@ export default function AIPanel({
               <div>
                 <p className="text-xs text-slate-500 uppercase font-semibold mb-2">Alternatives</p>
                 <div className="space-y-2">
-                  {recommendation.alternatives.map((alt) => (
-                    <div
-                      key={alt.player_id}
-                      className="flex items-center gap-3 bg-slate-800/60 rounded-lg px-3 py-2 hover:bg-slate-800 transition-colors cursor-pointer group"
-                      onClick={() => onDraftRecommended(alt.player_id)}
-                    >
-                      <ChevronRight size={12} className="text-slate-600 group-hover:text-slate-400 shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <span className="text-slate-200 text-sm font-medium">{alt.player_name}</span>
-                        <span className={`ml-1.5 text-xs ${POS_COLORS[alt.position] ?? "text-slate-400"}`}>
-                          {alt.position}
-                        </span>
-                        {alt.reasoning && (
-                          <p className="text-xs text-slate-500 truncate mt-0.5">{alt.reasoning}</p>
-                        )}
+                  {recommendation.alternatives.map((alt) => {
+                    const body = (
+                      <>
+                        <ChevronRight
+                          size={12}
+                          className="text-slate-600 group-hover:text-slate-400 shrink-0"
+                          aria-hidden="true"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <span className="text-slate-200 text-sm font-medium">{alt.player_name}</span>
+                          <span className={`ml-1.5 text-xs ${POS_COLORS[alt.position] ?? "text-slate-400"}`}>
+                            {alt.position}
+                          </span>
+                          {alt.reasoning && (
+                            <p className="text-xs text-slate-500 truncate mt-0.5">{alt.reasoning}</p>
+                          )}
+                        </div>
+                        <span className="text-xs text-slate-500 shrink-0">{alt.adp}</span>
+                      </>
+                    );
+
+                    // Static row while syncing — Sleeper owns the picks, so
+                    // there is nothing to click. Rendering a real <button>
+                    // (rather than the clickable <div> this used to be) also
+                    // makes the interactive case keyboard-reachable.
+                    return isSyncing ? (
+                      <div
+                        key={alt.player_id}
+                        className="flex items-center gap-3 bg-slate-800/60 rounded-lg px-3 py-2"
+                      >
+                        {body}
                       </div>
-                      <span className="text-xs text-slate-500 shrink-0">{alt.adp}</span>
-                    </div>
-                  ))}
+                    ) : (
+                      <button
+                        key={alt.player_id}
+                        type="button"
+                        onClick={() => onDraftRecommended(alt.player_id)}
+                        aria-label={`Draft ${alt.player_name}`}
+                        className="w-full text-left flex items-center gap-3 bg-slate-800/60 rounded-lg px-3 py-2 hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 transition-colors cursor-pointer group"
+                      >
+                        {body}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             )}

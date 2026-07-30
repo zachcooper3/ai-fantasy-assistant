@@ -33,9 +33,24 @@ interface Props {
   isMyTurn: boolean;
   recommendedId?: number;
   onPick: (playerId: number) => void;
+  /**
+   * True while picks are streaming in from Sleeper. The per-row Draft button
+   * is removed entirely rather than disabled: while sync is live the board is
+   * a read-only mirror of Sleeper, a manual pick actively corrupts team-slot
+   * attribution (audit W2), and a greyed-out button reads as "broken" rather
+   * than "not applicable". Dropping the column also gives the player name
+   * ~64px more room.
+   */
+  isSyncing?: boolean;
 }
 
-export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: Props) {
+export default function BigBoard({
+  players,
+  isMyTurn,
+  recommendedId,
+  onPick,
+  isSyncing = false,
+}: Props) {
   const [posFilter, setPosFilter] = useState<PosFilter>("All");
   const [search, setSearch] = useState("");
   const [displayLimit, setDisplayLimit] = useState(INITIAL_LIMIT);
@@ -76,6 +91,11 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
   const visible = shouldPaginate ? filtered.slice(0, displayLimit) : filtered;
   const hasMore = shouldPaginate && filtered.length > displayLimit;
 
+  // Column count, used for the full-width <td colSpan> rows below. Kept in one
+  // place so the tier-break divider and "show more" row can't drift out of
+  // sync with the header when the Draft column comes and goes.
+  const columnCount = isSyncing ? 4 : 5;
+
   return (
     <div className="flex flex-col h-full bg-slate-900 rounded-xl border border-slate-700 overflow-hidden">
       {/* Header */}
@@ -84,9 +104,22 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
           <h2 className="text-sm font-bold text-slate-200 uppercase tracking-wider">
             Big Board
           </h2>
-          <span className="text-xs text-slate-500">
-            {availableCount} / {totalCount} available
-          </span>
+          <div className="flex items-center gap-2">
+            {/* Explains the missing Draft column — without this the controls
+                just silently vanish, which reads as a bug. */}
+            {isSyncing && (
+              <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-800/60 text-xs font-medium text-emerald-300">
+                <span className="relative flex h-1.5 w-1.5" aria-hidden="true">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                </span>
+                Picks syncing from Sleeper
+              </span>
+            )}
+            <span className="text-xs text-slate-400">
+              {availableCount} / {totalCount} available
+            </span>
+          </div>
         </div>
 
         {/* Position filter */}
@@ -130,7 +163,7 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
                 <th className="text-left py-2">Player</th>
                 <th className="text-center py-2 w-12">Pos</th>
                 <th className="text-center py-2 w-12">ADP</th>
-                <th className="py-2 w-16" />
+                {!isSyncing && <th className="py-2 w-16" />}
               </tr>
             </thead>
             <tbody>
@@ -143,7 +176,7 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
                   <React.Fragment key={player.id}>
                     {tierBreak && (
                       <tr>
-                        <td colSpan={5} className="py-0.5">
+                        <td colSpan={columnCount} className="py-0.5">
                           <div className="mx-4 border-t border-dashed border-slate-700" />
                         </td>
                       </tr>
@@ -181,18 +214,21 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
                         {player.adp}
                       </td>
 
-                      <td className="py-2.5 pr-3 text-right">
-                        <button
-                          onClick={() => onPick(player.id)}
-                          className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
-                            isMyTurn
-                              ? "bg-emerald-600 hover:bg-emerald-500 text-white"
-                              : "bg-slate-700 hover:bg-slate-600 text-slate-300"
-                          }`}
-                        >
-                          Draft
-                        </button>
-                      </td>
+                      {!isSyncing && (
+                        <td className="py-2.5 pr-3 text-right">
+                          <button
+                            onClick={() => onPick(player.id)}
+                            aria-label={`Draft ${player.name}`}
+                            className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors ${
+                              isMyTurn
+                                ? "bg-emerald-600 hover:bg-emerald-500 text-white"
+                                : "bg-slate-700 hover:bg-slate-600 text-slate-300"
+                            }`}
+                          >
+                            Draft
+                          </button>
+                        </td>
+                      )}
                     </tr>
                   </React.Fragment>
                 );
@@ -201,7 +237,7 @@ export default function BigBoard({ players, isMyTurn, recommendedId, onPick }: P
               {/* Show more row */}
               {hasMore && (
                 <tr>
-                  <td colSpan={5} className="py-3 text-center">
+                  <td colSpan={columnCount} className="py-3 text-center">
                     <button
                       onClick={() => setDisplayLimit((n) => n + LOAD_MORE_STEP)}
                       className="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 text-xs font-medium transition-colors"

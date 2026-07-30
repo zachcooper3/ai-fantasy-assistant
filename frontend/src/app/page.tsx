@@ -24,6 +24,7 @@ export default function DraftPage() {
     board,
     recommendation,
     syncStatus,
+    isSyncing,
     isConnected,
     isLoadingRec,
     error,
@@ -88,13 +89,18 @@ export default function DraftPage() {
         </div>
       )}
 
-      {/* Desktop 3-column layout */}
-      <div className="hidden md:grid md:grid-cols-[1fr_280px_300px] gap-3 p-3 flex-1 min-h-0">
+      {/* Desktop 3-column layout.
+          The draft-room column was a fixed 280px, which forced Opponent
+          Tracking's per-slot chips to wrap into an unreadable block in a
+          12-team league. minmax() lets it breathe on wide screens while
+          minmax(0,1fr) keeps the board from being pushed out of the grid. */}
+      <div className="hidden md:grid md:grid-cols-[minmax(0,1fr)_320px_300px] xl:grid-cols-[minmax(0,1fr)_380px_340px] gap-3 p-3 flex-1 min-h-0">
         <BigBoard
           players={board?.players ?? []}
           isMyTurn={session.is_my_turn}
           recommendedId={recommendedId}
           onPick={recordPick}
+          isSyncing={isSyncing}
         />
         <DraftRoom session={session} />
         <AIPanel
@@ -104,6 +110,7 @@ export default function DraftPage() {
           isMyTurn={session.is_my_turn}
           onFetch={fetchRecommendation}
           onDraftRecommended={recordPick}
+          isSyncing={isSyncing}
         />
       </div>
 
@@ -115,6 +122,7 @@ export default function DraftPage() {
             isMyTurn={session.is_my_turn}
             recommendedId={recommendedId}
             onPick={recordPick}
+            isSyncing={isSyncing}
           />
         )}
         {mobileTab === "room" && <DraftRoom session={session} />}
@@ -126,6 +134,7 @@ export default function DraftPage() {
             isMyTurn={session.is_my_turn}
             onFetch={fetchRecommendation}
             onDraftRecommended={recordPick}
+            isSyncing={isSyncing}
           />
         )}
       </div>
