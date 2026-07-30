@@ -75,6 +75,7 @@ export default function DraftPage() {
         isConnected={isConnected}
         syncStatus={syncStatus}
         onUndo={undoPick}
+        onNewDraft={endSession}
         onReset={() => startSession({
           league_size: session.league_size,
           my_draft_position: session.my_draft_position,

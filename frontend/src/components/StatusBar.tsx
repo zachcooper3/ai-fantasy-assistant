@@ -4,15 +4,27 @@
  * Highlights in green when it's the user's turn.
  */
 
-import { Undo2, Wifi, WifiOff, RefreshCw } from "lucide-react";
+import { Undo2, Wifi, WifiOff, RefreshCw, RotateCcw, LogOut } from "lucide-react";
 import { DraftState, SyncStatus } from "@/lib/api";
+import ConfirmButton from "@/components/ConfirmButton";
 
 interface Props {
   session: DraftState;
   isConnected: boolean;
   syncStatus: SyncStatus | null;
   onUndo: () => void;
+  /** Clears the picks but keeps this league's settings. */
   onReset: () => void;
+  /**
+   * Ends the session entirely and returns to the setup screen.
+   *
+   * Without this there was no way out of an active draft: the session is
+   * persisted and rehydrated on boot, so restarting the backend resumed the
+   * old draft, and "Reset" restarts with the same config rather than letting
+   * you reconfigure. The only route back to setup was the draft-complete
+   * overlay — unreachable unless you played the draft out.
+   */
+  onNewDraft: () => void;
 }
 
 const POS_COLORS: Record<string, string> = {
@@ -24,7 +36,14 @@ const POS_COLORS: Record<string, string> = {
   K: "text-slate-400",
 };
 
-export default function StatusBar({ session, isConnected, syncStatus, onUndo, onReset }: Props) {
+export default function StatusBar({
+  session,
+  isConnected,
+  syncStatus,
+  onUndo,
+  onReset,
+  onNewDraft,
+}: Props) {
   const myTurn = session.is_my_turn;
 
   // Undoing a sync-recorded pick restores the player locally while Sleeper
@@ -112,12 +131,36 @@ export default function StatusBar({ session, isConnected, syncStatus, onUndo, on
         Undo
       </button>
 
-      <button
-        onClick={onReset}
-        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-900 text-slate-400 hover:text-red-300 transition-colors text-xs"
-      >
-        Reset
-      </button>
+      {/* Clears picks, keeps this league's settings */}
+      <ConfirmButton
+        label={
+          <span className="flex items-center gap-1.5">
+            <RotateCcw size={12} aria-hidden="true" />
+            Reset picks
+          </span>
+        }
+        confirmLabel="Clear all picks?"
+        onConfirm={onReset}
+        ariaLabel="Reset picks, keeping the current league settings"
+        title="Clear every pick and start this same draft over"
+        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+      />
+
+      {/* Ends the session and returns to the setup screen */}
+      <ConfirmButton
+        label={
+          <span className="flex items-center gap-1.5">
+            <LogOut size={12} aria-hidden="true" />
+            New draft
+          </span>
+        }
+        confirmLabel="End this draft?"
+        onConfirm={onNewDraft}
+        ariaLabel="End this draft and return to setup"
+        title="End this session and go back to the configuration screen"
+        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-red-900 text-slate-400 hover:text-red-300 transition-colors text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+        confirmClassName="bg-red-600 hover:bg-red-500 text-white"
+      />
 
       {/* Sleeper sync indicator */}
       {syncStatus && syncStatus.status !== "idle" && (

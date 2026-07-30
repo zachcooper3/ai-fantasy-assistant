@@ -15,7 +15,7 @@
  * fallback reports confidence "low" and carries no strategy or trade-offs).
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Lightbulb,
   RefreshCw,
@@ -28,6 +28,7 @@ import {
 import { Confidence, Player, PickSuggestion, Recommendation, Scarcity } from "@/lib/api";
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
+import ConfirmButton from "@/components/ConfirmButton";
 
 const POS_COLORS: Record<string, string> = {
   QB:  "text-red-400",
@@ -103,47 +104,18 @@ function DraftButton({
   onConfirm: () => void;
   variant?: "primary" | "subtle";
 }) {
-  const [armed, setArmed] = useState(false);
-
-  // Disarm on its own so a half-pressed button never sits waiting to fire
-  // later, long after you've moved on.
-  useEffect(() => {
-    if (!armed) return;
-    const t = setTimeout(() => setArmed(false), 4000);
-    return () => clearTimeout(t);
-  }, [armed]);
-
-  const base =
-    "shrink-0 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500";
-
-  if (armed) {
-    return (
-      <button
-        type="button"
-        onClick={onConfirm}
-        onBlur={() => setArmed(false)}
-        autoFocus
-        aria-label={`Confirm drafting ${playerName}`}
-        className={`${base} bg-amber-500 hover:bg-amber-400 text-slate-950`}
-      >
-        Confirm?
-      </button>
-    );
-  }
-
   return (
-    <button
-      type="button"
-      onClick={() => setArmed(true)}
-      aria-label={`Draft ${playerName}`}
-      className={`${base} ${
+    <ConfirmButton
+      label="Draft"
+      onConfirm={onConfirm}
+      ariaLabel={`Draft ${playerName}`}
+      confirmAriaLabel={`Confirm drafting ${playerName}`}
+      className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-bold transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
         variant === "primary"
           ? "bg-emerald-600 hover:bg-emerald-500 text-white"
           : "bg-slate-700 hover:bg-slate-600 text-slate-200"
       }`}
-    >
-      Draft
-    </button>
+    />
   );
 }
 
