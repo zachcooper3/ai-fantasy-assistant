@@ -237,3 +237,60 @@ def test_truncated_json_returns_none_rather_than_raising():
     # What a max_tokens cut-off actually looks like: valid opening, no close.
     truncated = json.dumps(valid_payload())[:120]
     assert _parse_response(truncated, ctx_with_available(1, 2, 3)) is None
+
+
+# ---------------------------------------------------------------------------
+# _parse_response — the id is the only trusted field
+#
+# Live bug 2026-07-30: the parser checked player_id against the available list
+# but rendered Claude's own player_name/position/adp, so an available id paired
+# with a drafted player's name displayed that drafted player. Every factual
+# field now comes from ctx.top_available; the model supplies only free text.
+# ---------------------------------------------------------------------------
+
+def test_player_name_comes_from_our_data_not_claudes():
+    payload = valid_payload()
+    payload["recommendation"]["player_name"] = "Some Drafted Guy"
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    # ctx_with_available names players P{id}
+    assert result.recommendation.player_name == "P1"
+
+
+def test_position_and_adp_come_from_our_data_not_claudes():
+    payload = valid_payload()
+    payload["recommendation"]["position"] = "QB"   # actually RB in our data
+    payload["recommendation"]["adp"] = 999.0       # actually 1.0
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    assert result.recommendation.position == "RB"
+    assert result.recommendation.adp == 1.0
+
+
+def test_alternative_fields_are_also_taken_from_our_data():
+    payload = valid_payload(alt_ids=(2,))
+    payload["alternatives"][0]["player_name"] = "Wrong Name"
+    payload["alternatives"][0]["adp"] = 0.1
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
+    assert result.alternatives[0].player_name == "P2"
+    assert result.alternatives[0].adp == 2.0
+
+
+def test_reasoning_and_tradeoff_still_come_from_claude():
+    # The model's judgement is the one thing it does supply.
+    payload = valid_payload(alt_ids=(2,))
+    payload["recommendation"]["reasoning"] = "Elite volume in a good offence."
+    payload["alternatives"][0]["tradeoff"] = "Higher floor, lower ceiling."
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
+    assert result.recommendation.reasoning == "Elite volume in a good offence."
+    assert result.alternatives[0].tradeoff == "Higher floor, lower ceiling."
+
+
+def test_suggestion_missing_name_and_adp_entirely_still_parses():
+    # Those fields are ours now, so Claude omitting them is harmless.
+    payload = valid_payload(alt_ids=(2,))
+    for key in ("player_name", "position", "adp"):
+        payload["recommendation"].pop(key)
+        payload["alternatives"][0].pop(key)
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
+    assert result is not None
+    assert result.recommendation.player_name == "P1"
+    assert result.alternatives[0].player_name == "P2"

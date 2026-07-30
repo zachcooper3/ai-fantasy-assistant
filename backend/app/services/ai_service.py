@@ -958,28 +958,42 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         logger.warning("Claude recommended unavailable player id=%s", rec.get("player_id"))
         return None
 
+    # Canonical player rows, keyed by id. Every *factual* field on a suggestion
+    # is taken from here rather than from Claude's JSON.
+    #
+    # This matters: validating player_id against the available list while still
+    # rendering the model's own player_name/position/adp meant an available id
+    # paired with a drafted player's name displayed that drafted player. The id
+    # is the only field we verify, so the id is the only field we trust — the
+    # model contributes judgement (reasoning, tradeoff), not data. It also
+    # closes the prompt-injection path where RotoWire/Sleeper text reaching the
+    # prompt could influence a rendered player name.
+    by_id = {p["id"]: p for p in ctx.top_available}
+
     def _pick(d: dict) -> PickSuggestion | None:
-        try:
-            return PickSuggestion(
-                player_id=int(d["player_id"]),
-                player_name=str(d["player_name"]),
-                position=str(d["position"]),
-                adp=float(d["adp"]),
-                reasoning=str(d.get("reasoning", "")),
-                tradeoff=_clean_text(d.get("tradeoff")),
-            )
-        except (KeyError, ValueError, TypeError):
+        canonical = by_id.get(_as_id(d.get("player_id")))
+        if canonical is None:
+            # Unknown or already-drafted id — not in top_available.
             return None
+        return PickSuggestion(
+            player_id=canonical["id"],
+            player_name=canonical["name"],
+            position=canonical["position"],
+            adp=canonical["adp"],
+            # Free text is the model's to write; it's the only thing it adds.
+            reasoning=str(d.get("reasoning", "")),
+            tradeoff=_clean_text(d.get("tradeoff")),
+        )
 
     recommendation = _pick(rec)
     if recommendation is None:
         return None
 
+    # No separate availability filter needed: _pick already returns None for
+    # anything not in the available list.
     alternatives = [
         s for d in data.get("alternatives", [])[:_MAX_ALTERNATIVES]
-        if isinstance(d, dict)
-        and (s := _pick(d)) is not None
-        and s.player_id in available_ids
+        if isinstance(d, dict) and (s := _pick(d)) is not None
     ]
 
     alerts = [str(a) for a in data.get("alerts", []) if a]
