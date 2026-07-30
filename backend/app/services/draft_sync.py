@@ -20,7 +20,7 @@ from backend.db import draft_session_repo
 from backend.app.services import sleeper_client
 from backend.app.services.draft_state import DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
-from backend.app.serializers import build_pick_response, build_state_response
+from backend.app.serializers import pick_payload, state_payload
 
 logger = logging.getLogger(__name__)
 
@@ -270,8 +270,8 @@ class DraftSyncService:
         my_slot = self._draft_svc.config.my_draft_position
         await self._conn_mgr.broadcast({
             "type": "pick",
-            "pick": build_pick_response(pick, my_slot).model_dump(),
-            "state": build_state_response(self._draft_svc).model_dump(),
+            "pick": pick_payload(pick, my_slot),
+            "state": state_payload(self._draft_svc),
         })
 
         logger.info(

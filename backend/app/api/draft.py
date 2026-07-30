@@ -28,7 +28,7 @@ from backend.app.schemas import (
     PlayerResponse,
     ScarcityResponse,
 )
-from backend.app.serializers import build_pick_response, build_state_response
+from backend.app.serializers import build_pick_response, build_state_response, state_payload
 from backend.app.services.draft_state import DraftConfig, DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.draft_sync import DraftSyncService
@@ -168,8 +168,8 @@ async def record_pick(
 
     await mgr.broadcast({
         "type": "pick",
-        "pick": pick_resp.model_dump(),
-        "state": build_state_response(svc).model_dump(),
+        "pick": pick_resp.model_dump(mode="json"),
+        "state": state_payload(svc),
     })
 
     return pick_resp
@@ -217,8 +217,8 @@ async def undo_pick(
 
     await mgr.broadcast({
         "type": "undo",
-        "pick": pick_resp.model_dump(),
-        "state": build_state_response(svc).model_dump(),
+        "pick": pick_resp.model_dump(mode="json"),
+        "state": state_payload(svc),
     })
 
     return pick_resp

@@ -55,3 +55,27 @@ def build_state_response(svc: DraftStateService) -> DraftStateResponse:
         picks=[build_pick_response(p, my_slot) for p in svc.picks],
         my_roster=[build_pick_response(p, my_slot) for p in svc.my_roster],
     )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket payloads
+#
+# `WebSocket.send_json` serialises with the *stdlib* json module, which knows
+# nothing about datetime, Decimal, UUID and friends — unlike the HTTP path,
+# where FastAPI runs every response through its own encoder first. So a field
+# that serialises fine over HTTP can still blow up the socket with
+# "Object of type datetime is not JSON serializable", taking down the
+# connection that carries every live pick.
+#
+# That's exactly what adding `started_at` did. These helpers exist so no call
+# site has to remember `mode="json"`: use them for anything sent over the wire.
+# ---------------------------------------------------------------------------
+
+def state_payload(svc: DraftStateService) -> dict:
+    """JSON-safe draft state for WebSocket broadcast."""
+    return build_state_response(svc).model_dump(mode="json")
+
+
+def pick_payload(pick: PickRecord, my_slot: int) -> dict:
+    """JSON-safe pick for WebSocket broadcast."""
+    return build_pick_response(pick, my_slot).model_dump(mode="json")
