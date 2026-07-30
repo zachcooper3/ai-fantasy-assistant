@@ -50,6 +50,77 @@ _IGNORED_SLOTS = {"BN", "IR", "TAXI", "K"}
 # misrepresent the league's actual eligibility rules.
 _UNSUPPORTED_SLOTS = {"SUPER_FLEX", "WRRB_FLEX", "REC_FLEX", "IDP_FLEX", "DL", "LB", "DB"}
 
+# ---------------------------------------------------------------------------
+# Draft-settings slot keys — the draft object's OWN roster shape
+# ---------------------------------------------------------------------------
+# GET /draft/{id} carries the full lineup in settings (slots_qb, slots_rb,
+# ...), which makes it the preferred source over the league's
+# roster_positions: it needs no second HTTP call, and — decisively — it's
+# the ONLY source available for mock drafts, which have league_id: null
+# (confirmed live 2026-07-29 against a real league_mock draft; the old
+# league-only path degraded every mock to "enter roster settings
+# manually" even though the numbers were sitting right there in the
+# response we'd already fetched).
+
+_DRAFT_SETTINGS_SLOT_MAP = {
+    "slots_qb": "qb_slots",
+    "slots_rb": "rb_slots",
+    "slots_wr": "wr_slots",
+    "slots_te": "te_slots",
+    "slots_flex": "flex_slots",   # Sleeper's plain flex = RB/WR/TE, same as ours
+    "slots_def": "dst_slots",
+}
+
+# Bench and kicker aren't starting slots this app models — same stance as
+# _IGNORED_SLOTS above.
+_DRAFT_SETTINGS_UNSUPPORTED = {
+    "slots_super_flex", "slots_wrrb_flex", "slots_rec_flex",
+    "slots_idp_flex", "slots_dl", "slots_lb", "slots_db",
+}
+
+# Sleeper's metadata.scoring_type strings -> our scoring_format values.
+_SCORING_TYPE_MAP = {
+    "ppr": "ppr",
+    "half_ppr": "half_ppr",
+    "std": "standard",
+    "standard": "standard",
+    # "2qb", "dynasty_ppr", etc. exist — anything unrecognized falls
+    # through to the league scoring_settings check instead of guessing.
+    "dynasty_ppr": "ppr",
+    "dynasty_half_ppr": "half_ppr",
+    "dynasty_std": "standard",
+}
+
+
+def _slots_from_draft_settings(settings: dict) -> tuple[dict[str, int], list[str]]:
+    """
+    Returns ({field_name: count}, [unsupported slot keys with count > 0])
+    from a draft object's settings. Empty dict means the settings carried
+    no slots_* keys at all (fall back to the league's roster_positions).
+
+    Unlike roster_positions, an explicit 0 here is real data ("this league
+    starts no DST"), so zeros are passed through rather than dropped.
+    """
+    if not any(k.startswith("slots_") for k in settings):
+        return {}, []
+
+    counts = {
+        field: settings[key]
+        for key, field in _DRAFT_SETTINGS_SLOT_MAP.items()
+        if isinstance(settings.get(key), int)
+    }
+    unsupported = sorted(
+        key for key in _DRAFT_SETTINGS_UNSUPPORTED if settings.get(key)
+    )
+    return counts, unsupported
+
+
+def _scoring_from_metadata(metadata: dict) -> str | None:
+    """Maps the draft's own metadata.scoring_type to ppr/half_ppr/standard,
+    or None if absent/unrecognized."""
+    raw = (metadata.get("scoring_type") or "").strip().lower()
+    return _SCORING_TYPE_MAP.get(raw)
+
 
 def _detect_scoring_format(scoring_settings: dict) -> str | None:
     """Maps Sleeper's reception-point setting to ppr/half_ppr/standard."""
@@ -112,6 +183,7 @@ async def build_prefill(draft_id: str, username: str | None) -> SleeperPrefillRe
         return result
 
     settings = draft_info.get("settings") or {}
+    metadata = draft_info.get("metadata") or {}
     result.league_size = settings.get("teams")
     result.total_rounds = settings.get("rounds")
     if result.league_size is None or result.total_rounds is None:
@@ -139,41 +211,78 @@ async def build_prefill(draft_id: str, username: str | None) -> SleeperPrefillRe
             logger.warning(f"Sleeper prefill: get_user({username!r}) failed: {e}")
             warnings.append(f"Couldn't look up Sleeper user '{username}' — enter your draft slot manually.")
 
-    # Roster construction + scoring — requires the league_id from the draft.
-    league_id = draft_info.get("league_id")
-    if not league_id:
-        warnings.append("Couldn't determine this draft's league — enter roster settings manually.")
-        result.warnings = warnings
-        return result
-
-    try:
-        league_info = await sleeper_client.get_league(league_id)
-    except Exception as e:
-        logger.warning(f"Sleeper prefill: get_league({league_id!r}) failed: {e}")
-        warnings.append("Couldn't fetch this league's roster settings from Sleeper — enter them manually.")
-        result.warnings = warnings
-        return result
-
-    roster_positions = league_info.get("roster_positions") or []
-    if roster_positions:
-        counts, unsupported = _slots_from_roster_positions(roster_positions)
+    # Roster construction — the draft's OWN settings are the preferred
+    # source (no second HTTP call, and the only source that exists for
+    # mock drafts, whose league_id is null — see
+    # _slots_from_draft_settings' docstring).
+    roster_known = False
+    counts, unsupported = _slots_from_draft_settings(settings)
+    if counts:
         result.qb_slots = counts.get("qb_slots")
         result.rb_slots = counts.get("rb_slots")
         result.wr_slots = counts.get("wr_slots")
         result.te_slots = counts.get("te_slots")
         result.flex_slots = counts.get("flex_slots")
         result.dst_slots = counts.get("dst_slots")
+        roster_known = True
         if unsupported:
             warnings.append(
-                f"This league has roster slot(s) this app doesn't model yet "
+                f"This draft has roster slot(s) this app doesn't model yet "
                 f"({', '.join(unsupported)}) — double-check the roster settings below; "
                 "they may be incomplete."
             )
-    else:
-        warnings.append("Sleeper didn't report roster positions for this league — enter them manually.")
 
-    scoring_settings = league_info.get("scoring_settings") or {}
-    detected = _detect_scoring_format(scoring_settings)
+    # Scoring — the draft's own metadata often says it outright.
+    detected = _scoring_from_metadata(metadata)
+
+    # League lookup — only for whatever's still missing. Mock drafts have
+    # league_id: null at the top level, but league mocks carry the real
+    # league in metadata.league_id (confirmed live), so check both before
+    # giving up.
+    league_id = draft_info.get("league_id") or metadata.get("league_id")
+
+    if (not roster_known or detected is None) and league_id:
+        try:
+            league_info = await sleeper_client.get_league(league_id)
+        except Exception as e:
+            logger.warning(f"Sleeper prefill: get_league({league_id!r}) failed: {e}")
+            league_info = None
+            if not roster_known:
+                warnings.append(
+                    "Couldn't fetch this league's roster settings from Sleeper — "
+                    "enter them manually."
+                )
+
+        if league_info is not None:
+            if not roster_known:
+                roster_positions = league_info.get("roster_positions") or []
+                if roster_positions:
+                    counts, unsupported = _slots_from_roster_positions(roster_positions)
+                    result.qb_slots = counts.get("qb_slots")
+                    result.rb_slots = counts.get("rb_slots")
+                    result.wr_slots = counts.get("wr_slots")
+                    result.te_slots = counts.get("te_slots")
+                    result.flex_slots = counts.get("flex_slots")
+                    result.dst_slots = counts.get("dst_slots")
+                    roster_known = True
+                    if unsupported:
+                        warnings.append(
+                            f"This league has roster slot(s) this app doesn't model yet "
+                            f"({', '.join(unsupported)}) — double-check the roster "
+                            "settings below; they may be incomplete."
+                        )
+                else:
+                    warnings.append(
+                        "Sleeper didn't report roster positions for this league — "
+                        "enter them manually."
+                    )
+            if detected is None:
+                detected = _detect_scoring_format(league_info.get("scoring_settings") or {})
+    elif not roster_known and not league_id:
+        warnings.append(
+            "Couldn't determine this draft's roster settings — enter them manually."
+        )
+
     result.detected_scoring_format = detected
     if detected and detected != "ppr":
         warnings.append(
