@@ -17,7 +17,7 @@ from backend.db import player_repo as repo
 from backend.db import metrics_repo
 from backend.db import draft_profile_repo
 from backend.app.schemas import PlayerResponse
-from backend.app.services.ai_service import AIService, RecommendationContext
+from backend.app.services.ai_service import AIService, RecommendationContext, compute_position_scarcity
 from backend.app.services.draft_state import DraftStateService
 
 router = APIRouter(prefix="/api/recommend", tags=["recommendations"])
@@ -287,6 +287,11 @@ def analyze_scarcity(
     flex_slots to both RB and WR — the same "a flex is usually an RB or
     WR" assumption the original hardcoded 3/3 encoded.
 
+    The critical/low/ok tier math itself lives in compute_position_scarcity
+    (ai_service.py) — shared with the main recommendation prompt's
+    Positional Availability section so the two never drift out of sync,
+    even though each passes its own starter_slots shape.
+
       critical  — fewer players left than half the league's demand
       low       — fewer than 1.5x the demand
       ok        — above that
@@ -315,25 +320,21 @@ def analyze_scarcity(
         starter_slots = {"QB": 1, "RB": 3, "WR": 3, "TE": 1, "DST": 1, "K": 1}
         league_size = 12
 
+    tiers = compute_position_scarcity(counts, league_size, starter_slots)
+
+    messages = {
+        "critical": lambda pos, n: f"Only {n} {pos}s left — critical scarcity. Consider drafting one now.",
+        "low": lambda pos, n: f"{n} {pos}s remaining — supply is thinning.",
+        "ok": lambda pos, n: f"{pos} supply is healthy ({n} available).",
+    }
+
     alerts: list[ScarcityAlert] = []
-    for pos, slots in starter_slots.items():
+    for pos, tier in tiers.items():
         available = counts.get(pos, 0)
-        # Players needed to fill starter slots for all remaining teams
-        teams_needing = league_size * slots
-        critical_threshold = teams_needing // 2
-        low_threshold = int(teams_needing * 1.5)
-
-        if available <= critical_threshold:
-            tier = "critical"
-            msg = f"Only {available} {pos}s left — critical scarcity. Consider drafting one now."
-        elif available <= low_threshold:
-            tier = "low"
-            msg = f"{available} {pos}s remaining — supply is thinning."
-        else:
-            tier = "ok"
-            msg = f"{pos} supply is healthy ({available} available)."
-
-        alerts.append(ScarcityAlert(position=pos, available=available, tier=tier, message=msg))
+        alerts.append(ScarcityAlert(
+            position=pos, available=available, tier=tier,
+            message=messages[tier](pos, available),
+        ))
 
     # Sort: critical first, then low, then ok
     tier_order = {"critical": 0, "low": 1, "ok": 2}

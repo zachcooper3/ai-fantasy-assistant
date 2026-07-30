@@ -177,6 +177,95 @@ def _compute_roster_gaps(
 
 
 # ---------------------------------------------------------------------------
+# ADP tiers — groups the ranked player list so the prompt stops implying
+# every ADP decimal is a meaningful ordering
+# ---------------------------------------------------------------------------
+
+# There's no external expert-consensus tier feed wired into this app (that
+# would need its own data source and ingestion script), so this is a
+# heuristic proxy, not a real analyst's tier sheet: a new tier starts
+# whenever the ADP gap to the previous player exceeds
+# max(_MIN_TIER_GAP, previous_adp * _TIER_GAP_RATIO). The ratio term is
+# what makes this scale-aware — a 3-pick gap is a real cliff at ADP 5 but
+# noise at ADP 150, so the threshold widens proportionally as ADP climbs
+# instead of using one fixed number for the whole board.
+_MIN_TIER_GAP = 3.0
+_TIER_GAP_RATIO = 0.10
+
+
+def _compute_adp_tiers(players: list[dict]) -> list[list[dict]]:
+    """
+    Groups ADP-sorted players (ascending) into tiers by clustering on gap
+    size — see module comment above for the threshold logic. Recomputed
+    fresh from whatever `players` contains on every call, so a refreshed
+    ADP dataset (fetch_adp.py) is reflected in tiering on the very next
+    recommendation with no separate step or cached/stale tier data.
+    """
+    if not players:
+        return []
+
+    tiers: list[list[dict]] = [[players[0]]]
+    for prev, cur in zip(players, players[1:]):
+        gap = cur["adp"] - prev["adp"]
+        threshold = max(_MIN_TIER_GAP, prev["adp"] * _TIER_GAP_RATIO)
+        if gap > threshold:
+            tiers.append([])
+        tiers[-1].append(cur)
+    return tiers
+
+
+# ---------------------------------------------------------------------------
+# Positional scarcity — shared with the standalone /api/recommend/scarcity
+# endpoint (backend/app/api/recommendations.py) so the two never drift out
+# of sync on what counts as "critical" scarcity for a given league size.
+# ---------------------------------------------------------------------------
+
+# Expected starter counts per team for a standard PPR roster (1 QB, 2 RB +
+# 1 flex-eligible ~= 3 RB-equivalent demand, similarly for WR, 1 TE, 1 DST,
+# 1 K). Approximate guides, not a per-league exact model.
+_STARTER_SLOTS = {"QB": 1, "RB": 3, "WR": 3, "TE": 1, "DST": 1, "K": 1}
+
+
+def compute_position_scarcity(
+    available_counts: dict[str, int],
+    league_size: int,
+    starter_slots: dict[str, int] | None = None,
+) -> dict[str, str]:
+    """
+    Returns {position: "critical"|"low"|"ok"} given how many of each
+    position remain undrafted, for a league of this size and starter-slot
+    shape. `starter_slots` defaults to the generic 1-QB/3-RB/3-WR/1-TE/
+    1-DST/1-K shape (_STARTER_SLOTS, FLEX pre-folded into RB+WR) when not
+    given — the standalone /api/recommend/scarcity endpoint instead passes
+    the session's real per-league roster shape (qb_slots/rb_slots/etc.,
+    with flex_slots added to both RB and WR demand) so its output reflects
+    the actual league instead of this generic assumption. Both callers
+    share this one function so the critical/low/ok math itself never
+    drifts out of sync between them, even when the shapes they pass differ.
+
+    Thresholds (approximate guides, not hard rules):
+      critical — fewer players left than half the league's demand
+      low      — fewer than 1.5x the demand
+      ok       — above that
+    """
+    starter_slots = starter_slots or _STARTER_SLOTS
+    tiers: dict[str, str] = {}
+    for pos, slots in starter_slots.items():
+        available = available_counts.get(pos, 0)
+        teams_needing = league_size * slots
+        critical_threshold = teams_needing // 2
+        low_threshold = int(teams_needing * 1.5)
+
+        if available <= critical_threshold:
+            tiers[pos] = "critical"
+        elif available <= low_threshold:
+            tiers[pos] = "low"
+        else:
+            tiers[pos] = "ok"
+    return tiers
+
+
+# ---------------------------------------------------------------------------
 # Retrieval — grounds the prompt in real news/analysis from ChromaDB
 # ---------------------------------------------------------------------------
 
@@ -604,26 +693,54 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             "",
         ]
 
-    # Top available players (cap at 25 to keep prompt tight)
-    lines.append("## Top Available Players (by ADP)")
-    lines.append(f"{'Rank':<5} {'Player':<22} {'Pos':<5} {'Team':<6} {'ADP'}")
-    for p in ctx.top_available[:25]:
-        lines.append(
-            f"{p['rank']:<5} {p['name']:<22} {p['position']:<5} {p['team']:<6} {p['adp']}"
-        )
+    # Top available players, grouped into ADP tiers (cap at 25 to keep
+    # prompt tight). Tiers, not a flat 1-25 rank — see _compute_adp_tiers'
+    # docstring for why: a precise ordinal table invites treating every
+    # ADP decimal as meaningful, when a few-point gap is often just noise.
+    lines.append("## Top Available Players (grouped into ADP tiers)")
+    lines.append(
+        "Players within the same tier are roughly interchangeable in ADP terms — "
+        "treat a gap within a tier as noise and use the Opportunity & Performance "
+        "Signals / Player News sections to choose among them, rather than the exact "
+        "ADP decimal. A gap between tiers is more likely to reflect real drop-off."
+    )
+    tiers = _compute_adp_tiers(ctx.top_available[:25])
+    for i, tier in enumerate(tiers, start=1):
+        adp_lo, adp_hi = tier[0]["adp"], tier[-1]["adp"]
+        lines.append(f"\nTier {i} (ADP {adp_lo:g}-{adp_hi:g}):")
+        for p in tier:
+            lines.append(
+                f"  {p['rank']:<5} {p['name']:<22} {p['position']:<5} {p['team']:<6} ADP {p['adp']}"
+            )
     lines.append("")
 
-    # Positional availability (scarcity context)
+    # Positional availability + scarcity tier (run-risk context). Starter
+    # slots derive from this league's actual configured lineup (not a
+    # generic assumption) the same way the standalone /api/recommend/
+    # scarcity endpoint's own fix does — FLEX demand folded into both RB
+    # and WR, since a flex is usually filled by one or the other.
     counts = ctx.available_counts
+    lineup = ctx.starting_lineup
+    scarcity_starter_slots = {
+        "QB": lineup.get("QB", 0),
+        "RB": lineup.get("RB", 0) + lineup.get("FLEX", 0),
+        "WR": lineup.get("WR", 0) + lineup.get("FLEX", 0),
+        "TE": lineup.get("TE", 0),
+        "DST": lineup.get("DST", 0),
+    }
+    scarcity_starter_slots = {pos: n for pos, n in scarcity_starter_slots.items() if n > 0}
+    scarcity = compute_position_scarcity(counts, ctx.league_size, scarcity_starter_slots)
+    scarcity_str = " | ".join(
+        f"{pos}: {counts.get(pos, 0)}" + (f" ({scarcity[pos].upper()})" if pos in scarcity else "")
+        for pos in ("QB", "RB", "WR", "TE", "DST")
+    )
     lines += [
-        "## Positional Availability (undrafted players remaining)",
-        (
-            f"QB: {counts.get('QB', 0)} | "
-            f"RB: {counts.get('RB', 0)} | "
-            f"WR: {counts.get('WR', 0)} | "
-            f"TE: {counts.get('TE', 0)} | "
-            f"DST: {counts.get('DST', 0)}"
-        ),
+        "## Positional Availability (undrafted players remaining; scarcity tier in parens)",
+        scarcity_str,
+        "CRITICAL or LOW means that position is thinning across the league — if a "
+        "player there fits your team, that's a legitimate reason to secure them now "
+        "rather than wait, since a similar-tier option may not be there at your next "
+        "turn. OK means no run risk; scarcity alone shouldn't push a pick there.",
         "",
     ]
 
@@ -652,20 +769,24 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     lines += [
         "## Task",
         "Recommend the best pick for my team right now.",
-        "Weigh ADP as one input among several, not the deciding factor. Prioritize "
-        "long-term value and upside: use the Opportunity & Performance Signals section "
-        "to judge real usage and efficiency, and call out any candidate whose underlying "
-        "opportunity looks stronger than their ADP suggests as a potential breakout. Use "
-        "the roster shape section above for awareness of which starting slots are still "
-        "open, but don't let that alone override a clearly better value/upside pick — the "
-        "exception is when that section includes an URGENT line, at which point rounds "
-        "are genuinely running out to complete a legal starting lineup, and filling the "
-        "open slot(s) takes priority.",
+        "Weigh ADP as one input among several, not the deciding factor. The players list "
+        "is grouped into ADP tiers, not a strict 1-25 rank — treat same-tier players as "
+        "roughly interchangeable and use the Opportunity & Performance Signals section to "
+        "judge real usage and efficiency as the actual tiebreaker among them, rather than "
+        "the exact ADP decimal. Call out any candidate whose underlying opportunity looks "
+        "stronger than their tier suggests as a potential breakout. Use the Positional "
+        "Availability scarcity tiers to judge run risk — a CRITICAL/LOW position that fits "
+        "your team now is worth securing rather than waiting on. Use the roster shape "
+        "section above for awareness of which starting slots are still open, but don't let "
+        "that alone override a clearly better value/upside pick — the exception is when "
+        "that section includes an URGENT line, at which point rounds are genuinely running "
+        "out to complete a legal starting lineup, and filling the open slot(s) takes "
+        "priority.",
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
             "recommendation": {
-                "player_id": "<int from table above>",
+                "player_id": "<int from the tiers above>",
                 "player_name": "<string>",
                 "position": "<string>",
                 "adp": "<float>",
@@ -701,6 +822,14 @@ _SYSTEM_PROMPT = (
     "snap share — looks stronger than their ADP suggests is a potential breakout; call "
     "that out explicitly in your reasoning or alerts rather than defaulting to the "
     "safest name-brand pick. "
+    "The available-players list is grouped into ADP tiers rather than a strict rank — "
+    "a few points of ADP within the same tier is noise, not a meaningful signal, so "
+    "don't let it be the deciding factor between two same-tier players. Reach for the "
+    "Opportunity & Performance Signals and Player News sections as the real tiebreaker "
+    "instead. A gap between tiers is more likely to reflect genuine talent/value "
+    "drop-off and is worth taking seriously. Positional Availability also carries a "
+    "CRITICAL/LOW/OK scarcity tier per position — treat CRITICAL or LOW as a legitimate "
+    "reason to secure a position now against run risk, not just a number to note. "
     "Favor long-term value and upside over reflexively filling a roster gap — a marginal "
     "'need' edge is rarely worth passing on the better player, especially early in a "
     "draft. Use the roster shape section to stay aware of which starting slots remain "
