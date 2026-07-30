@@ -13,6 +13,8 @@ from backend.app.services.ai_service import (
     RecommendationContext,
     _compute_roster_gaps,
     _parse_response,
+    _build_prompt,
+    _MAX_ALTERNATIVES,
 )
 
 
@@ -139,3 +141,99 @@ def test_malformed_alternative_entries_are_skipped():
     payload["alternatives"].append({"player_id": "not-an-int"})
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
     assert [a.player_id for a in result.alternatives] == [2]
+
+
+# ---------------------------------------------------------------------------
+# _parse_response — strategy / confidence / tradeoff
+#
+# These three fields are presentational extras. The rule they all share: a
+# missing or malformed value must degrade to a default, never reject an
+# otherwise-valid recommendation to the ADP fallback.
+# ---------------------------------------------------------------------------
+
+def test_strategy_and_confidence_are_parsed():
+    payload = valid_payload()
+    payload["strategy"] = "You're thin at RB with two picks before the tier breaks."
+    payload["confidence"] = "high"
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    assert result.strategy.startswith("You're thin at RB")
+    assert result.confidence == "high"
+
+
+def test_alternative_tradeoff_is_parsed():
+    payload = valid_payload(alt_ids=(2,))
+    payload["alternatives"][0]["tradeoff"] = "Safer floor, less weekly ceiling."
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
+    assert result.alternatives[0].tradeoff == "Safer floor, less weekly ceiling."
+
+
+def test_missing_extras_fall_back_to_defaults():
+    # valid_payload() has no strategy/confidence/tradeoff at all — the shape
+    # Claude returned before these fields existed.
+    result = _parse_response(json.dumps(valid_payload()), ctx_with_available(1, 2, 3))
+    assert result is not None
+    assert result.strategy == ""
+    assert result.confidence == "medium"
+    assert all(a.tradeoff == "" for a in result.alternatives)
+
+
+def test_unrecognised_confidence_normalises_to_medium():
+    for bogus in ["very high", "", None, 7, "CERTAIN"]:
+        payload = valid_payload()
+        payload["confidence"] = bogus
+        result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+        assert result is not None, f"{bogus!r} should not reject the response"
+        assert result.confidence == "medium"
+
+
+def test_confidence_is_case_and_whitespace_insensitive():
+    payload = valid_payload()
+    payload["confidence"] = "  LOW "
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    assert result.confidence == "low"
+
+
+def test_non_string_strategy_is_dropped_not_stringified():
+    # str() on a dict would put "{'unexpected': 'object'}" in front of the user.
+    payload = valid_payload()
+    payload["strategy"] = {"unexpected": "object"}
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    assert result is not None
+    assert result.strategy == ""
+
+
+def test_non_string_tradeoff_is_dropped_not_stringified():
+    payload = valid_payload(alt_ids=(2,))
+    payload["alternatives"][0]["tradeoff"] = ["a", "list"]
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
+    assert result.alternatives[0].tradeoff == ""
+
+
+# ---------------------------------------------------------------------------
+# Response-size guards
+#
+# The recommendation JSON is capped by max_tokens. A response that runs over is
+# truncated, which makes it invalid JSON, which silently degrades every pick to
+# the ADP fallback — the failure this suite exists to catch early.
+# ---------------------------------------------------------------------------
+
+def test_alternatives_cap_matches_the_documented_constant():
+    # The prompt tells Claude "at most _MAX_ALTERNATIVES"; the parser enforces
+    # the same number. If these drift, the model spends output budget on
+    # entries that are discarded unread.
+    payload = valid_payload(alt_ids=tuple(range(2, 12)))
+    result = _parse_response(json.dumps(payload), ctx_with_available(*range(1, 12)))
+    assert len(result.alternatives) <= _MAX_ALTERNATIVES
+
+
+def test_prompt_states_the_alternatives_cap():
+    ctx = ctx_with_available(1, 2, 3)
+    prompt = _build_prompt(ctx)
+    assert str(_MAX_ALTERNATIVES) in prompt
+    assert "alternatives" in prompt
+
+
+def test_truncated_json_returns_none_rather_than_raising():
+    # What a max_tokens cut-off actually looks like: valid opening, no close.
+    truncated = json.dumps(valid_payload())[:120]
+    assert _parse_response(truncated, ctx_with_available(1, 2, 3)) is None

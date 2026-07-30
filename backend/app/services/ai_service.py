@@ -29,6 +29,24 @@ logger = logging.getLogger(__name__)
 # Use Haiku on the clock (fast, cheap); override with CLAUDE_MODEL env var for richer analysis
 _DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
+# Accepted values for RecommendationResult.confidence. Anything else the model
+# returns is normalised to "medium".
+_CONFIDENCE_LEVELS = {"high", "medium", "low"}
+
+# How many alternatives we keep. The prompt states this explicitly *and*
+# _parse_response enforces it — if only the parser knew, the model would spend
+# tokens writing entries that get silently discarded.
+_MAX_ALTERNATIVES = 3
+
+# Output budget. This has to comfortably fit the whole JSON response: strategy,
+# confidence, the recommendation, _MAX_ALTERNATIVES entries that each carry
+# both a `reasoning` and a `tradeoff` sentence, and the alerts array. It was
+# 1024, which was sized for the older, smaller response shape; adding
+# strategy/tradeoff pushed real responses past the ceiling, and a truncated
+# response is unparseable JSON — which silently degraded every recommendation
+# to the ADP fallback.
+_MAX_RESPONSE_TOKENS = 2048
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -41,6 +59,11 @@ class PickSuggestion:
     position: str
     adp: float
     reasoning: str
+    # Why you'd take this player *instead of* the main recommendation — the
+    # comparison the model already reasons through internally but previously
+    # had nowhere to put. Only meaningful on alternatives; empty on the main
+    # recommendation. Optional so a response predating this field still parses.
+    tradeoff: str = ""
 
 
 @dataclass
@@ -49,6 +72,14 @@ class RecommendationResult:
     alternatives: list[PickSuggestion]
     alerts: list[str]
     model: str
+    # One-sentence read on the shape of the roster and what this pick is doing
+    # about it. Distinct from the per-player reasoning: it's the plan, not the
+    # justification for one name.
+    strategy: str = ""
+    # "high" | "medium" | "low" — how clear-cut the model considers this call.
+    # Defaults to "medium" when absent or unrecognised, so a missing value
+    # never reads as false certainty in either direction.
+    confidence: str = "medium"
 
 
 @dataclass
@@ -785,6 +816,8 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
+            "strategy": "<1 sentence: the shape of this roster and what this pick does about it>",
+            "confidence": "<high | medium | low — how clear-cut this call is>",
             "recommendation": {
                 "player_id": "<int from the tiers above>",
                 "player_name": "<string>",
@@ -798,11 +831,24 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                     "player_name": "<string>",
                     "position": "<string>",
                     "adp": "<float>",
-                    "reasoning": "<brief>",
+                    "reasoning": "<1 sentence on this player's own case>",
+                    "tradeoff": "<1 sentence: what you gain and give up by taking this instead of the main recommendation>",
                 }
             ],
             "alerts": ["<any scarcity warnings, handcuff notes, tier drop-off flags, or breakout/value calls>"],
         }, indent=2),
+        "",
+        "Use `confidence: low` honestly — when the top few players are genuinely "
+        "close, saying so is more useful than manufacturing a reason to separate "
+        "them. `tradeoff` should be a real comparison against the main "
+        "recommendation (floor vs upside, positional need vs value, bye/stack "
+        "considerations), not a restatement of `reasoning`.",
+        "",
+        f"Return AT MOST {_MAX_ALTERNATIVES} alternatives — any beyond that are "
+        "discarded unread, so they only cost you output budget. Keep every "
+        "`reasoning`, `tradeoff`, and `alert` to a single sentence: the whole "
+        "response must be complete, valid JSON, and a response that runs long "
+        "gets cut off mid-object and is thrown away entirely.",
     ]
 
     return "\n".join(lines)
@@ -854,6 +900,17 @@ _SYSTEM_PROMPT = (
 # Response parser
 # ---------------------------------------------------------------------------
 
+def _clean_text(value) -> str:
+    """
+    Free-text field from Claude's JSON, or "" if it isn't a string.
+
+    Deliberately not `str(value)`: coercing a dict or list would put a Python
+    repr like "{'unexpected': 'object'}" straight into the UI. These fields are
+    optional, so dropping a malformed one is strictly better than showing it.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResult | None:
     """
     Parses Claude's JSON response into a RecommendationResult.
@@ -866,8 +923,19 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         stripped = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
         try:
             data = json.loads(stripped)
-        except json.JSONDecodeError:
-            logger.warning("Could not parse Claude response as JSON: %s", raw[:200])
+        except json.JSONDecodeError as e:
+            # Log the tail as well as the head. The most common real failure is
+            # truncation, whose evidence is always at the *end* of the string —
+            # logging only raw[:200] showed a perfectly healthy-looking opening
+            # brace and hid the fact that the object simply stopped.
+            logger.warning(
+                "Could not parse Claude response as JSON (%s). "
+                "Length=%d chars. Head: %s ... Tail: %s",
+                e,
+                len(raw),
+                raw[:300],
+                raw[-200:],
+            )
             return None
 
     rec = data.get("recommendation")
@@ -898,6 +966,7 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
                 position=str(d["position"]),
                 adp=float(d["adp"]),
                 reasoning=str(d.get("reasoning", "")),
+                tradeoff=_clean_text(d.get("tradeoff")),
             )
         except (KeyError, ValueError, TypeError):
             return None
@@ -907,7 +976,7 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         return None
 
     alternatives = [
-        s for d in data.get("alternatives", [])[:3]
+        s for d in data.get("alternatives", [])[:_MAX_ALTERNATIVES]
         if isinstance(d, dict)
         and (s := _pick(d)) is not None
         and s.player_id in available_ids
@@ -915,11 +984,21 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
 
     alerts = [str(a) for a in data.get("alerts", []) if a]
 
+    # These are presentational extras — a malformed or missing value degrades
+    # to a sane default rather than rejecting an otherwise-good recommendation
+    # to the ADP fallback. Same principle as the player_id coercion above.
+    strategy = _clean_text(data.get("strategy"))
+    confidence = _clean_text(data.get("confidence")).lower()
+    if confidence not in _CONFIDENCE_LEVELS:
+        confidence = "medium"
+
     return RecommendationResult(
         recommendation=recommendation,
         alternatives=alternatives,
         alerts=alerts,
         model=_DEFAULT_MODEL,
+        strategy=strategy,
+        confidence=confidence,
     )
 
 
@@ -951,11 +1030,18 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
                 position=p["position"],
                 adp=p["adp"],
                 reasoning="Next best available by ADP.",
+                # No comparison is possible without the model — say so rather
+                # than inventing a trade-off the fallback didn't reason about.
+                tradeoff="",
             )
             for p in ctx.top_available[1:4]
         ],
         alerts=["AI service unavailable — showing best available by ADP only."],
         model=f"{model}:fallback",
+        strategy="",
+        # The fallback is pure ADP ordering with no roster awareness at all —
+        # never present it as a confident call.
+        confidence="low",
     )
 
 
@@ -1060,10 +1146,22 @@ class AIService:
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=1024,
+                max_tokens=_MAX_RESPONSE_TOKENS,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
+
+            # A truncated response is invalid JSON, so it fails in
+            # _parse_response looking exactly like the model returned garbage.
+            # Calling it out here makes the difference obvious in the log —
+            # "raise the budget" and "fix the prompt" are very different fixes.
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                logger.warning(
+                    "Claude response hit the %d-token ceiling and was truncated — "
+                    "the JSON will not parse. Raise _MAX_RESPONSE_TOKENS or tighten "
+                    "the requested response shape.",
+                    _MAX_RESPONSE_TOKENS,
+                )
 
             # Take the first text block rather than indexing content[0]
             # blindly — an empty content list or a non-text first block

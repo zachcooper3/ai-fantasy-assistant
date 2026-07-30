@@ -45,6 +45,10 @@ class PickSuggestionResponse(BaseModel):
     position: str
     adp: float
     reasoning: str
+    # Populated on alternatives only: what taking this player instead of the
+    # main recommendation gains and costs. Empty string when absent (older
+    # model output, or the no-AI fallback path).
+    tradeoff: str = ""
 
 
 class RecommendationResponse(BaseModel):
@@ -52,6 +56,10 @@ class RecommendationResponse(BaseModel):
     alternatives: list[PickSuggestionResponse]
     alerts: list[str]
     model: str
+    # One sentence on the roster's shape and what this pick does about it.
+    strategy: str = ""
+    # "high" | "medium" | "low". The ADP fallback always reports "low".
+    confidence: str = "medium"
     # Draft context echoed back for the frontend
     pick_number: int
     is_my_turn: bool
@@ -234,6 +242,8 @@ async def recommend_pick(
         alternatives=[PickSuggestionResponse(**a.__dict__) for a in result.alternatives],
         alerts=result.alerts,
         model=result.model,
+        strategy=result.strategy,
+        confidence=result.confidence,
         pick_number=ctx.pick_number,
         is_my_turn=ctx.is_my_turn,
         picks_until_my_turn=ctx.picks_until_my_turn,
