@@ -53,6 +53,8 @@ export default function StatusBar({
   const isSyncing = syncStatus?.status === "syncing";
   const undoDisabled = session.picks.length === 0 || isSyncing;
 
+  const lastPick = session.picks[session.picks.length - 1];
+
   return (
     <div
       className={`flex items-center gap-4 px-4 py-3 border-b text-sm font-medium transition-colors ${
@@ -61,22 +63,40 @@ export default function StatusBar({
           : "bg-slate-900 border-slate-700"
       }`}
     >
+      {/*
+        Screen-reader announcements. The visual UI conveys "it's your turn"
+        with colour, a pulsing dot and a layout shift — none of which reach a
+        screen reader. This is the one event in the app that's genuinely
+        time-critical, so it's assertive; the pick feed below it is polite.
+      */}
+      <span aria-live="assertive" aria-atomic="true" className="sr-only">
+        {myTurn
+          ? "You are on the clock."
+          : `${session.picks_until_my_turn} picks until your turn.`}
+      </span>
+      <span aria-live="polite" aria-atomic="true" className="sr-only">
+        {lastPick
+          ? `Pick ${lastPick.pick_number}: ${lastPick.player_name}, ${lastPick.position}, ` +
+            `${lastPick.is_mine ? "your pick" : `slot ${lastPick.team_slot}`}.`
+          : ""}
+      </span>
+
       {/* On the clock indicator */}
       {myTurn ? (
         <span className="flex items-center gap-2 text-emerald-400 font-bold text-base">
-          <span className="relative flex h-2.5 w-2.5">
+          <span className="relative flex h-2.5 w-2.5" aria-hidden="true">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
           </span>
           ON THE CLOCK
         </span>
       ) : (
-        <span className="text-slate-400">
+        <span className="text-slate-300">
           {session.picks_until_my_turn} pick{session.picks_until_my_turn !== 1 ? "s" : ""} away
         </span>
       )}
 
-      <span className="text-slate-600">|</span>
+      <span className="text-slate-500" aria-hidden="true">|</span>
 
       {/* Pick / round info */}
       <span className="text-slate-300">
@@ -84,26 +104,26 @@ export default function StatusBar({
       </span>
       <span className="text-slate-300">
         Round <span className="text-white font-bold">{session.current_round}</span>
-        <span className="text-slate-500"> / {session.total_rounds}</span>
+        <span className="text-slate-400"> / {session.total_rounds}</span>
       </span>
 
       {/* Current team on clock */}
       {!myTurn && (
-        <span className="text-slate-400">
-          Slot <span className="text-slate-200">{session.current_team_slot}</span> picking
+        <span className="text-slate-300">
+          Slot <span className="text-slate-100">{session.current_team_slot}</span> picking
         </span>
       )}
 
       {/* My next pick */}
       {session.my_next_pick_number && !myTurn && (
-        <span className="text-slate-500 text-xs">
+        <span className="text-slate-400 text-xs">
           My next: #{session.my_next_pick_number} (Rd {Math.ceil(session.my_next_pick_number / session.league_size)})
         </span>
       )}
 
       {/* Roster summary */}
       {session.my_roster.length > 0 && (
-        <span className="hidden lg:flex items-center gap-1 text-xs text-slate-500 ml-2">
+        <span className="hidden lg:flex items-center gap-1 text-xs text-slate-400 ml-2">
           My roster:
           {session.my_roster.map((p) => (
             <span key={p.pick_number} className={`${POS_COLORS[p.position] ?? "text-slate-400"}`}>
@@ -165,6 +185,7 @@ export default function StatusBar({
       {/* Sleeper sync indicator */}
       {syncStatus && syncStatus.status !== "idle" && (
         <span
+          role="status"
           title={
             syncStatus.status === "syncing"
               ? `Sleeper sync active (${syncStatus.synced_pick_count} picks synced)`
@@ -176,11 +197,12 @@ export default function StatusBar({
         >
           <RefreshCw
             size={12}
+            aria-hidden="true"
             className={
               syncStatus.status === "syncing"
                 ? "text-emerald-400 animate-spin"
                 : syncStatus.status === "complete"
-                ? "text-slate-500"
+                ? "text-slate-400"
                 : "text-red-400"
             }
           />
@@ -189,7 +211,7 @@ export default function StatusBar({
               syncStatus.status === "syncing"
                 ? "text-emerald-400"
                 : syncStatus.status === "complete"
-                ? "text-slate-500"
+                ? "text-slate-400"
                 : "text-red-400"
             }
           >
@@ -203,10 +225,14 @@ export default function StatusBar({
       )}
 
       {/* WebSocket connection indicator */}
-      <span title={isConnected ? "Live" : "Reconnecting…"}>
+      <span
+        role="status"
+        title={isConnected ? "Live" : "Reconnecting…"}
+        aria-label={isConnected ? "Connected to the draft server" : "Disconnected — reconnecting"}
+      >
         {isConnected
-          ? <Wifi size={14} className="text-emerald-500" />
-          : <WifiOff size={14} className="text-red-400 animate-pulse" />
+          ? <Wifi size={14} className="text-emerald-400" aria-hidden="true" />
+          : <WifiOff size={14} className="text-red-400 animate-pulse" aria-hidden="true" />
         }
       </span>
     </div>

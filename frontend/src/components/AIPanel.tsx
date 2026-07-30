@@ -23,6 +23,7 @@ import {
   Info,
   History,
   Compass,
+  Zap,
 } from "lucide-react";
 
 import { Confidence, Player, PickSuggestion, Recommendation, Scarcity } from "@/lib/api";
@@ -61,6 +62,11 @@ interface Props {
   onDraftRecommended: (playerId: number) => void;
   /** Board players by id — supplies team/bye, which the AI response omits. */
   playersById: Map<number, Player>;
+  /** The pick currently on the clock, for the staleness check below. */
+  currentPickNumber: number;
+  /** Whether the recommendation is fetched automatically as your turn nears. */
+  autoRecommend: boolean;
+  onAutoRecommendChange: (on: boolean) => void;
   /** See the isSyncing docs in useDraft: sync-active means no manual picks. */
   isSyncing?: boolean;
 }
@@ -128,9 +134,23 @@ export default function AIPanel({
   onFetch,
   onDraftRecommended,
   playersById,
+  currentPickNumber,
+  autoRecommend,
+  onAutoRecommendChange,
   isSyncing = false,
 }: Props) {
   const [showHistory, setShowHistory] = useState(false);
+
+  // Defence in depth. useDraft already discards responses that arrive after
+  // the draft has moved on, and clears the recommendation on every pick — but
+  // this app has twice shipped a bug where drafted players were presented as
+  // available, so the panel refuses to render advice as current when it
+  // demonstrably isn't, rather than trusting the layer above to be perfect.
+  const isStale = recommendation != null && recommendation.pick_number !== currentPickNumber;
+
+  // Drafting off stale advice is exactly the mistake the staleness check
+  // exists to prevent.
+  const canDraft = !isSyncing && !isStale;
 
   // "AI service unavailable" is already communicated by the fallback notice on
   // the card itself; repeating it as an alert is noise.
@@ -172,15 +192,40 @@ export default function AIPanel({
               AI Recommendation
             </h2>
           </div>
-          <button
-            type="button"
-            onClick={onFetch}
-            disabled={isLoading}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs transition-colors disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
-          >
-            <RefreshCw size={12} className={isLoading ? "animate-spin" : ""} aria-hidden="true" />
-            {isLoading ? "Thinking…" : "Get pick"}
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Auto-recommend toggle. Each automatic fetch is a paid Claude
+                call, so this is a real preference rather than something to
+                decide on the user's behalf. */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoRecommend}
+              onClick={() => onAutoRecommendChange(!autoRecommend)}
+              title={
+                autoRecommend
+                  ? "Auto-recommend on — fetches as your turn comes up"
+                  : "Auto-recommend off — fetch manually with Get pick or g"
+              }
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                autoRecommend
+                  ? "bg-emerald-950 border-emerald-800/60 text-emerald-300"
+                  : "bg-slate-800 border-slate-600 text-slate-300"
+              }`}
+            >
+              <Zap size={11} aria-hidden="true" />
+              Auto
+            </button>
+
+            <button
+              type="button"
+              onClick={onFetch}
+              disabled={isLoading}
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs transition-colors disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+            >
+              <RefreshCw size={12} className={isLoading ? "animate-spin" : ""} aria-hidden="true" />
+              {isLoading ? "Thinking…" : "Get pick"}
+            </button>
+          </div>
         </div>
 
         {!recommendation ? (
@@ -195,6 +240,23 @@ export default function AIPanel({
           </div>
         ) : (
           <div className="space-y-3">
+            {/* Stale advice — the board moved on after this was generated, so
+                the players named may already be gone. Drafting is suppressed
+                until it's refreshed. */}
+            {isStale && (
+              <div
+                role="status"
+                className="flex items-start gap-2 text-xs text-amber-200 bg-amber-900/25 border border-amber-800/50 rounded-lg px-3 py-2"
+              >
+                <AlertTriangle size={12} className="shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  This was for pick #{recommendation.pick_number}; the board is now on #
+                  {currentPickNumber}. Some of these players may be gone — hit{" "}
+                  <span className="font-semibold">Get pick</span> to refresh.
+                </span>
+              </div>
+            )}
+
             {/* Strategy — the plan, above the individual name it argues for */}
             {recommendation.strategy && (
               <div className="flex items-start gap-2 text-xs text-slate-300 bg-slate-800/60 rounded-lg px-3 py-2">
@@ -218,7 +280,7 @@ export default function AIPanel({
                     {recommendation.recommendation.position}
                   </span>
                 </div>
-                {!isSyncing && (
+                {canDraft && (
                   <DraftButton
                     playerName={recommendation.recommendation.player_name}
                     onConfirm={() =>
@@ -244,7 +306,7 @@ export default function AIPanel({
                 >
                   {confidence.label}
                 </span>
-                <span className="text-xs text-slate-500 truncate">
+                <span className="text-xs text-slate-400 truncate">
                   {isFallback ? "⚠ Fallback — no ANTHROPIC_API_KEY" : recommendation.model}
                 </span>
               </div>
@@ -273,7 +335,7 @@ export default function AIPanel({
                             {alt.position}
                           </span>
                         </div>
-                        {!isSyncing && (
+                        {canDraft && (
                           <DraftButton
                             playerName={alt.player_name}
                             onConfirm={() => onDraftRecommended(alt.player_id)}
@@ -295,7 +357,7 @@ export default function AIPanel({
                       )}
                       {alt.tradeoff && (
                         <p className="text-xs text-slate-400 leading-relaxed mt-1.5 pl-2 border-l-2 border-slate-600">
-                          <span className="text-slate-500 font-medium">vs. pick: </span>
+                          <span className="text-slate-400 font-medium">vs. pick: </span>
                           {alt.tradeoff}
                         </p>
                       )}
@@ -329,7 +391,7 @@ export default function AIPanel({
               {recHistory.map((past) => (
                 <div key={past.pickNumber} className="text-xs bg-slate-800/60 rounded-lg px-3 py-2">
                   <div className="flex items-center gap-2">
-                    <span className="text-slate-500 tabular-nums">#{past.pickNumber}</span>
+                    <span className="text-slate-400 tabular-nums">#{past.pickNumber}</span>
                     <span className="text-slate-100 font-medium">
                       {past.recommendation.recommendation.player_name}
                     </span>

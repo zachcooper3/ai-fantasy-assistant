@@ -4,8 +4,12 @@
  * Collects league size, draft position, rounds, and an optional Sleeper draft ID.
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, SleeperPrefill } from "@/lib/api";
+
+/** Elements that can hold focus inside the dialog, for the Tab trap below. */
+const FOCUSABLE =
+  'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
 interface Props {
   onStart: (config: {
@@ -146,13 +150,68 @@ export default function SetupModal({ onStart }: Props) {
     }
   }
 
+  // ------------------------------------------------------------------
+  // Focus management
+  // ------------------------------------------------------------------
+
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Move focus into the dialog on mount, so keyboard and screen-reader users
+  // start inside it rather than at the top of an inert page.
+  useEffect(() => {
+    const first = dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE);
+    first?.focus();
+  }, []);
+
+  /**
+   * Keeps Tab inside the dialog. Without this, tabbing past the last control
+   * walks into the page behind the overlay — which is visually hidden and
+   * completely unusable, so focus simply appears to vanish.
+   */
+  function handleTrapTab(e: React.KeyboardEvent) {
+    if (e.key !== "Tab") return;
+
+    const focusable = Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []
+    ).filter((el) => !el.hasAttribute("disabled") && el.offsetParent !== null);
+
+    if (focusable.length === 0) return;
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+
+    if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 p-8 shadow-2xl">
-        <h1 className="text-2xl font-bold text-slate-100 mb-1">
+      {/*
+        A real dialog. This is a modal in every sense except the semantics —
+        it covers the app and nothing behind it is usable — but it announced
+        as a plain div, and Tab walked straight out of it into the page
+        underneath. There's deliberately no Escape-to-close: there is nothing
+        to go back to until a session exists.
+      */}
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="setup-title"
+        aria-describedby="setup-description"
+        onKeyDown={handleTrapTab}
+        className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 p-8 shadow-2xl"
+      >
+        <h1 id="setup-title" className="text-2xl font-bold text-slate-100 mb-1">
           Fantasy Draft Assistant
         </h1>
-        <p className="text-slate-400 text-sm mb-8">
+        <p id="setup-description" className="text-slate-300 text-sm mb-8">
           Configure your draft settings to get started.
         </p>
 
@@ -241,7 +300,7 @@ export default function SetupModal({ onStart }: Props) {
 
             {showRosterSettings && (
               <div className="mt-3 p-4 rounded-xl bg-slate-800/60 border border-slate-700 space-y-2.5">
-                <p className="text-xs text-slate-500 mb-3">
+                <p className="text-xs text-slate-400 mb-3">
                   How many starters at each position. Defaults match a standard
                   1-QB PPR lineup — only change these if your league's roster
                   settings are different.
@@ -263,7 +322,7 @@ export default function SetupModal({ onStart }: Props) {
                       setFlexSlots(DEFAULT_LINEUP.flex);
                       setDstSlots(DEFAULT_LINEUP.dst);
                     }}
-                    className="text-xs text-slate-500 hover:text-slate-300 underline mt-1"
+                    className="text-xs text-slate-400 hover:text-slate-200 underline mt-1"
                   >
                     Reset to standard
                   </button>
@@ -276,9 +335,9 @@ export default function SetupModal({ onStart }: Props) {
           <div>
             <label className="block text-sm font-medium text-slate-300 mb-1">
               Sleeper Draft ID{" "}
-              <span className="text-slate-500 font-normal">(optional)</span>
+              <span className="text-slate-400 font-normal">(optional)</span>
             </label>
-            <p className="text-xs text-slate-500 mb-2">
+            <p className="text-xs text-slate-400 mb-2">
               Paste your Sleeper draft ID to sync picks automatically.
               Found in Sleeper under league settings → Drafts, or in the draft URL.
             </p>

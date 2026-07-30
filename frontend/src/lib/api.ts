@@ -79,6 +79,10 @@ export interface DraftState {
   picks_until_my_turn: number;
   my_next_pick_number: number | null;
   draft_complete: boolean;
+  /** True when the backend rehydrated this session from disk at boot. */
+  was_restored: boolean;
+  /** ISO timestamp of when the session originally began, if known. */
+  started_at: string | null;
   picks: Pick[];
   my_roster: Pick[];
 }

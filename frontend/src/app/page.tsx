@@ -7,9 +7,10 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { LayoutGrid, Users, Lightbulb } from "lucide-react";
+import { LayoutGrid, Users, Lightbulb, RotateCcw } from "lucide-react";
 
 import { useDraft } from "@/hooks/useDraft";
+import { hasModifier, isTypingTarget } from "@/lib/keyboard";
 import SetupModal from "@/components/SetupModal";
 import StatusBar from "@/components/StatusBar";
 import BigBoard from "@/components/BigBoard";
@@ -17,6 +18,20 @@ import DraftRoom from "@/components/DraftRoom";
 import AIPanel from "@/components/AIPanel";
 
 type MobileTab = "board" | "room" | "ai";
+
+/**
+ * Human-readable start time for the resume notice — "today at 11:14" reads
+ * faster mid-draft than a raw timestamp. Falls back to the raw string if the
+ * backend ever sends something unparseable, rather than rendering "Invalid Date".
+ */
+function formatStartedAt(iso: string): string {
+  const started = new Date(iso);
+  if (Number.isNaN(started.getTime())) return iso;
+
+  const time = started.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const isToday = started.toDateString() === new Date().toDateString();
+  return isToday ? `today at ${time}` : `${started.toLocaleDateString()} at ${time}`;
+}
 
 export default function DraftPage() {
   const {
@@ -28,6 +43,8 @@ export default function DraftPage() {
     isSyncing,
     isConnected,
     isLoadingRec,
+    autoRecommend,
+    setAutoRecommend,
     error,
     startSession,
     endSession,
@@ -48,6 +65,33 @@ export default function DraftPage() {
   useEffect(() => {
     if (!draftComplete) setCompleteDismissed(false);
   }, [draftComplete]);
+
+  // Resume notice. Sessions persist across backend restarts by design, so
+  // relaunching mid-draft silently drops you back into the old draft — which
+  // looks like the app being stuck if you meant to start a new one. Dismissal
+  // is keyed to the session's start time so a *different* resumed draft
+  // announces itself again.
+  const [resumeDismissed, setResumeDismissed] = useState<string | null>(null);
+  const showResumeNotice =
+    (session?.was_restored ?? false) && resumeDismissed !== (session?.started_at ?? "unknown");
+
+  // Global shortcuts that aren't about the player list (BigBoard owns those).
+  // Declared before the early return below: hooks can't run conditionally.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (hasModifier(e) || isTypingTarget(e)) return;
+
+      if (e.key === "g") {
+        e.preventDefault();
+        fetchRecommendation();
+      } else if (e.key === "u") {
+        e.preventDefault();
+        undoPick();
+      }
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [fetchRecommendation, undoPick]);
 
   // Lookup for team/bye, which the recommendation payload doesn't carry — the
   // AI response has only id/name/position/adp. Built once per board refresh
@@ -89,14 +133,48 @@ export default function DraftPage() {
         })}
       />
 
-      {/* Error toast */}
+      {/* Resumed-draft notice */}
+      {showResumeNotice && session && (
+        <div
+          role="status"
+          className="mx-3 mt-2 px-4 py-2.5 bg-sky-950/80 border border-sky-800 rounded-lg text-sky-100 text-sm flex items-center gap-3 shrink-0"
+        >
+          <RotateCcw size={14} className="shrink-0 text-sky-300" aria-hidden="true" />
+          <span className="flex-1">
+            Resumed your draft in progress
+            {session.started_at && ` from ${formatStartedAt(session.started_at)}`} —{" "}
+            {session.picks.length} pick{session.picks.length !== 1 ? "s" : ""} recorded.
+            Starting a different draft? Use{" "}
+            <span className="font-semibold">New draft</span> above.
+          </span>
+          <button
+            type="button"
+            onClick={() => setResumeDismissed(session.started_at ?? "unknown")}
+            className="shrink-0 text-xs text-sky-300 hover:text-sky-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 rounded px-1"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Error toast.
+          role="alert" so failures are announced rather than silently appearing,
+          and a real <button> to dismiss — this was a clickable div, so keyboard
+          users had no way to clear it. */}
       {error && (
         <div
-          className="mx-4 mt-2 px-4 py-2 bg-red-900/80 border border-red-700 rounded-lg text-red-200 text-sm flex items-center justify-between cursor-pointer"
-          onClick={clearError}
+          role="alert"
+          className="mx-3 mt-2 px-4 py-2 bg-red-900/80 border border-red-700 rounded-lg text-red-100 text-sm flex items-center justify-between gap-3 shrink-0"
         >
           <span>{error}</span>
-          <span className="text-red-400 text-xs ml-4">✕ dismiss</span>
+          <button
+            type="button"
+            onClick={clearError}
+            aria-label="Dismiss error"
+            className="shrink-0 text-red-200 hover:text-white text-xs px-1 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
+          >
+            ✕ dismiss
+          </button>
         </div>
       )}
 
@@ -112,6 +190,7 @@ export default function DraftPage() {
           recommendedId={recommendedId}
           onPick={recordPick}
           isSyncing={isSyncing}
+          sessionKey={session.started_at ?? ""}
         />
         <DraftRoom session={session} />
         <AIPanel
@@ -123,6 +202,9 @@ export default function DraftPage() {
           onFetch={fetchRecommendation}
           onDraftRecommended={recordPick}
           playersById={playersById}
+          currentPickNumber={session.current_pick_number}
+          autoRecommend={autoRecommend}
+          onAutoRecommendChange={setAutoRecommend}
           isSyncing={isSyncing}
         />
       </div>
@@ -136,6 +218,7 @@ export default function DraftPage() {
             recommendedId={recommendedId}
             onPick={recordPick}
             isSyncing={isSyncing}
+            sessionKey={session.started_at ?? ""}
           />
         )}
         {mobileTab === "room" && <DraftRoom session={session} />}
@@ -149,13 +232,22 @@ export default function DraftPage() {
             onFetch={fetchRecommendation}
             onDraftRecommended={recordPick}
             playersById={playersById}
+          currentPickNumber={session.current_pick_number}
+          autoRecommend={autoRecommend}
+          onAutoRecommendChange={setAutoRecommend}
             isSyncing={isSyncing}
           />
         )}
       </div>
 
-      {/* Mobile bottom tab bar */}
-      <nav className="md:hidden flex border-t border-slate-800 bg-slate-900 shrink-0">
+      {/* Mobile bottom tab bar.
+          A real tablist: these were plain buttons, so nothing conveyed that
+          they're a set or which one is current. */}
+      <nav
+        role="tablist"
+        aria-label="Draft room sections"
+        className="md:hidden flex border-t border-slate-800 bg-slate-900 shrink-0"
+      >
         {(
           [
             { tab: "board", Icon: LayoutGrid, label: "Board" },
@@ -165,14 +257,17 @@ export default function DraftPage() {
         ).map(({ tab, Icon, label }) => (
           <button
             key={tab}
+            type="button"
+            role="tab"
+            aria-selected={mobileTab === tab}
             onClick={() => setMobileTab(tab)}
-            className={`flex-1 flex flex-col items-center gap-1 py-3 text-xs font-medium transition-colors ${
+            className={`flex-1 flex flex-col items-center gap-1 py-3 min-h-[56px] text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-emerald-500 ${
               mobileTab === tab
                 ? "text-emerald-400"
-                : "text-slate-500 hover:text-slate-300"
+                : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            <Icon size={20} />
+            <Icon size={20} aria-hidden="true" />
             {label}
           </button>
         ))}
@@ -180,11 +275,21 @@ export default function DraftPage() {
 
       {/* Draft complete banner */}
       {session.draft_complete && !completeDismissed && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl p-10 text-center max-w-sm max-h-[85vh] overflow-y-auto">
-            <div className="text-4xl mb-4">🏈</div>
-            <h2 className="text-2xl font-bold text-white mb-2">Draft Complete!</h2>
-            <p className="text-slate-400 mb-6">
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50"
+          onKeyDown={(e) => e.key === "Escape" && setCompleteDismissed(true)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="draft-complete-title"
+            className="bg-slate-900 border border-slate-700 rounded-2xl p-10 text-center max-w-sm max-h-[85vh] overflow-y-auto"
+          >
+            <div className="text-4xl mb-4" aria-hidden="true">🏈</div>
+            <h2 id="draft-complete-title" className="text-2xl font-bold text-white mb-2">
+              Draft Complete!
+            </h2>
+            <p className="text-slate-300 mb-6">
               You drafted {session.my_roster.length} players across {session.total_rounds} rounds.
             </p>
             <div className="flex flex-col gap-2">
@@ -192,20 +297,23 @@ export default function DraftPage() {
                 <div key={p.pick_number} className="text-sm text-slate-300 flex justify-between">
                   <span>Rd {p.round_number}</span>
                   <span className="font-medium">{p.player_name}</span>
-                  <span className="text-slate-500">{p.position}</span>
+                  <span className="text-slate-400">{p.position}</span>
                 </div>
               ))}
             </div>
             <div className="flex flex-col gap-2 mt-8">
               <button
+                type="button"
                 onClick={endSession}
-                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-bold text-sm transition-colors"
+                autoFocus
+                className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-white font-bold text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
               >
                 Start New Draft
               </button>
               <button
+                type="button"
                 onClick={() => setCompleteDismissed(true)}
-                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-sm transition-colors"
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
               >
                 Review Board
               </button>

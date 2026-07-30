@@ -42,6 +42,22 @@ function sameSyncStatus(a: SyncStatus | null, b: SyncStatus | null): boolean {
 /** How many past recommendations to keep for review. */
 const REC_HISTORY_LIMIT = 3;
 
+/**
+ * Auto-fetch the recommendation once you're this many picks away.
+ *
+ * One, deliberately. Each fire is a paid Claude call, and because the
+ * recommendation is invalidated by every pick, a threshold of N fires roughly
+ * N+1 times per turn. At 1 that means: once while the team ahead of you is
+ * picking (so there's something on screen immediately), then once more when
+ * you're actually on the clock — which is the one that reflects the real board
+ * and is safe to draft from. At 2 it was three calls a turn, most of them
+ * describing a board that no longer existed by the time you looked.
+ */
+const REC_PREFETCH_WITHIN_PICKS = 1;
+
+/** localStorage key for the auto-recommend preference. */
+const AUTO_RECOMMEND_KEY = "fda:auto-recommend";
+
 /** A recommendation plus the pick it was given for, so history can be labelled. */
 export interface PastRecommendation {
   recommendation: Recommendation;
@@ -73,6 +89,12 @@ export interface DraftHook {
   isSyncing: boolean;
   isConnected: boolean;
   isLoadingRec: boolean;
+  /**
+   * When on, the recommendation is fetched automatically as your turn comes
+   * up instead of waiting for a click. Persisted across sessions.
+   */
+  autoRecommend: boolean;
+  setAutoRecommend: (on: boolean) => void;
   error: string | null;
   startSession: (config: {
     league_size: number;
@@ -110,6 +132,34 @@ export function useDraft(): DraftHook {
   // clobber the fresh value.
   const [syncNonce, setSyncNonce] = useState(0);
 
+  // Auto-recommend preference. Defaults on, but the stored value wins once
+  // it's read — `prefsLoaded` gates the prefetch effect until then so a saved
+  // "off" isn't briefly ignored on mount. Reading localStorage in an effect
+  // (not during render) also keeps the server and first client render
+  // identical, avoiding a hydration mismatch.
+  const [autoRecommend, setAutoRecommendState] = useState(true);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(AUTO_RECOMMEND_KEY);
+      if (stored !== null) setAutoRecommendState(stored === "true");
+    } catch {
+      // Storage can be unavailable (private mode, blocked cookies) — fall
+      // back to the default rather than breaking the draft room.
+    }
+    setPrefsLoaded(true);
+  }, []);
+
+  const setAutoRecommend = useCallback((on: boolean) => {
+    setAutoRecommendState(on);
+    try {
+      window.localStorage.setItem(AUTO_RECOMMEND_KEY, String(on));
+    } catch {
+      // Preference just won't persist; the toggle still works this session.
+    }
+  }, []);
+
   const wsRef = useRef<WebSocket | null>(null);
 
   // Mirrors `recommendation` so the WebSocket handler — which is created once
@@ -120,10 +170,21 @@ export function useDraft(): DraftHook {
     recommendationRef.current = recommendation;
   }, [recommendation]);
 
+  // The pick currently on the clock, readable from inside async callbacks that
+  // started before it changed. Used to throw away recommendation responses the
+  // draft has already moved past — see fetchRecommendation.
+  const currentPickRef = useRef<number | null>(null);
+  useEffect(() => {
+    currentPickRef.current = session?.current_pick_number ?? null;
+  }, [session?.current_pick_number]);
+
   // ------------------------------------------------------------------
   // Board refresh — fetch ALL available players so position filters
   // have the full pool, not just the top 40.
   // ------------------------------------------------------------------
+
+  // Debounce handle for the reconcile refetch below.
+  const reconcileTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const refreshBoard = useCallback(async () => {
     try {
@@ -132,6 +193,46 @@ export function useDraft(): DraftHook {
     } catch {
       // Board fetch failures are non-fatal; keep showing the old board
     }
+  }, []);
+
+  /**
+   * Refetch the board shortly, collapsing bursts into one request.
+   *
+   * Every pick used to trigger a full 400-player fetch — roughly 180 of them
+   * over a 12-team draft, each re-rendering the entire table, and Sleeper sync
+   * can deliver several picks in a single poll. Picks are applied locally for
+   * instant feedback (see applyPickLocally); this reconciles against the
+   * server afterwards so any drift is short-lived.
+   */
+  const scheduleReconcile = useCallback(() => {
+    clearTimeout(reconcileTimer.current);
+    reconcileTimer.current = setTimeout(refreshBoard, 1500);
+  }, [refreshBoard]);
+
+  useEffect(() => () => clearTimeout(reconcileTimer.current), []);
+
+  /**
+   * Drop a drafted player from the board without a round trip.
+   *
+   * Returns the board unchanged if the player isn't on it, so a duplicate
+   * WebSocket frame can't decrement a scarcity count twice.
+   */
+  const applyPickLocally = useCallback((playerId: number) => {
+    setBoard((prev) => {
+      if (!prev) return prev;
+      const drafted = prev.players.find((p) => p.id === playerId);
+      if (!drafted) return prev;
+
+      const position = drafted.position as keyof typeof prev.scarcity;
+      return {
+        ...prev,
+        players: prev.players.filter((p) => p.id !== playerId),
+        scarcity: {
+          ...prev.scarcity,
+          [position]: Math.max(0, (prev.scarcity[position] ?? 0) - 1),
+        },
+      };
+    });
   }, []);
 
   // ------------------------------------------------------------------
@@ -169,7 +270,19 @@ export function useDraft(): DraftHook {
           }
         } else if (msg.type === "pick" || msg.type === "undo") {
           setSession(msg.state);
-          refreshBoard();
+
+          if (msg.type === "pick") {
+            // Instant: drop the drafted player and decrement their position
+            // count, then reconcile in the background.
+            applyPickLocally(msg.pick.player_id);
+            scheduleReconcile();
+          } else {
+            // An undo puts a player *back* on the board, and the pick payload
+            // doesn't carry their rank/adp/bye — only a refetch can restore
+            // the full row, so undo stays a straight refresh.
+            refreshBoard();
+          }
+
           // Retire the current recommendation into history rather than
           // dropping it — it was computed for a board state that no longer
           // exists, so it must not stay presented as live advice, but it's
@@ -217,7 +330,7 @@ export function useDraft(): DraftHook {
       clearTimeout(retryTimeout);
       wsRef.current?.close();
     };
-  }, [refreshBoard]);
+  }, [refreshBoard, applyPickLocally, scheduleReconcile]);
 
   // ------------------------------------------------------------------
   // Sleeper sync status
@@ -378,6 +491,21 @@ export function useDraft(): DraftHook {
     setIsLoadingRec(true);
     try {
       const rec = await api.getRecommendation();
+
+      // Discard advice the draft has already moved past.
+      //
+      // A recommendation takes several seconds. If picks land while the
+      // request is in flight — which prefetching makes routine, since it fires
+      // while other teams are still picking — the response describes a board
+      // that no longer exists, and the players it names may since have been
+      // drafted. The WebSocket handler clears `recommendation` on every pick,
+      // but that happens *before* this response arrives, so without this check
+      // the stale result simply repopulates the panel.
+      //
+      // rec.pick_number is the pick the server actually computed against,
+      // which is more trustworthy than the pick we think we asked at.
+      if (rec.pick_number !== currentPickRef.current) return;
+
       setRecommendation(rec);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to fetch recommendation");
@@ -385,6 +513,44 @@ export function useDraft(): DraftHook {
       setIsLoadingRec(false);
     }
   }, [session?.is_active]);
+
+  /**
+   * Fetch the recommendation ahead of your turn instead of on a click.
+   *
+   * A recommendation takes several seconds (Claude call plus retrieval), and
+   * asking for one only when you're already on the clock spends that time out
+   * of your pick window. Firing it a couple of picks early means the advice is
+   * usually on screen by the time it's your turn.
+   *
+   * Fires at most once per pick number: `prefetchedForPick` is what stops the
+   * effect from re-requesting every time the board or session object changes
+   * identity.
+   */
+  const prefetchedForPick = useRef<number | null>(null);
+
+  useEffect(() => {
+    // Parked until the stored preference has been read — otherwise a saved
+    // "off" would still let one automatic call through on every page load.
+    if (!prefsLoaded || !autoRecommend) return;
+    if (!session?.is_active || session.draft_complete) return;
+    if (session.picks_until_my_turn > REC_PREFETCH_WITHIN_PICKS) return;
+    if (prefetchedForPick.current === session.current_pick_number) return;
+    if (recommendation || isLoadingRec) return;
+
+    prefetchedForPick.current = session.current_pick_number;
+    fetchRecommendation();
+  }, [
+    prefsLoaded,
+    autoRecommend,
+    session?.is_active,
+    session?.draft_complete,
+    session?.picks_until_my_turn,
+    session?.current_pick_number,
+    recommendation,
+    isLoadingRec,
+    fetchRecommendation,
+    session,
+  ]);
 
   // ------------------------------------------------------------------
 
@@ -397,6 +563,8 @@ export function useDraft(): DraftHook {
     isSyncing: syncStatus?.status === "syncing",
     isConnected,
     isLoadingRec,
+    autoRecommend,
+    setAutoRecommend,
     error,
     startSession,
     endSession,

@@ -125,7 +125,7 @@ export default function DraftRoom({ session }: Props) {
                 </span>
                 <span className="text-slate-200 truncate">{pick.player_name}</span>
                 <span className="text-xs text-slate-400 ml-auto shrink-0">{pick.nfl_team}</span>
-                <span className="text-xs text-slate-500 shrink-0">Rd {pick.round_number}</span>
+                <span className="text-xs text-slate-400 shrink-0">Rd {pick.round_number}</span>
               </div>
             ))}
           </div>
@@ -137,7 +137,7 @@ export default function DraftRoom({ session }: Props) {
             {slots.slice(myPicks.length).map((slot, i) => (
               <div
                 key={i}
-                className="flex items-center gap-2 text-xs text-slate-500 border border-dashed border-slate-700 rounded px-2 py-1"
+                className="flex items-center gap-2 text-xs text-slate-400 border border-dashed border-slate-700 rounded px-2 py-1"
               >
                 <span className="font-bold w-10">{slot}</span>
                 <span aria-hidden="true">—</span>
@@ -162,7 +162,7 @@ export default function DraftRoom({ session }: Props) {
                     : "hover:bg-slate-800/50"
                 }`}
               >
-                <span className="text-xs text-slate-500 tabular-nums w-6 shrink-0">
+                <span className="text-xs text-slate-400 tabular-nums w-6 shrink-0">
                   {pick.pick_number}
                 </span>
 
@@ -182,7 +182,7 @@ export default function DraftRoom({ session }: Props) {
                   {pick.player_name}
                 </span>
 
-                <span className="ml-auto text-xs text-slate-500 shrink-0">
+                <span className="ml-auto text-xs text-slate-400 shrink-0">
                   {pick.is_mine ? "Me" : `Slot ${pick.team_slot}`}
                 </span>
               </div>
@@ -244,7 +244,7 @@ export default function DraftRoom({ session }: Props) {
                     </span>
                   ))}
                   {slotPicks.length === 0 && (
-                    <span className="text-xs text-slate-500">No picks</span>
+                    <span className="text-xs text-slate-400">No picks</span>
                   )}
                 </div>
 
