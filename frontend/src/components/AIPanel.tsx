@@ -86,8 +86,11 @@ function PlayerMeta({
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-400">
       <span className="tabular-nums">ADP {suggestion.adp}</span>
-      <span className={`tabular-nums font-medium ${VALUE_STYLES[value.label]}`}>
-        {value.text}
+      <span className={`font-medium ${VALUE_STYLES[value.label]}`}>
+        <span className="tabular-nums">{value.text}</span>
+        {/* The number's sign is ambiguous on its own — negative is the *good*
+            direction here — so the verdict is spelled out next to it. */}
+        <span className="ml-1">· {value.word}</span>
       </span>
       {player?.team && <span>{player.team}</span>}
       {player?.bye != null && <span>Bye {player.bye}</span>}

@@ -63,28 +63,48 @@ export function slotsBeforeMyNextPick(session: DraftState): number[] {
  * account for every remaining round rather than stopping at the starters.
  */
 export interface AdpValue {
-  /** Positive = falling past ADP (value); negative = taken early (reach). */
+  /**
+   * `adp - pickNumber`, i.e. the player's market slot relative to this pick.
+   *
+   * NEGATIVE is the good direction: the field takes this player at `adp` on
+   * average and they're somehow still on the board at a later pick, so they've
+   * fallen to you. Positive means you'd be buying ahead of the market.
+   */
   delta: number;
   label: "value" | "reach" | "even";
-  /** e.g. "+7 vs pick 31" */
+  /** e.g. "-7 vs pick 31" */
   text: string;
+  /** "value" / "reach" spelled out, so the sign convention needn't be known. */
+  word: string;
 }
 
 /**
  * How a player's ADP compares to the pick you'd spend on them.
  *
- * Consensus ADP is where the field drafts a player on average, so `adp - pick`
- * is the surplus (or premium) of taking them here. The neutral band exists
- * because ADP is an average over noisy inputs — a point or two either way is
- * not a signal, and colouring it as one would make almost every player look
- * like a value or a reach.
+ * ADP is where the field drafts a player on average, so the comparison is
+ * against `pickNumber`:
+ *
+ *   ADP 16, you're at pick 26  → they fell 10 past their slot  → VALUE
+ *   ADP 32, you're at pick 26  → you'd pay 6 picks early       → REACH
+ *
+ * The direction is easy to get backwards — this shipped inverted, painting
+ * genuine value amber and reaches green — so the mapping is spelled out above
+ * and the label is rendered as a word alongside the number.
+ *
+ * The neutral band exists because ADP is an average over noisy inputs: a point
+ * or two either way isn't a signal, and treating it as one would paint almost
+ * every player as a value or a reach.
  */
 export function adpValue(adp: number, pickNumber: number, neutralBand = 3): AdpValue {
   const delta = Math.round(adp - pickNumber);
+
   const label: AdpValue["label"] =
-    delta > neutralBand ? "value" : delta < -neutralBand ? "reach" : "even";
+    delta < -neutralBand ? "value" : delta > neutralBand ? "reach" : "even";
+
   const sign = delta > 0 ? "+" : "";
-  return { delta, label, text: `${sign}${delta} vs pick ${pickNumber}` };
+  const word = label === "value" ? "value" : label === "reach" ? "reach" : "at ADP";
+
+  return { delta, label, text: `${sign}${delta} vs pick ${pickNumber}`, word };
 }
 
 export function rosterSlots(session: DraftState): string[] {
