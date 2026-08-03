@@ -19,13 +19,28 @@ Author: Zach Cooper
 
 import logging
 import os
+import time
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 BASE = "https://api.collegefootballdata.com"
-TIMEOUT = 20.0
+
+# /stats/player/season with no `team` filter returns every FBS player for
+# the whole category/season — thousands of rows. Confirmed live (2026-07-29):
+# 20s wasn't enough and every category/season combination read-timed out.
+# Bumped generously rather than finely tuned, since the actual payload size
+# varies by category and there's no way to measure it from this sandbox
+# (no CFBD_API_KEY available here — see module docstring).
+TIMEOUT = 60.0
+
+# A single slow response shouldn't be fatal — retry with backoff before
+# giving up, same "one bad call doesn't kill the batch" stance as the rest
+# of this app's ingestion scripts. Only retries timeouts/connection issues;
+# an actual 4xx (bad key, bad params) fails immediately via raise_for_status.
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF = (3.0, 8.0)  # seconds before attempt 2, then attempt 3
 
 # .env.example ships this as a fill-in-the-blank value, same convention as
 # ANTHROPIC_API_KEY (see ai_service.py's build_anthropic_client /
@@ -63,6 +78,12 @@ def get_player_season_stats(year: int, category: str | None = None) -> list[dict
     Raises RuntimeError if CFBD_API_KEY isn't configured — callers should
     check is_configured() first if they want to no-op gracefully instead
     (see fetch_college_stats.py's main()).
+
+    Retries on timeout/connection errors (see _MAX_ATTEMPTS/_RETRY_BACKOFF)
+    before raising — an unfiltered full-season pull is a large enough
+    response that a single slow attempt shouldn't be treated as a hard
+    failure. Does NOT retry a non-2xx response (bad key, bad params) —
+    raise_for_status fails immediately for those since a retry wouldn't help.
     """
     key = _get_api_key()
     if key is None:
@@ -72,11 +93,25 @@ def get_player_season_stats(year: int, category: str | None = None) -> list[dict
     if category:
         params["category"] = category
 
-    resp = httpx.get(
-        f"{BASE}/stats/player/season",
-        params=params,
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=TIMEOUT,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    last_error: Exception | None = None
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            resp = httpx.get(
+                f"{BASE}/stats/player/season",
+                params=params,
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=TIMEOUT,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_error = e
+            if attempt < _MAX_ATTEMPTS:
+                backoff = _RETRY_BACKOFF[attempt - 1]
+                logger.warning(
+                    f"CFBD request timed out (attempt {attempt}/{_MAX_ATTEMPTS}, "
+                    f"year={year}, category={category}) — retrying in {backoff}s: {e}"
+                )
+                time.sleep(backoff)
+
+    raise last_error
