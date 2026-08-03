@@ -470,6 +470,17 @@ _TREND_FIELDS: list[tuple[str, str, str]] = [
     ("depth chart Δ (neg=moving up)", "depth_chart_trend", "{:+d}"),
 ]
 
+# Below this many games played (out of a 17-game season), a fantasy_points_avg
+# is computed over a meaningfully shortened sample — often because of injury
+# — and shouldn't be read as equivalent to a full-season average. Flagged
+# explicitly in the line itself rather than left for the reader to notice:
+# confirmed live (2026-07-29) that a QB averaging more PPR pts/gm than a
+# healthier alternative, but over roughly half a season with heavy injury-
+# report presence, still got recommended ahead of the healthier player
+# despite worse ADP — the raw numbers were all there, nothing told the
+# model to weigh them differently.
+_SMALL_SAMPLE_GAMES = 10
+
 
 def _format_metrics_line(m: dict) -> str | None:
     """
@@ -492,6 +503,8 @@ def _format_metrics_line(m: dict) -> str | None:
             consistency += f" (±{m['fantasy_points_stdev']:.1f} stdev)"
         if m.get("games_played") is not None:
             consistency += f" over {m['games_played']} gm"
+            if m["games_played"] <= _SMALL_SAMPLE_GAMES:
+                consistency += " [SMALL SAMPLE — weigh this average with caution]"
         parts.append(consistency)
 
     risk_bits = []
@@ -598,17 +611,33 @@ def _format_metrics_section(
     backend/db/models.py) is almost certainly a rookie or recent draftee —
     they get draft capital (round/pick/college) instead of the generic
     "no data" line, since that's real, concrete signal rather than nothing.
+
+    Deliberately NOT capped to _MAX_CONTEXT_PLAYERS the way
+    _retrieve_player_context is — this function just formats already-fetched
+    dicts (no per-player network/embedding call), so there's no cost reason
+    to cut it off early. The caller (_build_prompt) passes the same top-25
+    slice shown in the ADP tiers table, so every player named there also
+    gets an explicit line here. Confirmed live (2026-07-29): with the old
+    shared cap, players ranked 11-25 — DST especially, since defenses
+    usually have higher ADP than whatever skill players are still on the
+    board — got cut from this section entirely with no line at all, worse
+    than the explicit "not modeled" case above. A defense recommended with
+    strictly less visible information than its alternatives is a sign the
+    model reached for outside knowledge instead of the prompt.
     """
     draft_profiles = draft_profiles or {}
     sections: list[str] = []
-    for p in top_available[:_MAX_CONTEXT_PLAYERS]:
+    for p in top_available:
         m = player_metrics.get(p["id"])
         if m is None:
             if p["position"] in ("DST", "K"):
                 sections.append(
                     f"- {p['name']} ({p['position']}): Not modeled by this metrics table "
-                    f"(built for individual offensive usage) — evaluate by matchup, "
-                    f"scheme, and ADP instead."
+                    f"(built for individual offensive usage — no matchup, scheme, or "
+                    f"opponent data exists anywhere in this app). ADP is the only "
+                    f"grounded signal available for this position here — do not "
+                    f"substitute outside knowledge about which defense/kicker is "
+                    f"'good.'"
                 )
                 continue
 
@@ -827,7 +856,10 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             },
             "alternatives": [
                 {
-                    "player_id": "<int>",
+                    # Same constraint as the recommendation: an id outside the
+                    # listed players is silently dropped by the parser, which
+                    # is how a requested 3 quietly became 2 on screen.
+                    "player_id": "<int from the tiers above>",
                     "player_name": "<string>",
                     "position": "<string>",
                     "adp": "<float>",
@@ -844,11 +876,16 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "recommendation (floor vs upside, positional need vs value, bye/stack "
         "considerations), not a restatement of `reasoning`.",
         "",
-        f"Return AT MOST {_MAX_ALTERNATIVES} alternatives — any beyond that are "
-        "discarded unread, so they only cost you output budget. Keep every "
-        "`reasoning`, `tradeoff`, and `alert` to a single sentence: the whole "
-        "response must be complete, valid JSON, and a response that runs long "
-        "gets cut off mid-object and is thrown away entirely.",
+        f"Return exactly {_MAX_ALTERNATIVES} alternatives whenever there are that "
+        "many defensible options on the board — fewer only when there genuinely "
+        f"aren't (late in the draft, thin position). More than {_MAX_ALTERNATIVES} "
+        "are discarded unread and only cost you output budget. Every "
+        "`player_id`, in both the recommendation and the alternatives, must be "
+        "one of the ids listed above: anything else is dropped, and you'll have "
+        "spent the tokens for nothing. Keep every `reasoning`, `tradeoff`, and "
+        "`alert` to a single sentence — the whole response must be complete, "
+        "valid JSON, and one that runs long gets cut off mid-object and thrown "
+        "away entirely.",
     ]
 
     return "\n".join(lines)
@@ -868,6 +905,15 @@ _SYSTEM_PROMPT = (
     "snap share — looks stronger than their ADP suggests is a potential breakout; call "
     "that out explicitly in your reasoning or alerts rather than defaulting to the "
     "safest name-brand pick. "
+    "A fantasy_points_avg is only as trustworthy as the sample it's computed over — a "
+    "player whose line is flagged '[SMALL SAMPLE — weigh this average with caution]' "
+    "missed enough of the season (often to injury) that their per-game average isn't "
+    "directly comparable to a healthy player's full-season average, even if the raw "
+    "number is higher. Weeks on injury report and games missed are real durability risk "
+    "for the season ahead, not footnotes — treat heavy injury-report presence or a "
+    "shortened season as a genuine reason for caution, and don't let a modest per-game "
+    "scoring edge from a small, injury-affected sample override a healthier, more "
+    "available player, especially one with a better ADP tier already. "
     "The available-players list is grouped into ADP tiers rather than a strict rank — "
     "a few points of ADP within the same tier is noise, not a meaningful signal, so "
     "don't let it be the deciding factor between two same-tier players. Reach for the "
@@ -892,6 +938,13 @@ _SYSTEM_PROMPT = (
     "rookie's eventual role, and a Day 1-2 pick landing in a favorable offense can be a "
     "legitimate breakout call even with zero NFL stats yet. Weigh it alongside ADP and "
     "whatever other context you have, the same as any other signal. "
+    "DST and K are not modeled by the Opportunity & Performance Signals section at all — "
+    "this app has no matchup, scheme, or opponent-strength data for any position. For "
+    "these two positions, ADP is the only grounded signal you actually have. Do not "
+    "reach for outside knowledge about which real-world defense or kicker is 'good' — "
+    "that would be exactly the kind of invented, ungrounded reasoning this system avoids "
+    "everywhere else. Defer to ADP order for DST/K unless the Player News & Analysis "
+    "section gives you something concrete to weigh against it. "
     "You always respond with valid JSON and nothing else."
 )
 
@@ -991,10 +1044,28 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
 
     # No separate availability filter needed: _pick already returns None for
     # anything not in the available list.
+    raw_alternatives = data.get("alternatives", [])[:_MAX_ALTERNATIVES]
     alternatives = [
-        s for d in data.get("alternatives", [])[:_MAX_ALTERNATIVES]
+        s for d in raw_alternatives
         if isinstance(d, dict) and (s := _pick(d)) is not None
     ]
+
+    # Alternatives vanish for two very different reasons — Claude offered fewer
+    # than we asked for, or it offered enough but named players that aren't in
+    # the available list and _pick discarded them. Both look identical on
+    # screen ("only two options"), so say which happened.
+    if len(alternatives) < len(raw_alternatives):
+        dropped = [d.get("player_name", "?") for d in raw_alternatives
+                   if isinstance(d, dict) and _pick(d) is None]
+        logger.warning(
+            "Dropped %d of %d alternatives — not in the available list: %s",
+            len(raw_alternatives) - len(alternatives), len(raw_alternatives), dropped,
+        )
+    elif len(alternatives) < _MAX_ALTERNATIVES:
+        logger.info(
+            "Claude returned %d alternatives (asked for %d) — none were invalid.",
+            len(alternatives), _MAX_ALTERNATIVES,
+        )
 
     alerts = [str(a) for a in data.get("alerts", []) if a]
 
