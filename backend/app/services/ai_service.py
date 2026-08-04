@@ -477,8 +477,43 @@ def _full_lineup(lineup: dict[str, int]) -> dict[str, int]:
 # what makes this scale-aware — a 3-pick gap is a real cliff at ADP 5 but
 # noise at ADP 150, so the threshold widens proportionally as ADP climbs
 # instead of using one fixed number for the whole board.
-_MIN_TIER_GAP = 3.0
-_TIER_GAP_RATIO = 0.10
+# A tier break is a gap unusually large FOR THIS BOARD, judged against the
+# other gaps on it — not against an absolute number and not against the ADP
+# value itself.
+#
+# The previous rule, max(3.0, prev_adp * 0.10), was calibrated against the
+# wrong quantity and silently produced a single tier at nearly every point in
+# a draft. Consecutive available players sit about 1 ADP point apart (roughly
+# 230 players spread over 230 ADP points), and the largest gap anywhere in a
+# 25-player board is 2.3-4.2 — while the threshold ran from 3.0 early to over
+# 10 by ADP 100. It could not be exceeded, so no break was ever emitted.
+#
+# The damage was not a missing feature. The board carries the instruction
+# "players within the same tier are roughly interchangeable, treat a gap
+# within a tier as noise" — so a single 25-player tier told the model that
+# the ADP-1.6 player and the ADP-24.7 player were equivalent, and that any
+# ADP evidence separating them should be discarded. Confirmed live: a back at
+# ADP 45.2 went unrecommended in favour of players 25 ADP points later, all
+# of them presented as one undifferentiated block.
+#
+# A percentile self-calibrates to whatever density the board actually has,
+# early or late, thin or dense. The size cap then splits any tier that stays
+# implausibly large, so the "interchangeable" claim is never made about a
+# group big enough for it to be false.
+_TIER_GAP_PERCENTILE = 0.80
+_MIN_TIER_GAP = 0.5
+_MAX_TIER_SIZE = 8
+
+
+def _split_oversized(tier: list[dict]) -> list[list[dict]]:
+    """Recursively splits a tier at its largest internal gap until every
+    piece is at most _MAX_TIER_SIZE. A tier of twenty players is not a
+    statement anyone would defend about football, whatever the gaps say."""
+    if len(tier) <= _MAX_TIER_SIZE:
+        return [tier]
+    gaps = [(tier[i + 1]["adp"] - tier[i]["adp"], i) for i in range(len(tier) - 1)]
+    _, at = max(gaps, key=lambda g: (g[0], -abs(g[1] - len(tier) // 2)))
+    return _split_oversized(tier[: at + 1]) + _split_oversized(tier[at + 1:])
 
 
 def _compute_adp_tiers(players: list[dict]) -> list[list[dict]]:
@@ -491,15 +526,20 @@ def _compute_adp_tiers(players: list[dict]) -> list[list[dict]]:
     """
     if not players:
         return []
+    if len(players) < 3:
+        return [list(players)]
+
+    gaps = sorted(b["adp"] - a["adp"] for a, b in zip(players, players[1:]))
+    # Break on gaps in the top fifth of this board's own gap distribution.
+    threshold = max(_MIN_TIER_GAP, gaps[min(int(len(gaps) * _TIER_GAP_PERCENTILE), len(gaps) - 1)])
 
     tiers: list[list[dict]] = [[players[0]]]
     for prev, cur in zip(players, players[1:]):
-        gap = cur["adp"] - prev["adp"]
-        threshold = max(_MIN_TIER_GAP, prev["adp"] * _TIER_GAP_RATIO)
-        if gap > threshold:
+        if cur["adp"] - prev["adp"] >= threshold:
             tiers.append([])
         tiers[-1].append(cur)
-    return tiers
+
+    return [piece for tier in tiers for piece in _split_oversized(tier)]
 
 
 # ---------------------------------------------------------------------------
@@ -1611,10 +1651,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # ADP decimal as meaningful, when a few-point gap is often just noise.
     lines.append("## Top Available Players (grouped into ADP tiers)")
     lines.append(
-        "Players within the same tier are roughly interchangeable in ADP terms — "
-        "treat a gap within a tier as noise and use the Opportunity & Performance "
-        "Signals / Player News sections to choose among them, rather than the exact "
-        "ADP decimal. A gap between tiers is more likely to reflect real drop-off."
+        "Tier boundaries fall at the largest ADP gaps on this particular board, so "
+        "they adapt to how tightly packed it is. Within a tier, a fraction of an ADP "
+        "point is noise and should not decide anything — use the Opportunity & "
+        "Performance Signals / Player News sections to choose among them. Across "
+        "tiers the gap is more likely to be real drop-off, and a lower tier is NOT "
+        "interchangeable with a higher one: preferring a player two tiers down needs "
+        "a reason you can point at, not just a better-looking stat line."
     )
     if ctx.replacement_ppg:
         repl_str = ", ".join(
@@ -1705,9 +1748,10 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "Recommend the best pick for my team right now. Work through these steps in "
         "order — each one narrows the field for the next:",
         "",
-        "1. SHORTLIST. Take the top tier or two on the board. Same-tier players are "
-        "roughly interchangeable in ADP terms, so ignore the exact ADP decimal between "
-        "them; a gap *between* tiers is real drop-off and worth respecting.",
+        "1. SHORTLIST. Take the top tier or two on the board. Ignore ADP differences "
+        "WITHIN a tier — those are noise. Do not treat a lower tier as equivalent to a "
+        "higher one: tier boundaries sit at the real gaps on this board, so dropping a "
+        "tier costs something and needs a reason beyond a nicer-looking stat line.",
         "2. SUBTRACT WHAT WILL KEEP. Remove anyone in the 'Very likely still on the "
         "board at your next turn' bucket unless they are clearly, not marginally, "
         "better than everyone in the GONE bucket. You can have them later; you cannot "

@@ -21,6 +21,7 @@ from backend.app.services.ai_service import (
     _format_metrics_section,
     _infer_current_season,
     _compute_roster_depth,
+    _compute_adp_tiers,
     compute_replacement_levels,
     _vor,
     _format_roster_depth_section,
@@ -882,3 +883,82 @@ def test_system_prompt_guards_against_stacking_on_high_vor():
     assert "stacking a fourth player at a position that starts one" in sp
     # And the honest caveat about where the number comes from.
     assert "computed from last season" in sp
+
+
+# ---------------------------------------------------------------------------
+# ADP tiers
+#
+# Live failure: the board rendered as ONE tier of 25 players spanning 25 ADP
+# points, and the board's own instruction says same-tier players are
+# interchangeable and within-tier gaps are noise. So the prompt was actively
+# telling the model to discard the ADP evidence separating a back at 45.2
+# from a receiver at 71.7. Cause: the threshold was max(3.0, adp * 0.10)
+# while consecutive available players sit ~1 ADP point apart, so it could
+# never be exceeded.
+# ---------------------------------------------------------------------------
+
+def _board(*adps: float) -> list[dict]:
+    return [{"id": i, "rank": i, "name": f"P{i}", "position": "RB",
+             "team": "X", "adp": a, "sleeper_id": None}
+            for i, a in enumerate(adps, start=1)]
+
+
+def test_dense_board_still_produces_multiple_tiers():
+    # 25 players ~1 ADP apart with a few 2+ gaps: the exact shape that
+    # collapsed into a single tier under the old absolute threshold.
+    adps = []
+    x = 1.0
+    for i in range(25):
+        adps.append(x)
+        x += 2.4 if i % 6 == 5 else 0.9
+    tiers = _compute_adp_tiers(_board(*adps))
+    assert len(tiers) > 1, "a board with real gaps must not render as one blob"
+    assert all(len(t) <= 8 for t in tiers)
+
+
+def test_threshold_scales_with_the_board_not_with_adp_value():
+    # Same relative shape, shifted deep into the draft. The old ratio term
+    # made the threshold grow with ADP (>10 by ADP 100) so late boards always
+    # collapsed; tiering must depend on gap distribution, not position on it.
+    shape = [0, 1, 2, 5, 6, 7, 10, 11, 12]
+    early = _compute_adp_tiers(_board(*[1.0 + s for s in shape]))
+    late = _compute_adp_tiers(_board(*[120.0 + s for s in shape]))
+    assert len(early) == len(late)
+    assert [len(t) for t in early] == [len(t) for t in late]
+
+
+def test_no_tier_exceeds_the_size_cap():
+    # A perfectly uniform board has no meaningful break, but a 25-player
+    # "these are all interchangeable" claim is indefensible regardless.
+    tiers = _compute_adp_tiers(_board(*[10.0 + i for i in range(25)]))
+    assert all(len(t) <= 8 for t in tiers)
+    assert sum(len(t) for t in tiers) == 25
+
+
+def test_tiers_preserve_every_player_and_their_order():
+    adps = [1.0, 1.2, 4.0, 4.1, 4.2, 9.0, 20.0, 20.1]
+    tiers = _compute_adp_tiers(_board(*adps))
+    flat = [p["adp"] for t in tiers for p in t]
+    assert flat == adps
+
+
+def test_a_clear_cliff_starts_a_new_tier():
+    tiers = _compute_adp_tiers(_board(1.0, 1.1, 1.2, 40.0, 40.1, 40.2))
+    assert len(tiers) >= 2
+    assert tiers[0][-1]["adp"] == 1.2
+    assert tiers[1][0]["adp"] == 40.0
+
+
+def test_tiny_boards_are_left_alone():
+    assert _compute_adp_tiers([]) == []
+    assert len(_compute_adp_tiers(_board(1.0))) == 1
+    assert len(_compute_adp_tiers(_board(1.0, 50.0))) == 1
+
+
+def test_board_no_longer_claims_distant_players_are_interchangeable():
+    ctx = ctx_with_available(*range(1, 26))
+    for i, p in enumerate(ctx.top_available):
+        p["adp"] = 40.0 + i * 1.1
+    prompt = _build_prompt(ctx)
+    assert "roughly interchangeable" not in prompt
+    assert "NOT interchangeable with a higher one" in prompt
