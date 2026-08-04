@@ -876,7 +876,11 @@ def test_board_omits_vor_entirely_without_replacement_levels():
     # board exactly as before rather than showing a column of dashes.
     ctx = ctx_with_available(1, 2)
     prompt = _build_prompt(ctx)
-    assert "VOR" not in prompt
+    # Scoped to the board section: the Task steps reference VOR by name as
+    # part of a standing instruction, which is correct even when no VOR
+    # figures can be computed. What must not appear is a column of dashes.
+    board = prompt.split("## Top Available Players")[1].split("## ")[0]
+    assert "VOR" not in board
 
 
 def test_system_prompt_guards_against_stacking_on_high_vor():
@@ -1067,3 +1071,42 @@ def test_system_prompt_forbids_recommending_around_a_listed_player():
     # The exact reasoning pattern observed live must be named as an error.
     assert "the best option once X and Y are gone" in sp
     assert "one of THEM is the pick" in sp
+
+
+# ---------------------------------------------------------------------------
+# Durability must not be double-counted against ADP
+#
+# Live failure at pick 17: Rashee Rice sat first on the board (ADP 11.5,
+# VOR +6.9, 9.8 tgt/gm, RACR 1.69, 68% catch, 18.8 ppg) and was not even
+# listed as an alternative. The model took George Pickens (ADP 21.3, VOR
+# +5.3, 8.1 tgt/gm, RACR 0.92) and wrote that Pickens' efficiency "outpaces
+# his tier" — while Rice beat him on every visible metric. The only thing
+# favouring Pickens was Rice's [SMALL SAMPLE] flag and injury weeks. But
+# RULE 6 required the healthier player to already hold the better ADP tier,
+# and Pickens was ten picks worse, so the rule never applied.
+# ---------------------------------------------------------------------------
+
+def test_rule6_forbids_charging_a_player_twice_for_injury_history():
+    sp = _build_system_prompt("ppr")
+    assert "ADP ALREADY PRICES KNOWN INJURY HISTORY" in sp
+    assert "charges him twice for the same fact" in sp
+
+
+def test_rule6_scopes_the_small_sample_caveat_to_the_scoring_average():
+    # The flag is attached to fantasy_points_avg. Usage rates on the same
+    # line describe the role he held and stabilise much faster.
+    sp = _build_system_prompt("ppr")
+    assert "applies to that average, not to the whole line" in sp
+    assert "stabilise far faster than points do" in sp
+
+
+def test_rule6_names_the_better_adp_and_vor_override():
+    sp = _build_system_prompt("ppr")
+    assert "BOTH the better ADP and the higher VOR" in sp
+    assert "durability is NOT sufficient reason to pass on him" in sp
+
+
+def test_task_requires_justifying_a_pass_on_a_strictly_better_player():
+    prompt = _build_prompt(ctx_with_available(1, 2, 3))
+    assert "a better ADP and a higher VOR" in prompt
+    assert "take the better player" in prompt
