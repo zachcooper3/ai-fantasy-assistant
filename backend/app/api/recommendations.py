@@ -122,9 +122,19 @@ def _metrics_dict(m) -> dict:
 def _build_context(
     svc: DraftStateService,
     db: Session,
-    top_n: int = 25,
+    top_n: int = 60,
 ) -> RecommendationContext:
-    """Builds the full RecommendationContext from live draft state and DB."""
+    """
+    Builds the full RecommendationContext from live draft state and DB.
+
+    top_n is deliberately deeper than the board the prompt actually displays
+    (ai_service._LISTED_PLAYERS, 25). The extra players are never rendered;
+    they exist so the "cost of waiting" math can find replacement level at
+    each position. On a 25-player global ADP slice, the next available TE or
+    QB is frequently past the cut — which is exactly the situation where
+    waiting is most expensive and the model could least see it. The cost is
+    two bulk keyed lookups over 60 ids instead of 25.
+    """
 
     # Top available players as plain dicts
     top_available = [
@@ -188,6 +198,31 @@ def _build_context(
         if slot != svc.config.my_draft_position
     }
 
+    # Look-ahead: the turn AFTER the one being advised on, plus every team
+    # that picks in between. This is the opportunity-cost horizon the
+    # recommendation prompt reasons against — see
+    # RecommendationContext.my_following_pick_number for why it can't just
+    # be my_next_pick_number (that property returns the *current* pick when
+    # it's already my turn).
+    #
+    # Computed here rather than in ai_service so the snake math stays in
+    # DraftStateService alone; any future variant (third-round reversal and
+    # friends) changes slot_for_pick and this follows automatically.
+    total_picks = svc.config.league_size * svc.config.total_rounds
+    advised_pick = svc.my_next_pick_number
+    my_following_pick_number = None
+    upcoming_pick_slots: list[int] = []
+    if advised_pick is not None:
+        for p in range(advised_pick + 1, total_picks + 1):
+            if svc.slot_for_pick(p) == svc.config.my_draft_position:
+                my_following_pick_number = p
+                break
+            upcoming_pick_slots.append(svc.slot_for_pick(p))
+        if my_following_pick_number is None:
+            # Advising on my final pick of the draft — nothing to defer to,
+            # so drop the partial list rather than implying a next turn.
+            upcoming_pick_slots = []
+
     return RecommendationContext(
         pick_number=svc.current_pick_number,
         round_number=svc.current_round,
@@ -205,6 +240,8 @@ def _build_context(
         starting_lineup=svc.config.starting_lineup,
         player_metrics=player_metrics,
         draft_profiles=draft_profiles,
+        my_following_pick_number=my_following_pick_number,
+        upcoming_pick_slots=upcoming_pick_slots,
     )
 
 

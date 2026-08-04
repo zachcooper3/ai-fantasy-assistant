@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import anthropic
@@ -47,10 +48,42 @@ _MAX_ALTERNATIVES = 3
 # to the ADP fallback.
 _MAX_RESPONSE_TOKENS = 2048
 
+# This is an analytical task with a single best answer, not a creative one.
+# The default temperature of 1.0 meant two "Get pick" clicks on an unchanged
+# board could return different players with equally confident reasoning,
+# which reads as the tool being unreliable rather than the board being close
+# (that's what `confidence: low` is for). 0 also measurably reduces malformed
+# JSON, which on this path costs a whole recommendation via the ADP fallback.
+_TEMPERATURE = 0.0
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+# How many players from top_available are actually rendered in the tiers
+# table / metrics / news sections. ctx.top_available is deliberately deeper
+# than this (see _build_context's top_n) so the positional drop-off and
+# survival math below can see past the end of the displayed board — you
+# cannot reason about "what's left at RB if I wait" from a 25-player global
+# ADP slice that might contain three RBs.
+_LISTED_PLAYERS = 25
+
+# DST and K are roster taxes, not picks: their week-to-week fantasy output is
+# close to unpredictable (this app has no matchup/scheme data for either —
+# see _format_metrics_section), so a pick spent on one before the very end of
+# the draft is a pick not spent on a skill player who could actually win a
+# week. Reserved out of the "rounds remaining" math below rather than left to
+# the model's judgement, because the gap logic would otherwise count an open
+# DST slot as an urgent starting-lineup hole in round 10 and push exactly the
+# pick this rule exists to prevent.
+_LATE_ROUND_POSITIONS = ("DST", "K")
+
+# Kickers aren't modeled by DraftConfig at all (it has qb/rb/wr/te/flex/dst
+# slots and no k_slots), but every standard Sleeper league starts one, and
+# without it here the assistant would never once tell you to draft a kicker —
+# the same class of bug as the missing-QB-slot problem documented on
+# _STANDARD_STARTING_LINEUP below. Modeled as a constant rather than plumbed
+# through DraftConfig/DraftSession/schemas/serializers because the desired
+# behavior is a fixed rule ("one kicker, last round"), not a per-league knob;
+# if a league ever starts zero or two, that's when it earns a real k_slots
+# column and a DB migration.
+_K_SLOTS = 1
 
 @dataclass
 class PickSuggestion:
@@ -141,6 +174,27 @@ class RecommendationContext:
     # won't have a key here, which is expected, not an error.
     draft_profiles: dict[int, dict] = field(default_factory=dict)
 
+    # The overall pick number of my turn AFTER the one being advised on, or
+    # None if this is my last pick of the draft.
+    #
+    # This is the field the entire opportunity-cost section hangs on, and it
+    # is deliberately NOT my_next_pick_number: that property already returns
+    # the *current* pick when it's my turn (see DraftStateService), so using
+    # it as the horizon would ask "will this player still be here right now,"
+    # which is trivially yes for everyone on the board. The only question
+    # that changes a pick is "which of these is gone before I pick again."
+    #
+    # Defaults None so pre-existing callers/tests degrade to the old behavior
+    # (the section is simply omitted) rather than computing a wrong horizon.
+    my_following_pick_number: int | None = None
+
+    # Draft slots, in pick order, of every team that picks between this pick
+    # and my next turn — from DraftStateService.slot_for_pick, so the snake
+    # math lives in exactly one place and any future variant (third-round
+    # reversal, etc.) is picked up here for free rather than reimplemented.
+    # Empty when I pick again immediately or when the caller predates this.
+    upcoming_pick_slots: list[int] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Starting lineup gaps — gives Claude a concrete target, not just "consider
@@ -167,26 +221,23 @@ _STANDARD_STARTING_LINEUP = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST
 _FLEX_ELIGIBLE_POSITIONS = {"RB", "WR", "TE"}
 
 
-def _compute_roster_gaps(
-    my_roster: list[dict],
+def _gaps_from_counts(
+    have: dict[str, int],
     lineup: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """
-    Returns {position: still_needed} for every starting slot not yet filled,
-    treating extra RB/WR/TE beyond their required minimums as satisfying the
-    FLEX slot. Positions already fully covered are omitted entirely (empty
-    dict = a complete starting lineup).
-
-    lineup defaults to the standard 1-QB PPR shape when not given (e.g. from
-    callers/tests that predate DraftConfig.starting_lineup); the live app
-    always passes ctx.starting_lineup explicitly.
+    Core gap math, expressed over a {position: count} tally rather than a
+    roster list — so it can serve both my own roster (via
+    _compute_roster_gaps) and every *opponent's* roster, which the draft
+    service only ever exposes as position counts (see
+    DraftStateService.position_counts_for_slot). Sharing one implementation
+    is the point: "which teams ahead of me still need an RB starter" has to
+    mean exactly the same thing as "do I still need an RB starter," or the
+    run-risk section would be quietly measuring something different from the
+    roster-gap section directly above it.
     """
     if lineup is None:
         lineup = _STANDARD_STARTING_LINEUP
-
-    have: dict[str, int] = {}
-    for p in my_roster:
-        have[p["position"]] = have.get(p["position"], 0) + 1
 
     gaps: dict[str, int] = {}
     flex_surplus = 0
@@ -205,6 +256,38 @@ def _compute_roster_gaps(
         gaps["FLEX"] = flex_needed
 
     return gaps
+
+
+def _compute_roster_gaps(
+    my_roster: list[dict],
+    lineup: dict[str, int] | None = None,
+) -> dict[str, int]:
+    """
+    Returns {position: still_needed} for every starting slot not yet filled,
+    treating extra RB/WR/TE beyond their required minimums as satisfying the
+    FLEX slot. Positions already fully covered are omitted entirely (empty
+    dict = a complete starting lineup).
+
+    lineup defaults to the standard 1-QB PPR shape when not given (e.g. from
+    callers/tests that predate DraftConfig.starting_lineup); the live app
+    always passes ctx.starting_lineup explicitly.
+    """
+    have: dict[str, int] = {}
+    for p in my_roster:
+        have[p["position"]] = have.get(p["position"], 0) + 1
+    return _gaps_from_counts(have, lineup)
+
+
+def _full_lineup(lineup: dict[str, int]) -> dict[str, int]:
+    """
+    The configured lineup plus the kicker DraftConfig doesn't model — see
+    _K_SLOTS. Everything downstream (gap math, scarcity, the roster-shape
+    line) reads the lineup through here so the kicker requirement can't be
+    visible in one place and missing in another.
+    """
+    if not _K_SLOTS:
+        return dict(lineup)
+    return {**lineup, "K": lineup.get("K", _K_SLOTS)}
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +380,245 @@ def compute_position_scarcity(
 
 
 # ---------------------------------------------------------------------------
+# Opportunity cost — which players actually survive to my next turn
+#
+# This is the single question a snake draft turns on, and nothing in this
+# prompt used to answer it. The context carried my_next_pick_number and
+# picks_until_my_turn from the very beginning, but they appeared only in a
+# one-line "N pick(s) until my turn" header and were never connected to the
+# player list, so every recommendation was implicitly reasoning as though
+# both candidates would still be available later. They won't be, and which
+# one won't be is usually the whole decision: taking the player who survives
+# and losing the one who doesn't is strictly worse than the reverse, at
+# identical value.
+#
+# All of this is computed in Python rather than asked of the model on
+# purpose. Arithmetic over 25-60 ADP values is exactly what a small fast
+# model is worst at and what costs the most reasoning tokens; handing it the
+# conclusions leaves it doing the judgement work it's actually good at.
+# ---------------------------------------------------------------------------
+
+# ADP is a consensus average, so a player's real draft slot is a distribution
+# around it, not a point. These two numbers define that spread: a player goes
+# roughly within +/- max(_ADP_NOISE_FLOOR, adp * _ADP_NOISE_RATIO) of their
+# ADP. The ratio term matters for the same reason it does in the tier math
+# above — 8 picks of slack is enormous at ADP 10 and meaningless at ADP 180,
+# where whole positions come off the board in that span.
+_ADP_NOISE_FLOOR = 8.0
+_ADP_NOISE_RATIO = 0.25
+
+# Labels, not probabilities. A calibrated percentage would imply a precision
+# this heuristic doesn't have, and would invite the model to do arithmetic
+# with it; three buckets communicate the same actionable distinction.
+_SURVIVAL_GONE = "GONE"
+_SURVIVAL_TOSSUP = "TOSS-UP"
+_SURVIVAL_SAFE = "LIKELY THERE"
+
+
+def _survival(adp: float, horizon_pick: int | None) -> str | None:
+    """
+    Whether a player with this ADP is likely to still be on the board at
+    `horizon_pick`. Returns None when there's no horizon (my last pick of
+    the draft — nothing to wait for, so the question is meaningless and the
+    section is omitted rather than filled with a guess).
+    """
+    if horizon_pick is None:
+        return None
+    noise = max(_ADP_NOISE_FLOOR, adp * _ADP_NOISE_RATIO)
+    if horizon_pick > adp + noise:
+        return _SURVIVAL_GONE
+    if horizon_pick < adp - noise:
+        return _SURVIVAL_SAFE
+    return _SURVIVAL_TOSSUP
+
+
+def _format_survival_section(
+    listed: list[dict],
+    horizon_pick: int | None,
+    picks_between: int,
+) -> str:
+    """
+    Splits the displayed board into "won't be there next time," "might be,"
+    and "will almost certainly still be there" — the frame that turns a
+    ranked list into a decision.
+
+    The last bucket is as important as the first and is the one a model
+    won't infer on its own: a LIKELY THERE player is not a worse player, he's
+    a player you can take later, which means spending this pick on him
+    forfeits a GONE player for nothing. Stated explicitly in the header
+    because "available later" reading as "lower priority" is the entire
+    behavior this section exists to produce.
+    """
+    if horizon_pick is None or picks_between <= 0:
+        return ""
+
+    buckets: dict[str, list[str]] = {
+        _SURVIVAL_GONE: [], _SURVIVAL_TOSSUP: [], _SURVIVAL_SAFE: [],
+    }
+    for p in listed:
+        label = _survival(p["adp"], horizon_pick)
+        if label is not None:
+            buckets[label].append(f"{p['name']} ({p['position']}, ADP {p['adp']:g})")
+
+    if not any(buckets.values()):
+        return ""
+
+    lines = [
+        f"## Opportunity Cost — {picks_between} pick(s) happen before your next turn (#{horizon_pick})",
+        "Estimated from each player's ADP versus that pick number. This is the "
+        "decisive comparison: taking a LIKELY THERE player now forfeits every GONE "
+        "player for nothing, since the LIKELY THERE player can still be had at your "
+        "next turn. Only pass on a GONE player for someone clearly better, not for "
+        "someone merely similar.",
+    ]
+    for label, header in (
+        (_SURVIVAL_GONE, "Almost certainly gone by then — available now only"),
+        (_SURVIVAL_TOSSUP, "Coin flip — could go either way"),
+        (_SURVIVAL_SAFE, "Very likely still on the board at your next turn"),
+    ):
+        names = buckets[label]
+        if names:
+            lines.append(f"- {header}: " + "; ".join(names))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _format_positional_dropoff(
+    board: list[dict],
+    horizon_pick: int | None,
+    positions: tuple[str, ...] = ("QB", "RB", "WR", "TE"),
+) -> str:
+    """
+    For each position: the best player available now, and the best one still
+    expected to be there at my next turn — with the ADP gap between them.
+
+    That gap is the actual cost of waiting at that position, and it's the
+    closest thing this app has to a value-over-replacement number. The system
+    prompt has always instructed value-based drafting "relative to positional
+    replacement level" without ever supplying a replacement level; this
+    supplies one, derived per-position from the live board instead of a
+    static baseline.
+
+    Reads from `board` (the full ctx.top_available, deeper than the displayed
+    _LISTED_PLAYERS slice) rather than the tiers table, because the
+    replacement-level player at a position is frequently past the end of a
+    25-player global ADP cut — which is exactly when waiting is most
+    expensive and the model could least see it.
+    """
+    if horizon_pick is None:
+        return ""
+
+    lines: list[str] = []
+    for pos in positions:
+        at_pos = sorted(
+            (p for p in board if p["position"] == pos), key=lambda p: p["adp"]
+        )
+        if not at_pos:
+            continue
+        best = at_pos[0]
+        survivor = next(
+            (p for p in at_pos if _survival(p["adp"], horizon_pick) != _SURVIVAL_GONE),
+            None,
+        )
+        if survivor is None:
+            lines.append(
+                f"- {pos}: best available {best['name']} (ADP {best['adp']:g}). "
+                f"Every {pos} currently on this board projects to be gone by your "
+                f"next turn — waiting means starting from whatever is left."
+            )
+        elif survivor["id"] == best["id"]:
+            lines.append(
+                f"- {pos}: best available {best['name']} (ADP {best['adp']:g}) — "
+                f"projects to still be there at your next turn. No cost to waiting."
+            )
+        else:
+            gap = survivor["adp"] - best["adp"]
+            lines.append(
+                f"- {pos}: best available {best['name']} (ADP {best['adp']:g}); best "
+                f"likely to survive to your next turn is {survivor['name']} (ADP "
+                f"{survivor['adp']:g}). Cost of waiting: {gap:.0f} ADP points at the position."
+            )
+
+    if not lines:
+        return ""
+    return "\n".join([
+        "## Cost of Waiting, by Position",
+        "The drop from the best player available now to the best one likely to "
+        "survive to your next turn. A large drop is the strongest argument for "
+        "taking that position now; a small one means the position can wait and "
+        "this pick belongs somewhere else.",
+        *lines,
+        "",
+    ])
+
+
+def _format_run_risk(
+    upcoming_pick_slots: list[int],
+    opponent_position_counts: dict[int, dict[str, int]],
+    lineup: dict[str, int],
+) -> str:
+    """
+    How many of the teams picking before my next turn still need a starter at
+    each position — the demand side of run risk, which raw undrafted counts
+    (the Positional Availability section) can't express at all.
+
+    Replaces the old full opponent-roster dump: printing all 11 opponents'
+    position counts spent real prompt budget on teams that pick *after* me
+    and therefore cannot take a player before my next turn. The teams that
+    can are the only ones whose needs are actionable, and reducing 11 lines
+    to one demand tally per position also trims input tokens on a path where
+    latency is a live complaint.
+    """
+    if not upcoming_pick_slots or not opponent_position_counts:
+        return ""
+
+    # Distinct teams, not distinct picks. Across a snake turn most teams
+    # appear twice in upcoming_pick_slots (down the order, then back up), and
+    # counting each appearance made the tally exceed the number of teams —
+    # "WR: 38" for 19 teams, a number that can't mean anything and quietly
+    # discredits every other figure in the prompt. A team that needs one
+    # starting WR takes roughly one starting WR regardless of how many picks
+    # it holds.
+    teams = sorted({s for s in upcoming_pick_slots if s in opponent_position_counts})
+    if not teams:
+        return ""
+
+    demand: dict[str, int] = {}
+    flex_demand = 0
+    for slot in teams:
+        gaps = _gaps_from_counts(opponent_position_counts[slot], lineup)
+        for pos, _ in gaps.items():
+            if pos == "FLEX":
+                # Counted on its own line, NOT added to both RB and WR. Adding
+                # it to both is what inflated the totals past 100% and implies
+                # one open flex slot generates two positions' worth of demand.
+                flex_demand += 1
+            elif pos not in _LATE_ROUND_POSITIONS:
+                # A DST/K "need" is not run risk — nobody is taking one this
+                # early, and listing it invites the model to treat those
+                # positions as contested. See _LATE_ROUND_POSITIONS.
+                demand[pos] = demand.get(pos, 0) + 1
+
+    if not demand and not flex_demand:
+        return ""
+
+    n = len(teams)
+    ordered = sorted(demand.items(), key=lambda kv: -kv[1])
+    parts = [f"{pos} {cnt}/{n}" for pos, cnt in ordered]
+    if flex_demand:
+        parts.append(f"FLEX {flex_demand}/{n} (fills with an RB or WR)")
+
+    return "\n".join([
+        f"## Run Risk — needs of the {n} team(s) picking before your next turn",
+        "Share of those teams with that starting slot still unfilled: " + ", ".join(parts),
+        "High demand at a position means a run there is likely before your next "
+        "turn, which compounds the cost-of-waiting numbers above. Low demand means "
+        "you can probably wait even if raw supply looks thin.",
+        "",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Retrieval — grounds the prompt in real news/analysis from ChromaDB
 # ---------------------------------------------------------------------------
 
@@ -376,19 +698,39 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
         logger.info(f"Vector store unavailable — building prompt without retrieved context: {e}")
         return ""
 
+    candidates = [
+        p for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")
+    ]
+
+    # Fan the (network-bound, cache-missing) queries out instead of running
+    # them one after another. Each is an embedding round trip of a few
+    # hundred ms; ten of them serially was a large, entirely avoidable share
+    # of the reported ~10s per recommendation, since they don't depend on
+    # each other in any way. The whole call already runs in a worker thread
+    # (see AIService.recommend), so this nests a small pool inside it rather
+    # than touching the event loop. _retrieval_cache is only ever written
+    # with whole-value dict assignment, which is atomic under the GIL — a
+    # duplicate concurrent query for the same player is wasted work at worst,
+    # never corruption.
+    def _lookup(p: dict) -> tuple[dict, list[str] | None]:
+        try:
+            return p, _query_player_chunks(vector_query, p["sleeper_id"], p["name"])
+        except Exception as e:
+            logger.warning(f"Vector query failed for {p['name']}: {e}")
+            return p, None
+
+    if candidates:
+        with ThreadPoolExecutor(max_workers=min(len(candidates), 8)) as pool:
+            outcomes = list(pool.map(_lookup, candidates))
+    else:
+        outcomes = []
+
     sections: list[str] = []
     hits = 0
     checked = 0
-    for p in top_available[:_MAX_CONTEXT_PLAYERS]:
-        sleeper_id = p.get("sleeper_id")
-        if not sleeper_id:
-            continue
+    for p, results in outcomes:
         checked += 1
-
-        try:
-            results = _query_player_chunks(vector_query, sleeper_id, p["name"])
-        except Exception as e:
-            logger.warning(f"Vector query failed for {p['name']}: {e}")
+        if results is None:
             continue
 
         if results:
@@ -688,11 +1030,17 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         if ctx.is_my_turn
         else f"{ctx.picks_until_my_turn} pick(s) until my turn (next pick: #{ctx.my_next_pick_number})."
     )
+    # Roster spots left, not just rounds left — the same number framed as
+    # "how many more players do I get" is what makes a late-round pick feel
+    # expensive. Counts the current pick, unlike the old rounds_remaining
+    # below (see the off-by-one note there).
+    spots_left = max(0, ctx.total_rounds - ctx.round_number + 1)
     lines += [
         "## Draft State",
         f"- Overall pick: #{ctx.pick_number} (Round {ctx.round_number} of {ctx.total_rounds})",
         f"- My draft slot: {ctx.my_slot} of {ctx.league_size}",
         f"- {turn_info}",
+        f"- Roster spots left to fill after this one: {max(0, spots_left - 1)}",
         f"- Scoring: {ctx.scoring_format.upper()}",
         "",
     ]
@@ -719,39 +1067,93 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # _compute_roster_gaps' docstring for why this exists: without it,
     # nothing told Claude it still needed a starting QB, and it never
     # once got recommended across a full draft as a result)
-    gaps = _compute_roster_gaps(ctx.my_roster, ctx.starting_lineup)
-    rounds_remaining = max(0, ctx.total_rounds - ctx.round_number)
-    lineup_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(gaps.items()))
-    # Built from ctx.starting_lineup (not hardcoded) so this line reflects
-    # this league's actual configured roster, e.g. via /api/draft/session.
-    _slot_order = ["QB", "RB", "WR", "TE", "FLEX", "DST"]
+    lineup = _full_lineup(ctx.starting_lineup)
+    gaps = _compute_roster_gaps(ctx.my_roster, lineup)
+
+    # Split the gaps: DST/K are roster taxes you pay at the end (see
+    # _LATE_ROUND_POSITIONS), skill slots are what the draft is actually
+    # for. Folding them together is what let an open DST slot in round 10
+    # register as an urgent starting-lineup hole.
+    late_gaps = {p: n for p, n in gaps.items() if p in _LATE_ROUND_POSITIONS}
+    skill_gaps = {p: n for p, n in gaps.items() if p not in _LATE_ROUND_POSITIONS}
+
+    # Counts the current pick. The old expression (total_rounds - round_number)
+    # excluded it, so on the final round it evaluated to 0 and the `> 0` guard
+    # below suppressed the URGENT line entirely — at precisely the pick where
+    # an unfilled starting slot is least recoverable.
+    rounds_remaining = spots_left
+    # Rounds genuinely available for skill players: the last picks are spoken
+    # for by the DST/K still owed. Without this subtraction the urgency check
+    # is optimistic by exactly the number of roster taxes outstanding, which
+    # is how you arrive at the final two rounds needing a QB, a DST and a K
+    # with two picks left.
+    late_reserved = sum(late_gaps.values())
+    skill_rounds_remaining = max(0, rounds_remaining - late_reserved)
+
+    lineup_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(skill_gaps.items()))
+    # Built from the configured lineup (not hardcoded) so this line reflects
+    # this league's actual roster, e.g. via /api/draft/session.
+    _slot_order = ["QB", "RB", "WR", "TE", "FLEX", "DST", "K"]
     roster_str = ", ".join(
-        f"{ctx.starting_lineup[pos]} {pos}"
-        for pos in _slot_order
-        if ctx.starting_lineup.get(pos, 0) > 0
+        f"{lineup[pos]} {pos}" for pos in _slot_order if lineup.get(pos, 0) > 0
     )
-    if gaps:
-        gap_total = sum(gaps.values())
-        lines.append(f"## League's Configured Starting Roster Shape ({roster_str})")
+    lines.append(f"## League's Configured Starting Roster Shape ({roster_str})")
+    if skill_gaps:
+        skill_total = sum(skill_gaps.values())
         # Informational, not imperative — this is roster awareness, not an
         # instruction to fill these before a better value/upside pick. See
-        # the Task section and _SYSTEM_PROMPT below for the actual
+        # the Task section and the system prompt below for the actual
         # prioritization: value/upside first, gap-filling only escalates to
         # a hard priority once the URGENT line below appears.
-        lines.append(f"Open slots (not yet on your roster): {lineup_str}")
-        if gap_total >= rounds_remaining and rounds_remaining > 0:
+        lines.append(f"Open starting slots (not yet on your roster): {lineup_str}")
+        if skill_total >= skill_rounds_remaining:
             lines.append(
-                f"URGENT: {gap_total} required starting slot(s) still open with only "
-                f"{rounds_remaining} round(s) left — prioritize filling these over upside/"
-                f"value picks at positions you've already covered."
+                f"URGENT: {skill_total} required starting slot(s) still open with only "
+                f"{skill_rounds_remaining} usable round(s) left (of {rounds_remaining} "
+                f"total, {late_reserved} reserved for DST/K) — prioritize filling these "
+                f"over upside/value picks at positions you've already covered."
             )
-        lines.append("")
     else:
-        lines += [
-            f"## League's Configured Starting Roster Shape ({roster_str})",
-            "All required starting slots filled.",
-            "",
-        ]
+        lines.append("All required starting slots filled — every remaining pick is depth or upside.")
+
+    if late_gaps:
+        late_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(late_gaps.items()))
+        if rounds_remaining <= late_reserved:
+            lines.append(
+                f"Still owed (draft now — you are out of rounds to defer them): {late_str}."
+            )
+        else:
+            lines.append(
+                f"Still owed, but NOT yet: {late_str}. These are roster taxes with "
+                f"near-random weekly output and no supporting data in this app — do NOT "
+                f"recommend one until the final {late_reserved} round(s) of the draft "
+                f"(round {ctx.total_rounds - late_reserved + 1} onward). Spending an "
+                f"earlier pick here wastes a roster spot on a position that will still "
+                f"be freely available at the end."
+            )
+    lines.append("")
+
+    # Opportunity cost — the decisive section (see its own module comment).
+    # Placed immediately before the player list so the board gets read
+    # through it rather than as a flat ranking.
+    #
+    # The pick being advised on is my *next* turn, which is the current pick
+    # when I'm on the clock and a look-ahead when I'm not — either way it's
+    # my_next_pick_number, whose docstring covers both. The horizon is the
+    # turn after that, and the picks in between are the ones that can take a
+    # player away from me.
+    advised_pick = ctx.my_next_pick_number or ctx.pick_number
+    horizon = ctx.my_following_pick_number
+    picks_between = max(0, horizon - advised_pick - 1) if horizon else 0
+
+    for section in (
+        _format_survival_section(
+            ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between
+        ),
+        _format_positional_dropoff(ctx.top_available, horizon),
+    ):
+        if section:
+            lines.append(section)
 
     # Top available players, grouped into ADP tiers (cap at 25 to keep
     # prompt tight). Tiers, not a flat 1-25 rank — see _compute_adp_tiers'
@@ -764,7 +1166,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "Signals / Player News sections to choose among them, rather than the exact "
         "ADP decimal. A gap between tiers is more likely to reflect real drop-off."
     )
-    tiers = _compute_adp_tiers(ctx.top_available[:25])
+    tiers = _compute_adp_tiers(ctx.top_available[:_LISTED_PLAYERS])
     for i, tier in enumerate(tiers, start=1):
         adp_lo, adp_hi = tier[0]["adp"], tier[-1]["adp"]
         lines.append(f"\nTier {i} (ADP {adp_lo:g}-{adp_hi:g}):")
@@ -780,7 +1182,6 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # scarcity endpoint's own fix does — FLEX demand folded into both RB
     # and WR, since a flex is usually filled by one or the other.
     counts = ctx.available_counts
-    lineup = ctx.starting_lineup
     scarcity_starter_slots = {
         "QB": lineup.get("QB", 0),
         "RB": lineup.get("RB", 0) + lineup.get("FLEX", 0),
@@ -804,19 +1205,23 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "",
     ]
 
-    # Opponent rosters (position counts only — keeps prompt compact)
-    if ctx.opponent_position_counts:
-        lines.append("## Opponent Rosters (position counts per team)")
-        for slot, pos_counts in sorted(ctx.opponent_position_counts.items()):
-            if not pos_counts:
-                lines.append(f"  Slot {slot:>2}: [empty]")
-            else:
-                pos_str = ", ".join(f"{pos}: {n}" for pos, n in sorted(pos_counts.items()))
-                lines.append(f"  Slot {slot:>2}: {pos_str}")
-        lines.append("")
+    # Run risk — replaces the old full opponent-roster dump, which spent ~12
+    # lines describing teams that pick after me and therefore can't take
+    # anyone before my next turn. See _format_run_risk.
+    run_risk = _format_run_risk(
+        ctx.upcoming_pick_slots, ctx.opponent_position_counts, lineup
+    )
+    if run_risk:
+        lines.append(run_risk)
 
-    # Opportunity/performance signals (best-effort; omitted if no metrics at all)
-    metrics_section = _format_metrics_section(ctx.top_available, ctx.player_metrics, ctx.draft_profiles)
+    # Opportunity/performance signals (best-effort; omitted if no metrics at
+    # all). Scoped to the same slice shown in the tiers table: ctx.top_available
+    # now runs deeper than the displayed board (so the positional drop-off math
+    # can see replacement level), and rendering a metrics line for a player the
+    # model was never shown is pure prompt bloat.
+    metrics_section = _format_metrics_section(
+        ctx.top_available[:_LISTED_PLAYERS], ctx.player_metrics, ctx.draft_profiles
+    )
     if metrics_section:
         lines.append(metrics_section)
 
@@ -828,24 +1233,33 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # Output schema
     lines += [
         "## Task",
-        "Recommend the best pick for my team right now.",
-        "Weigh ADP as one input among several, not the deciding factor. The players list "
-        "is grouped into ADP tiers, not a strict 1-25 rank — treat same-tier players as "
-        "roughly interchangeable and use the Opportunity & Performance Signals section to "
-        "judge real usage and efficiency as the actual tiebreaker among them, rather than "
-        "the exact ADP decimal. Call out any candidate whose underlying opportunity looks "
-        "stronger than their tier suggests as a potential breakout. Use the Positional "
-        "Availability scarcity tiers to judge run risk — a CRITICAL/LOW position that fits "
-        "your team now is worth securing rather than waiting on. Use the roster shape "
-        "section above for awareness of which starting slots are still open, but don't let "
-        "that alone override a clearly better value/upside pick — the exception is when "
-        "that section includes an URGENT line, at which point rounds are genuinely running "
-        "out to complete a legal starting lineup, and filling the open slot(s) takes "
-        "priority.",
+        "Recommend the best pick for my team right now. Work through these steps in "
+        "order — each one narrows the field for the next:",
+        "",
+        "1. SHORTLIST. Take the top tier or two on the board. Same-tier players are "
+        "roughly interchangeable in ADP terms, so ignore the exact ADP decimal between "
+        "them; a gap *between* tiers is real drop-off and worth respecting.",
+        "2. SUBTRACT WHAT WILL KEEP. Remove anyone in the 'Very likely still on the "
+        "board at your next turn' bucket unless they are clearly, not marginally, "
+        "better than everyone in the GONE bucket. You can have them later; you cannot "
+        "have the GONE players later. This step decides most picks.",
+        "3. WEIGH THE COST OF WAITING. Use the Cost of Waiting table plus Run Risk. A "
+        "large drop-off at a position you still need to start, with several teams ahead "
+        "of you needing it too, is the strongest possible case for taking that position "
+        "now. A small drop-off means the position can wait and this pick belongs "
+        "elsewhere — say so in `strategy`.",
+        "4. BREAK REMAINING TIES ON EVIDENCE. Among what survives, use Opportunity & "
+        "Performance Signals (real usage, efficiency, consistency, durability) and "
+        "Player News. Call out any candidate whose underlying opportunity looks "
+        "stronger than their tier implies as a potential breakout. Never break a tie on "
+        "name recognition or last season's box score alone.",
+        "5. CHECK LEGALITY LAST. Confirm the pick doesn't leave you unable to field a "
+        "legal starting lineup — that only overrides steps 2-4 when the roster shape "
+        "section shows an URGENT line.",
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
-            "strategy": "<1 sentence: the shape of this roster and what this pick does about it>",
+            "strategy": "<1 sentence: what this pick does about the roster's shape, and what you are deliberately deferring to your next turn because it will still be there>",
             "confidence": "<high | medium | low — how clear-cut this call is>",
             "recommendation": {
                 "player_id": "<int from the tiers above>",
@@ -867,14 +1281,14 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                     "tradeoff": "<1 sentence: what you gain and give up by taking this instead of the main recommendation>",
                 }
             ],
-            "alerts": ["<any scarcity warnings, handcuff notes, tier drop-off flags, or breakout/value calls>"],
+            "alerts": ["<scarcity warnings, tier drop-off flags, breakout/value calls, or a note that a listed player will not survive to your next turn>"],
         }, indent=2),
         "",
         "Use `confidence: low` honestly — when the top few players are genuinely "
         "close, saying so is more useful than manufacturing a reason to separate "
         "them. `tradeoff` should be a real comparison against the main "
-        "recommendation (floor vs upside, positional need vs value, bye/stack "
-        "considerations), not a restatement of `reasoning`.",
+        "recommendation (floor vs upside, positional need vs value, survives-to-"
+        "your-next-turn vs doesn't), not a restatement of `reasoning`.",
         "",
         f"Return exactly {_MAX_ALTERNATIVES} alternatives whenever there are that "
         "many defensible options on the board — fewer only when there genuinely "
@@ -891,62 +1305,115 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     return "\n".join(lines)
 
 
-_SYSTEM_PROMPT = (
-    "You are an expert fantasy football draft advisor for a PPR Sleeper league. You give "
-    "concise, data-driven recommendations and draw on standard fantasy football draft "
-    "strategy: value-based drafting (the best player relative to positional replacement "
-    "level, not just the next recognizable name), taking on more boom/bust upside as the "
-    "draft moves past the first few rounds, and not overpaying for reputation or last "
-    "season's box score over a player's actual current opportunity. "
-    "ADP is one input, not the deciding one — weigh it alongside the Opportunity & "
-    "Performance Signals section (real usage, efficiency, and week-to-week consistency "
-    "from last season) and the Player News & Analysis section (current role and injury "
-    "context). A player whose underlying opportunity — targets, carries, red zone usage, "
-    "snap share — looks stronger than their ADP suggests is a potential breakout; call "
-    "that out explicitly in your reasoning or alerts rather than defaulting to the "
-    "safest name-brand pick. "
-    "A fantasy_points_avg is only as trustworthy as the sample it's computed over — a "
-    "player whose line is flagged '[SMALL SAMPLE — weigh this average with caution]' "
-    "missed enough of the season (often to injury) that their per-game average isn't "
-    "directly comparable to a healthy player's full-season average, even if the raw "
-    "number is higher. Weeks on injury report and games missed are real durability risk "
-    "for the season ahead, not footnotes — treat heavy injury-report presence or a "
-    "shortened season as a genuine reason for caution, and don't let a modest per-game "
-    "scoring edge from a small, injury-affected sample override a healthier, more "
-    "available player, especially one with a better ADP tier already. "
-    "The available-players list is grouped into ADP tiers rather than a strict rank — "
-    "a few points of ADP within the same tier is noise, not a meaningful signal, so "
-    "don't let it be the deciding factor between two same-tier players. Reach for the "
-    "Opportunity & Performance Signals and Player News sections as the real tiebreaker "
-    "instead. A gap between tiers is more likely to reflect genuine talent/value "
-    "drop-off and is worth taking seriously. Positional Availability also carries a "
-    "CRITICAL/LOW/OK scarcity tier per position — treat CRITICAL or LOW as a legitimate "
-    "reason to secure a position now against run risk, not just a number to note. "
-    "Favor long-term value and upside over reflexively filling a roster gap — a marginal "
-    "'need' edge is rarely worth passing on the better player, especially early in a "
-    "draft. Use the roster shape section to stay aware of which starting slots remain "
-    "open, but only let that override a better value/upside pick once that section "
-    "includes an URGENT line — at that point rounds are genuinely running out to "
-    "complete a legal starting lineup, and filling it takes priority. "
-    "Some players — especially rookies — will show 'No retrieved data' or 'No "
-    "prior-season metrics' in the sections above. That reflects a gap in available "
-    "statistics (no prior NFL season to compute from), not a judgment about the player. "
-    "Do not treat a missing data section as a reason to avoid a player. A rookie with no "
-    "NFL track record will often instead show draft capital (round/pick, college) in the "
-    "Opportunity & Performance Signals section — treat that as real signal, not a "
-    "consolation prize: early-round draft capital is one of the strongest predictors of a "
-    "rookie's eventual role, and a Day 1-2 pick landing in a favorable offense can be a "
-    "legitimate breakout call even with zero NFL stats yet. Weigh it alongside ADP and "
-    "whatever other context you have, the same as any other signal. "
-    "DST and K are not modeled by the Opportunity & Performance Signals section at all — "
-    "this app has no matchup, scheme, or opponent-strength data for any position. For "
-    "these two positions, ADP is the only grounded signal you actually have. Do not "
-    "reach for outside knowledge about which real-world defense or kicker is 'good' — "
-    "that would be exactly the kind of invented, ungrounded reasoning this system avoids "
-    "everywhere else. Defer to ADP order for DST/K unless the Player News & Analysis "
-    "section gives you something concrete to weigh against it. "
-    "You always respond with valid JSON and nothing else."
-)
+# Scoring-format-specific emphasis. The system prompt used to hardcode "a PPR
+# Sleeper league" regardless of ctx.scoring_format, so a half-PPR or standard
+# session got confidently PPR-shaped advice — pass-catching backs and slot
+# receivers overvalued by exactly the amount the scoring doesn't award.
+_SCORING_NOTES = {
+    "ppr": (
+        "Every reception is a point, so target volume is the most reliable "
+        "predictor of fantasy scoring: pass-catching backs, high-target slot "
+        "receivers, and target-hog tight ends are worth more than their raw "
+        "yardage suggests."
+    ),
+    "half_ppr": (
+        "Half a point per reception, so reception volume matters but less than "
+        "in full PPR — weigh targets alongside yardage and touchdown equity "
+        "rather than treating catch volume as decisive."
+    ),
+    "standard": (
+        "No points for receptions, so catch volume is worth far less than in "
+        "PPR — prioritize yardage and touchdown equity, and specifically do "
+        "not inflate pass-catching backs or high-volume, low-yardage slot "
+        "receivers the way PPR rankings do."
+    ),
+}
+
+
+def _build_system_prompt(scoring_format: str = "ppr") -> str:
+    """
+    The advisor's standing instructions.
+
+    Structured as an ordered set of rules with headers rather than the one
+    long paragraph this used to be. That's not cosmetic: the model on this
+    path is Haiku, which follows short, explicitly-scoped, numbered rules
+    considerably more reliably than a 600-word block of prose where every
+    constraint has equal visual weight and several ("weigh ADP as one input"
+    vs "defer to ADP order for DST/K") appear to contradict each other until
+    you notice they're scoped to different positions. Every rule below was
+    already present in that paragraph; the scoping is what's new.
+    """
+    scoring_note = _SCORING_NOTES.get(
+        scoring_format.lower().replace("-", "_"), _SCORING_NOTES["ppr"]
+    )
+
+    return (
+        f"You are an expert fantasy football draft advisor for a "
+        f"{scoring_format.upper()} Sleeper redraft league. You give concise, "
+        f"data-driven recommendations, and you always respond with valid JSON and "
+        f"nothing else.\n\n"
+
+        f"SCORING: {scoring_note}\n\n"
+
+        "RULE 1 — OPPORTUNITY COST DECIDES CLOSE CALLS. A draft pick's real cost is "
+        "the best player you won't get back. When two players are close, take the one "
+        "who will not survive to your next turn and plan to take the other one later. "
+        "The prompt tells you explicitly which players fall in each bucket and what "
+        "the drop-off at each position is if you wait; use those numbers rather than "
+        "estimating. Never spend a pick on a player labeled 'very likely still on the "
+        "board at your next turn' unless he is clearly — not marginally — better than "
+        "everything that's about to disappear.\n\n"
+
+        "RULE 2 — VALUE OVER NEED, UNTIL LEGALITY IS AT RISK. Draft the best player "
+        "relative to positional replacement level, not the next recognizable name and "
+        "not whichever slot happens to be empty. A marginal 'need' edge is rarely "
+        "worth passing on a better player. The one exception is an URGENT line in the "
+        "roster shape section: at that point you are genuinely running out of picks to "
+        "field a legal starting lineup, and filling those slots takes priority.\n\n"
+
+        "RULE 3 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
+        "Within a tier, ADP differences are noise and must not decide anything; break "
+        "those ties on Opportunity & Performance Signals (usage, efficiency, "
+        "consistency) and Player News. Between tiers, the gap is likely real drop-off "
+        "and deserves weight. A player whose underlying opportunity — targets, "
+        "carries, red zone touches, snap share — outstrips his tier is a breakout "
+        "candidate; say so explicitly rather than defaulting to the safest name.\n\n"
+
+        "RULE 4 — SAMPLES AND DURABILITY. A per-game average is only as good as the "
+        "sample behind it. A line flagged '[SMALL SAMPLE — weigh this average with "
+        "caution]' covers a shortened, often injury-affected season and is not "
+        "comparable to a healthy player's full-season average even when the number is "
+        "higher. Weeks on the injury report and games missed are live risk for the "
+        "season ahead, not footnotes. Do not let a modest per-game edge from a small, "
+        "injury-affected sample outweigh a healthier, more available player who "
+        "already has the better ADP tier.\n\n"
+
+        "RULE 5 — MISSING DATA IS NOT BAD DATA. Players showing 'No retrieved data' or "
+        "'No prior-season metrics' have no prior NFL season to compute from. That is a "
+        "coverage gap in this app, never evidence against the player, and must not be "
+        "the reason you pass on someone. Rookies frequently show draft capital "
+        "(round/pick, college) instead — treat that as genuine signal: early draft "
+        "capital is among the strongest predictors of a rookie's eventual role, and a "
+        "Day 1-2 pick in a favorable offense is a legitimate breakout call with zero "
+        "NFL snaps.\n\n"
+
+        "RULE 6 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
+        "scheme, or opponent-strength data for any position, so nothing grounds a "
+        "claim that one defense or kicker is better than another; ADP order is the "
+        "only signal you have for them. Never invent outside knowledge about which "
+        "real defense or kicker is 'good.' Do not recommend either position until the "
+        "prompt says you are inside the reserved final rounds — a DST or K taken "
+        "earlier costs you a skill player for a position that will still be freely "
+        "available at the end.\n\n"
+
+        "RULE 7 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
+        "trace to something in the prompt. You have no bye-week data, no depth-chart "
+        "narrative beyond what is shown, no 2026 projections, and no injury news past "
+        "what appears in Player News & Analysis — so do not reason about bye-week "
+        "conflicts, stacking, coaching changes, training-camp reports, or contract "
+        "situations. If the deciding factor genuinely isn't in the prompt, say the "
+        "call is close and set `confidence` to low."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1429,23 @@ def _clean_text(value) -> str:
     optional, so dropping a malformed one is strictly better than showing it.
     """
     return value.strip() if isinstance(value, str) else ""
+
+
+def _restore_prefill(raw: str) -> str:
+    """
+    Puts back the opening brace consumed by the prefilled assistant turn (see
+    AIService.recommend), which the model continues from rather than
+    re-emitting — so its text is a JSON object body with no `{` in front.
+
+    Conditional rather than an unconditional `"{" + raw` because the prefill
+    is a strong convention, not a guarantee: a model that re-emits the brace
+    anyway, or any future call path that drops the prefill, would otherwise
+    have a perfectly good response corrupted into `{{...` and thrown away for
+    the ADP fallback — turning a harmless model quirk into a lost
+    recommendation. Caught by test_non_text_first_block_is_skipped_not_crashed,
+    whose stub returns a complete object.
+    """
+    return raw if raw.lstrip().startswith("{") else "{" + raw
 
 
 def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResult | None:
@@ -1232,8 +1716,18 @@ class AIService:
             response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=_MAX_RESPONSE_TOKENS,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+                temperature=_TEMPERATURE,
+                system=_build_system_prompt(ctx.scoring_format),
+                messages=[
+                    {"role": "user", "content": prompt},
+                    # Prefilled assistant turn: the response is forced to begin
+                    # mid-JSON, so there is no room for a "Here's my pick:"
+                    # preamble or a ```json fence to wrap it. Both were real
+                    # parse failures, and a parse failure here doesn't degrade
+                    # the recommendation, it discards it for the ADP fallback.
+                    # Also saves a few output tokens per call.
+                    {"role": "assistant", "content": "{"},
+                ],
             )
 
             # A truncated response is invalid JSON, so it fails in
@@ -1261,7 +1755,7 @@ class AIService:
                 logger.warning("Falling back to ADP — Claude response had no text content.")
                 return _fallback(ctx, self._model)
 
-            result = _parse_response(raw, ctx)
+            result = _parse_response(_restore_prefill(raw), ctx)
 
             if result is None:
                 logger.warning("Falling back to ADP — could not parse Claude response.")
@@ -1284,7 +1778,7 @@ class AIService:
 # CLI — preview the exact prompt Claude would receive, without calling Claude
 # ---------------------------------------------------------------------------
 
-def _build_preview_context(top_n: int = 10) -> RecommendationContext:
+def _build_preview_context(top_n: int = 60) -> RecommendationContext:
     """
     Builds a RecommendationContext straight from the DB's top-available
     players — no live draft session needed. Only for main() below; the real
@@ -1306,9 +1800,16 @@ def _build_preview_context(top_n: int = 10) -> RecommendationContext:
         ]
         available_counts = repo.count_available_by_position(session)
 
+    # Slot 1 of a 12-team snake: picking at #1 means waiting until #24, with
+    # slots 2-12 then 12-2 in between. Hardcoded here (the real app derives
+    # it from DraftStateService) purely so the preview actually exercises the
+    # opportunity-cost and run-risk sections instead of silently omitting the
+    # ones most worth eyeballing.
     return RecommendationContext(
         pick_number=1, round_number=1, my_slot=1, league_size=12,
         is_my_turn=True, picks_until_my_turn=0, my_next_pick_number=1,
+        my_following_pick_number=24,
+        upcoming_pick_slots=list(range(2, 13)) + list(range(12, 1, -1)),
         top_available=top_available,
         available_counts=available_counts,
     )
@@ -1330,6 +1831,13 @@ def main() -> None:
     ctx = _build_preview_context()
     prompt = _build_prompt(ctx)
 
+    print("=" * 70)
+    print("SYSTEM PROMPT")
+    print("=" * 70)
+    print(_build_system_prompt(ctx.scoring_format))
+    print("\n" + "=" * 70)
+    print("USER PROMPT")
+    print("=" * 70)
     print(prompt)
     print("\n" + "=" * 70)
     if "## Player News & Analysis (retrieved)" in prompt:
