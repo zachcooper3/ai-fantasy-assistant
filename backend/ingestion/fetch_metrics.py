@@ -213,6 +213,14 @@ def _fantasy_points_ppr(row: dict) -> float:
     return sum(_num(row, stat) * weight for stat, weight in _PPR_WEIGHTS.items())
 
 
+# Minimum season air-yard total before RACR is computed at all. Below this
+# the denominator is either negative (RB screen/checkdown usage) or so small
+# that the ratio is dominated by rounding — see the comment at the "racr" key
+# below. 50 yards is roughly a handful of downfield targets; anyone with a
+# genuine receiving role clears it easily.
+_MIN_AIR_YARDS_FOR_RACR = 50.0
+
+
 def _compute_opportunity_efficiency(weeks: list[dict]) -> dict:
     games = len(weeks)
     if games == 0:
@@ -238,7 +246,25 @@ def _compute_opportunity_efficiency(weeks: list[dict]) -> dict:
         "yards_per_target": (sum_rec_yards / sum_targets) if sum_targets else None,
         "yards_per_carry": (sum(rush_yards) / sum_carries) if sum_carries else None,
         "yac_per_reception": (sum(yac) / sum(receptions)) if sum(receptions) else None,
-        "racr": (sum_rec_yards / sum_air_yards) if sum_air_yards else None,
+        # RACR (receiving yards / air yards) is a WR/TE metric and is
+        # undefined for players whose targets come at or behind the line of
+        # scrimmage. Running backs catch screens, checkdowns and dumpoffs,
+        # whose depth of target is negative, so their season air-yard total
+        # is often negative or a handful of yards — which turned this
+        # division into nonsense for 50 of 57 RBs in the DB (TreVeyon
+        # Henderson: 221 receiving yards on -1.0 air yards = RACR -221).
+        #
+        # The old guard only rejected exactly 0. Requiring a meaningful
+        # positive denominator rejects both the negative case and the
+        # tiny-denominator case, where a 1-yard air total inflates RACR by
+        # two orders of magnitude. None means "not a meaningful stat for
+        # this player," which the prompt already renders as absence rather
+        # than as zero.
+        "racr": (
+            (sum_rec_yards / sum_air_yards)
+            if sum_air_yards >= _MIN_AIR_YARDS_FOR_RACR
+            else None
+        ),
         "catch_rate": (sum(receptions) / sum_targets) if sum_targets else None,
         "target_share": (sum_targets / sum(team_targets)) if sum(team_targets) else None,
         "carry_share": (sum_carries / sum(team_carries)) if sum(team_carries) else None,

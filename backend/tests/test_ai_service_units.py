@@ -18,6 +18,8 @@ from backend.app.services.ai_service import (
     _experience_context,
     _format_metrics_section,
     _infer_current_season,
+    _is_trustworthy,
+    _format_metrics_line,
     _format_positional_dropoff,
     _format_run_risk,
     _restore_prefill,
@@ -558,3 +560,82 @@ def test_system_prompt_tells_the_model_what_the_tag_means():
     sp = _build_system_prompt("ppr")
     assert "ASCENDING" in sp
     assert "floor" in sp
+
+
+# ---------------------------------------------------------------------------
+# Rate-stat trust gates
+#
+# Live finding (2026-08-04): 50 of 57 RBs carried a nonsense RACR because
+# their season air-yard total is negative (screens/checkdowns are targeted
+# behind the line of scrimmage), plus a long tail of rates computed over
+# denominators of 1-2 attempts. All of it reached the prompt as real
+# efficiency signal. Guarded in ingestion AND at render — the DB on disk
+# still holds the bad values.
+# ---------------------------------------------------------------------------
+
+def _rb(**over):
+    m = {"season": 2025, "games_played": 16, "targets_per_game": 3.0,
+         "carries_per_game": 13.9, "fantasy_points_avg": 14.3}
+    m.update(over)
+    return m
+
+
+def test_negative_racr_is_suppressed():
+    # D'Andre Swift: 299 receiving yards on -25 air yards.
+    assert not _is_trustworthy("racr", -11.96, _rb())
+    assert "RACR" not in (_format_metrics_line(_rb(racr=-11.96)) or "")
+
+
+def test_wildly_inflated_racr_is_suppressed():
+    # Tiny positive denominator: 86 receiving yards on 1.0 air yards.
+    assert not _is_trustworthy("racr", 86.0, _rb())
+
+
+def test_legitimate_receiver_racr_survives():
+    wr = {"season": 2025, "games_played": 14, "targets_per_game": 5.6}
+    assert _is_trustworthy("racr", 0.56, wr)
+    assert "RACR 0.56" in _format_metrics_line({**wr, "racr": 0.56})
+
+
+def test_rate_over_a_trivial_denominator_is_suppressed():
+    # Mahomes: "catch rate 100%" on roughly one target all season.
+    qb = {"season": 2025, "games_played": 14, "targets_per_game": 0.1,
+          "carries_per_game": 4.6}
+    assert not _is_trustworthy("catch_rate", 1.0, qb)
+    assert "catch rate" not in (_format_metrics_line({**qb, "catch_rate": 1.0}) or "")
+
+
+def test_rushing_rate_suppressed_for_a_receiver_with_two_carries():
+    # Jordan Addison: "Y/carry 40.5" on ~2 end-arounds.
+    wr = {"season": 2025, "games_played": 14, "targets_per_game": 5.6,
+          "carries_per_game": 0.1}
+    assert not _is_trustworthy("yards_per_carry", 40.5, wr)
+
+
+def test_rushing_rate_survives_for_an_actual_running_back():
+    assert _is_trustworthy("yards_per_carry", 4.9, _rb())
+    assert "Y/carry 4.9" in _format_metrics_line(_rb(yards_per_carry=4.9))
+
+
+def test_volume_stats_are_never_gated_by_the_rate_thresholds():
+    # The gate applies to per-attempt RATES. The attempt counts themselves
+    # are the evidence you most need when volume is low.
+    low = {"season": 2025, "games_played": 16, "targets_per_game": 0.1,
+           "carries_per_game": 0.1}
+    assert _is_trustworthy("targets_per_game", 0.1, low)
+    assert _is_trustworthy("carries_per_game", 0.1, low)
+    assert _is_trustworthy("fantasy_points_avg", 5.0, low)
+
+
+def test_impossible_percentages_are_rejected_regardless_of_volume():
+    heavy = {"season": 2025, "games_played": 17, "targets_per_game": 9.0}
+    assert not _is_trustworthy("catch_rate", 1.4, heavy)
+    assert not _is_trustworthy("snap_pct", -0.2, heavy)
+
+
+def test_missing_games_played_does_not_suppress_everything():
+    # Without games_played there's no denominator to reconstruct; fall back
+    # to sanity bounds only rather than hiding the whole line.
+    m = {"season": 2025, "targets_per_game": 5.0}
+    assert _is_trustworthy("catch_rate", 0.62, m)
+    assert not _is_trustworthy("racr", -3.0, m)

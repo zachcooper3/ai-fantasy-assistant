@@ -812,6 +812,79 @@ _TREND_FIELDS: list[tuple[str, str, str]] = [
     ("depth chart Δ (neg=moving up)", "depth_chart_trend", "{:+d}"),
 ]
 
+# ---------------------------------------------------------------------------
+# Rate-stat trust gates
+#
+# A rate is only as meaningful as the denominator it was divided by, and the
+# DB is full of rates computed over denominators of 1 or 2: "catch rate 100%"
+# for a QB targeted once, "Y/carry 40.5" for a WR with two end-arounds,
+# "RACR -221.00" for a back with -1.0 season air yards. Every one of these
+# reached the prompt as though it were a real efficiency signal.
+#
+# This is a *display* guard, deliberately duplicated with the ingestion fix in
+# fetch_metrics.py rather than replacing it. The DB already on disk holds the
+# bad values, re-running ingestion is a separate manual step, and draft day is
+# not when you want to discover you skipped it. Ingestion stops writing them;
+# this stops showing them regardless of what's stored.
+# ---------------------------------------------------------------------------
+
+# Attempts required before a per-attempt rate is worth showing at all.
+_MIN_TARGETS_FOR_RECEIVING_RATES = 20
+_MIN_CARRIES_FOR_RUSHING_RATES = 20
+
+_RECEIVING_RATE_FIELDS = {
+    "yards_per_target", "yac_per_reception", "racr", "catch_rate", "target_share",
+}
+_RUSHING_RATE_FIELDS = {"yards_per_carry", "carry_share"}
+
+# Backstop for values that clear the volume gate but still can't be right —
+# a real stat outside these bounds is a computation error, not a remarkable
+# player. D'Andre Swift had 48 targets (well past the gate) and RACR -11.96.
+# Ranges are deliberately generous; the goal is catching broken math, not
+# second-guessing unusual seasons.
+_METRIC_SANITY_BOUNDS: dict[str, tuple[float, float]] = {
+    "racr": (0.2, 3.0),
+    "catch_rate": (0.0, 1.0),
+    "target_share": (0.0, 1.0),
+    "carry_share": (0.0, 1.0),
+    "snap_pct": (0.0, 1.0),
+    "team_pass_rate": (0.0, 1.0),
+    "yards_per_target": (0.0, 25.0),
+    "yards_per_carry": (0.0, 12.0),
+    "yac_per_reception": (0.0, 20.0),
+}
+
+
+def _is_trustworthy(key: str, value, m: dict) -> bool:
+    """
+    Whether a metric should be shown at all, given how much volume it was
+    computed over and whether the result is physically plausible.
+
+    Attempt totals are reconstructed from the per-game rate times games
+    played — PlayerMetrics stores rates, not raw season totals, so this is
+    the only denominator available. It's approximate, which is fine: the
+    distinction being drawn is "2 carries" versus "200," not 19 versus 21.
+    """
+    bounds = _METRIC_SANITY_BOUNDS.get(key)
+    if bounds is not None:
+        try:
+            if not (bounds[0] <= float(value) <= bounds[1]):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    games = m.get("games_played") or 0
+    if not games:
+        return True
+
+    if key in _RECEIVING_RATE_FIELDS:
+        approx = (m.get("targets_per_game") or 0) * games
+        return approx >= _MIN_TARGETS_FOR_RECEIVING_RATES
+    if key in _RUSHING_RATE_FIELDS:
+        approx = (m.get("carries_per_game") or 0) * games
+        return approx >= _MIN_CARRIES_FOR_RUSHING_RATES
+    return True
+
 # Below this many games played (out of a 17-game season), a fantasy_points_avg
 # is computed over a meaningfully shortened sample — often because of injury
 # — and shouldn't be read as equivalent to a full-season average. Flagged
@@ -836,7 +909,11 @@ def _format_metrics_line(m: dict) -> str | None:
     parts = [
         f"{label} {fmt.format(m[key])}"
         for label, key, fmt in _METRIC_FIELDS
-        if m.get(key) is not None and not (key in _SUPPRESS_ZERO and m[key] == 0)
+        if m.get(key) is not None
+        and not (key in _SUPPRESS_ZERO and m[key] == 0)
+        # Drops rates computed over a denominator too small to mean anything,
+        # plus anything physically impossible. See _is_trustworthy.
+        and _is_trustworthy(key, m[key], m)
     ]
 
     if m.get("fantasy_points_avg") is not None:
