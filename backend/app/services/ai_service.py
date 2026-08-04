@@ -278,6 +278,149 @@ def _compute_roster_gaps(
     return _gaps_from_counts(have, lineup)
 
 
+# ---------------------------------------------------------------------------
+# Roster depth — what you can start in a week, versus what you actually hold
+#
+# Starting-lineup gaps model LEGALITY: can I field a valid lineup at all.
+# That is a genuinely different question from roster construction, and
+# conflating the two produced a confirmed live failure. In a 15-round draft
+# that opened RB-RB, the gap logic marked RB satisfied from round 3 onward
+# (2 held >= 2 required) and never mentioned it again; from round 8 the
+# section printed "All required starting slots filled" for eight straight
+# picks. The draft ended RB4/WR7 — four bench receivers at a position whose
+# late-round replacements are nearly free, and no cover at all at the
+# position where they aren't.
+#
+# The fix isn't a hardcoded "draft 5 RBs" heuristic. It's reporting the
+# quantity the gap logic silently discards: how many of a position you can
+# start in a single week (base slot plus FLEX) against how many you hold.
+# Zero cover at RB means one injury or bye forces a replacement whose cost
+# is quantified live in the Cost of Waiting section.
+# ---------------------------------------------------------------------------
+
+# Positions a FLEX realistically absorbs. Deliberately excludes TE even
+# though a TE is flex-eligible: counting TE as 2-startable would flag every
+# roster as short a tight end, which is not how anyone plays. Matches the
+# FLEX handling in the Positional Availability scarcity block, so the two
+# sections can't disagree about how many RBs a team can start.
+_FLEX_ABSORBS = ("RB", "WR")
+
+
+def _compute_roster_depth(
+    my_roster: list[dict],
+    lineup: dict[str, int],
+) -> dict[str, dict[str, int]]:
+    """
+    Returns {position: {"hold", "max_starts", "cover"}} for the skill
+    positions, where max_starts is how many could appear in one week's
+    lineup (base slot + FLEX for RB/WR) and cover is the surplus beyond it.
+
+    cover == 0 means a legal lineup today and no answer to an injury, a bye,
+    or a bust. cover < 0 means you cannot even fill a FLEX-heavy week from
+    this position. Both are invisible to _compute_roster_gaps, which reports
+    nothing at all once the base requirement is met.
+    """
+    have: dict[str, int] = {}
+    for p in my_roster:
+        have[p["position"]] = have.get(p["position"], 0) + 1
+
+    flex = lineup.get("FLEX", 0)
+    depth: dict[str, dict[str, int]] = {}
+    for pos in ("QB", "RB", "WR", "TE"):
+        base = lineup.get(pos, 0)
+        if base == 0 and not have.get(pos):
+            continue
+        max_starts = base + (flex if pos in _FLEX_ABSORBS else 0)
+        hold = have.get(pos, 0)
+        depth[pos] = {
+            "hold": hold,
+            "base": base,
+            "max_starts": max_starts,
+            "cover": hold - max_starts,
+            # Whether the base starting requirement is met at all. Positions
+            # that fail it are NOT depth problems — they're unfilled starting
+            # slots, already reported by the gap section above. Without this
+            # distinction the depth callout fires on every position for the
+            # first several rounds ("zero cover at QB, RB, WR, TE" after two
+            # picks), which is true, useless, and drowns the one position
+            # that genuinely is a depth problem.
+            "base_met": hold >= base,
+        }
+    return depth
+
+
+def _format_roster_depth_section(
+    depth: dict[str, dict[str, int]],
+    spots_left: int,
+) -> str:
+    """
+    The roster table plus an explicit read on which positions have no cover.
+
+    Exists to replace a dead end: once every base slot was filled the prompt
+    said "All required starting slots filled — every remaining pick is depth
+    or upside," which is the emptiest possible instruction at exactly the
+    point in a draft where roster construction is the whole decision.
+    """
+    if not depth:
+        return ""
+
+    lines = [
+        "## Roster Construction (what you hold vs. what you can start in one week)",
+        f"  {'pos':<5}{'hold':>6}{'max starts':>12}{'cover':>7}",
+    ]
+    # Two severities, deliberately kept apart. "Short" means you own the
+    # minimum but fewer than you can actually field in a FLEX-heavy week —
+    # the exact state that let a draft run RB2 from round 3 to round 11 with
+    # the prompt calling it satisfied. "Thin" means exactly enough for a
+    # normal week and nothing spare. Only positions whose base requirement is
+    # already met can be either; the rest are starting-slot gaps, reported
+    # above, and repeating them here would bury the real signal.
+    short: list[str] = []
+    thin: list[str] = []
+    surplus: list[str] = []
+    for pos in ("QB", "RB", "WR", "TE"):
+        d = depth.get(pos)
+        if d is None:
+            continue
+        note = ""
+        if not d["base_met"]:
+            note = "  <-- starting slot still unfilled (see above)"
+        elif d["cover"] < 0:
+            note = f"  <-- SHORT: can start {d['max_starts']} in a FLEX-heavy week, hold {d['hold']}"
+            short.append(pos)
+        elif d["cover"] == 0:
+            note = "  <-- thin: no cover for an injury, bye, or bust"
+            thin.append(pos)
+        elif d["cover"] >= 3:
+            surplus.append(pos)
+        lines.append(
+            f"  {pos:<5}{d['hold']:>6}{d['max_starts']:>12}{d['cover']:>+7}{note}"
+        )
+
+    lines.append(f"Roster spots left to fill after this pick: {max(0, spots_left - 1)}.")
+
+    if short:
+        lines.append(
+            f"SHORT at {', '.join(short)} — you hold fewer than you can start in a "
+            f"single week, so a FLEX-heavy week or one injury already forces a "
+            f"replacement. Meeting the base requirement at these positions did not "
+            f"make them safe. Check the Cost of Waiting figures for what that "
+            f"replacement actually costs you in points."
+        )
+    if thin:
+        lines.append(
+            f"No cover at {', '.join(thin)} — enough for a normal week, nothing spare."
+        )
+    if surplus:
+        lines.append(
+            f"Already deep at {', '.join(surplus)} — at least three more than you can "
+            f"start in any single week. Another one upgrades only your bench, and only "
+            f"if he beats the players already on it."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _full_lineup(lineup: dict[str, int]) -> dict[str, int]:
     """
     The configured lineup plus the kicker DraftConfig doesn't model — see
@@ -483,9 +626,19 @@ def _format_survival_section(
     return "\n".join(lines)
 
 
+def _ppg(player_metrics: dict[int, dict], player: dict) -> float | None:
+    """Prior-season PPR points per game, or None. Points are the unit every
+    roster decision is ultimately denominated in; ADP is only a proxy for
+    them, and "46 ADP points of drop-off" is not a quantity anyone can
+    weigh against a roster hole."""
+    m = player_metrics.get(player["id"]) if player_metrics else None
+    return m.get("fantasy_points_avg") if m else None
+
+
 def _format_positional_dropoff(
     board: list[dict],
     horizon_pick: int | None,
+    player_metrics: dict[int, dict] | None = None,
     positions: tuple[str, ...] = ("QB", "RB", "WR", "TE"),
 ) -> str:
     """
@@ -533,10 +686,22 @@ def _format_positional_dropoff(
             )
         else:
             gap = survivor["adp"] - best["adp"]
+            # Points where they're known, ADP only as the fallback — a
+            # drop-off stated in prior-season PPR ppg is directly comparable
+            # to what a roster hole costs, which "46 ADP points" is not.
+            best_ppg = _ppg(player_metrics or {}, best)
+            surv_ppg = _ppg(player_metrics or {}, survivor)
+            if best_ppg is not None and surv_ppg is not None:
+                cost = (
+                    f"Cost of waiting: {best_ppg - surv_ppg:+.1f} PPR ppg "
+                    f"({best_ppg:.1f} -> {surv_ppg:.1f}), {gap:.0f} ADP points"
+                )
+            else:
+                cost = f"Cost of waiting: {gap:.0f} ADP points at the position"
             lines.append(
                 f"- {pos}: best available {best['name']} (ADP {best['adp']:g}); best "
                 f"likely to survive to your next turn is {survivor['name']} (ADP "
-                f"{survivor['adp']:g}). Cost of waiting: {gap:.0f} ADP points at the position."
+                f"{survivor['adp']:g}). {cost}."
             )
 
     if not lines:
@@ -1284,7 +1449,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                 f"over upside/value picks at positions you've already covered."
             )
     else:
-        lines.append("All required starting slots filled — every remaining pick is depth or upside.")
+        # Note the absence of a "you're done" line here. The depth table
+        # immediately below carries the real content from this point on; the
+        # old "every remaining pick is depth or upside" wording ended the
+        # section on a shrug for the entire back half of the draft.
+        lines.append("All base starting slots filled — see roster construction below.")
 
     if late_gaps:
         late_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(late_gaps.items()))
@@ -1317,10 +1486,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     picks_between = max(0, horizon - advised_pick - 1) if horizon else 0
 
     for section in (
+        _format_roster_depth_section(
+            _compute_roster_depth(ctx.my_roster, lineup), spots_left
+        ),
         _format_survival_section(
             ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between
         ),
-        _format_positional_dropoff(ctx.top_available, horizon),
+        _format_positional_dropoff(ctx.top_available, horizon, ctx.player_metrics),
     ):
         if section:
             lines.append(section)
@@ -1413,11 +1585,12 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "board at your next turn' bucket unless they are clearly, not marginally, "
         "better than everyone in the GONE bucket. You can have them later; you cannot "
         "have the GONE players later. This step decides most picks.",
-        "3. WEIGH THE COST OF WAITING. Use the Cost of Waiting table plus Run Risk. A "
-        "large drop-off at a position you still need to start, with several teams ahead "
-        "of you needing it too, is the strongest possible case for taking that position "
-        "now. A small drop-off means the position can wait and this pick belongs "
-        "elsewhere — say so in `strategy`.",
+        "3. WEIGH THE COST OF WAITING AGAINST YOUR ROSTER. Use the Cost of Waiting "
+        "table, Run Risk, and the Roster Construction table together. A large drop-off "
+        "at a position you still need to start — or at one sitting at zero cover — "
+        "with several teams ahead of you needing it too, is the strongest possible "
+        "case for taking that position now. A small drop-off, or a position you are "
+        "already deep at, means this pick belongs elsewhere. Say which in `strategy`.",
         "4. BREAK REMAINING TIES ON EVIDENCE. Among what survives, use Opportunity & "
         "Performance Signals (real usage, efficiency, consistency, durability) and "
         "Player News. Call out any candidate whose underlying opportunity looks "
@@ -1425,7 +1598,8 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "name recognition or last season's box score alone.",
         "5. CHECK LEGALITY LAST. Confirm the pick doesn't leave you unable to field a "
         "legal starting lineup — that only overrides steps 2-4 when the roster shape "
-        "section shows an URGENT line.",
+        "section shows an URGENT line. Filling every base slot is not a finished "
+        "roster; do not call a position secure just because its minimum is met.",
         "",
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
@@ -1537,11 +1711,25 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "RULE 2 — VALUE OVER NEED, UNTIL LEGALITY IS AT RISK. Draft the best player "
         "relative to positional replacement level, not the next recognizable name and "
         "not whichever slot happens to be empty. A marginal 'need' edge is rarely "
-        "worth passing on a better player. The one exception is an URGENT line in the "
-        "roster shape section: at that point you are genuinely running out of picks to "
-        "field a legal starting lineup, and filling those slots takes priority.\n\n"
+        "worth passing on a better player, ESPECIALLY in the early rounds. Two things "
+        "outrank that: an URGENT line in the roster shape section, meaning you are "
+        "running out of picks to field a legal lineup at all, and the depth reasoning "
+        "in RULE 3 once the base slots are filled.\n\n"
 
-        "RULE 3 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
+        "RULE 3 — A LEGAL LINEUP IS NOT A COMPLETE ROSTER. Filling every starting "
+        "slot is the floor, not the goal. The Roster Construction table shows how many "
+        "of each position you can start in a single week against how many you hold; a "
+        "position at zero cover has no answer to an injury, a bye, or a bust, and you "
+        "will need one over a full season. Once the base slots are filled, judge each "
+        "remaining pick by how many points it protects or adds, using the Cost of "
+        "Waiting figures — a position whose replacement level falls off steeply "
+        "deserves a bench spot well before a position where the 6th-best available is "
+        "nearly as good as the 3rd. Adding a fourth bench player at a position you are "
+        "already deep at, while another position sits at zero cover, is the most common "
+        "way to lose a draft you were winning. Never describe a position as secure "
+        "merely because its base requirement is met.\n\n"
+
+        "RULE 4 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
         "Within a tier, ADP differences are noise and must not decide anything; break "
         "those ties on Opportunity & Performance Signals (usage, efficiency, "
         "consistency) and Player News. Between tiers, the gap is likely real drop-off "
@@ -1549,7 +1737,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "carries, red zone touches, snap share — outstrips his tier is a breakout "
         "candidate; say so explicitly rather than defaulting to the safest name.\n\n"
 
-        "RULE 4 — SAMPLES AND DURABILITY. A per-game average is only as good as the "
+        "RULE 5 — SAMPLES AND DURABILITY. A per-game average is only as good as the "
         "sample behind it. A line flagged '[SMALL SAMPLE — weigh this average with "
         "caution]' covers a shortened, often injury-affected season and is not "
         "comparable to a healthy player's full-season average even when the number is "
@@ -1558,7 +1746,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "injury-affected sample outweigh a healthier, more available player who "
         "already has the better ADP tier.\n\n"
 
-        "RULE 5 — MISSING DATA IS NOT BAD DATA. Players showing 'No retrieved data' or "
+        "RULE 6 — MISSING DATA IS NOT BAD DATA. Players showing 'No retrieved data' or "
         "'No prior-season metrics' have no prior NFL season to compute from. That is a "
         "coverage gap in this app, never evidence against the player, and must not be "
         "the reason you pass on someone. Rookies frequently show draft capital "
@@ -1567,7 +1755,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "Day 1-2 pick in a favorable offense is a legitimate breakout call with zero "
         "NFL snaps.\n\n"
 
-        "RULE 6 — YOUNG PLAYERS ARE ASCENDING; TREAT THEIR NUMBERS AS A FLOOR. Some "
+        "RULE 7 — YOUNG PLAYERS ARE ASCENDING; TREAT THEIR NUMBERS AS A FLOOR. Some "
         "stat lines are tagged with the player's NFL season and draft capital, e.g. "
         "'2nd NFL season, 1st-round pick (#19 overall)'. That tag changes what the "
         "numbers mean. A first- or second-year player's per-game average was produced "
@@ -1580,7 +1768,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "— the market is pricing in growth you can see the reason for right in the "
         "tag.\n\n"
 
-        "RULE 7 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
+        "RULE 8 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
         "scheme, or opponent-strength data for any position, so nothing grounds a "
         "claim that one defense or kicker is better than another; ADP order is the "
         "only signal you have for them. Never invent outside knowledge about which "
@@ -1589,7 +1777,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "earlier costs you a skill player for a position that will still be freely "
         "available at the end.\n\n"
 
-        "RULE 8 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
+        "RULE 9 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
         "trace to something in the prompt. You have no bye-week data, no depth-chart "
         "narrative beyond what is shown, no 2026 projections, and no injury news past "
         "what appears in Player News & Analysis — so do not reason about bye-week "

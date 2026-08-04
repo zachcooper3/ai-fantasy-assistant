@@ -18,6 +18,8 @@ from backend.app.services.ai_service import (
     _experience_context,
     _format_metrics_section,
     _infer_current_season,
+    _compute_roster_depth,
+    _format_roster_depth_section,
     _is_trustworthy,
     _format_metrics_line,
     _format_positional_dropoff,
@@ -639,3 +641,114 @@ def test_missing_games_played_does_not_suppress_everything():
     m = {"season": 2025, "targets_per_game": 5.0}
     assert _is_trustworthy("catch_rate", 0.62, m)
     assert not _is_trustworthy("racr", -3.0, m)
+
+
+# ---------------------------------------------------------------------------
+# Roster construction / depth
+#
+# Live failure (2026-08-04 draft review): a 15-round draft opened RB-RB, and
+# from round 3 the gap logic reported RB satisfied (2 held >= 2 required) and
+# never mentioned it again; from round 8 the section read "All required
+# starting slots filled" for eight straight picks. Final roster: RB4/WR7.
+# Legality was met the whole time — that was never the question.
+# ---------------------------------------------------------------------------
+
+_PPR_LINEUP = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1, "K": 1}
+
+
+def test_two_backs_read_as_short_not_satisfied():
+    # THE regression. 2 RB meets the base requirement but you can start 3 in
+    # a FLEX week, so the position is not covered and must not read as done.
+    depth = _compute_roster_depth(roster("RB", "RB"), _PPR_LINEUP)
+    assert depth["RB"]["base_met"] is True
+    assert depth["RB"]["max_starts"] == 3
+    assert depth["RB"]["cover"] == -1
+    out = _format_roster_depth_section(depth, spots_left=13)
+    assert "SHORT at RB" in out
+
+
+def test_flex_inflates_rb_and_wr_but_not_te():
+    depth = _compute_roster_depth(roster("RB", "WR", "TE", "QB"), _PPR_LINEUP)
+    assert depth["RB"]["max_starts"] == 3      # 2 + FLEX
+    assert depth["WR"]["max_starts"] == 3      # 2 + FLEX
+    # TE is flex-eligible in the rules but nobody starts two; counting it
+    # that way would flag every roster as short a tight end.
+    assert depth["TE"]["max_starts"] == 1
+    assert depth["QB"]["max_starts"] == 1
+
+
+def test_unfilled_starting_slots_are_not_reported_as_depth_problems():
+    # After two picks everything is technically "uncovered". Saying so for
+    # all four positions is true, useless, and buries the one position that
+    # is genuinely a depth problem.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("RB", "RB"), _PPR_LINEUP), spots_left=13
+    )
+    assert "SHORT at RB" in out
+    for pos in ("WR", "TE", "QB"):
+        assert f"SHORT at {pos}" not in out
+    assert "starting slot still unfilled" in out  # flagged, but deferred upward
+
+
+def test_exactly_enough_reads_as_thin_not_short():
+    depth = _compute_roster_depth(
+        roster("QB", "RB", "RB", "RB", "WR", "WR", "WR", "TE"), _PPR_LINEUP)
+    assert depth["RB"]["cover"] == 0
+    out = _format_roster_depth_section(depth, spots_left=7)
+    assert "SHORT" not in out
+    assert "No cover at" in out and "TE" in out
+
+
+def test_surplus_position_is_called_out():
+    # The other half of the live failure: seven receivers for three slots.
+    depth = _compute_roster_depth(roster(*(["WR"] * 7), "RB", "RB"), _PPR_LINEUP)
+    assert depth["WR"]["cover"] == 4
+    out = _format_roster_depth_section(depth, spots_left=6)
+    assert "Already deep at WR" in out
+    assert "SHORT at RB" in out  # both signals present simultaneously
+
+
+def test_the_replayed_draft_flags_rb_at_every_pick_it_was_missed():
+    # Rounds 3, 6 and 9 of the real draft all took a WR while sitting on two
+    # backs. Each must now say so.
+    seq = ["RB", "RB", "WR", "WR", "TE", "WR", "QB", "WR"]
+    for through in (2, 5, 8):
+        depth = _compute_roster_depth(roster(*seq[:through]), _PPR_LINEUP)
+        out = _format_roster_depth_section(depth, spots_left=15 - through)
+        assert "SHORT at RB" in out, f"missed at pick {through + 1}"
+
+
+def test_depth_section_appears_in_the_built_prompt():
+    ctx = ctx_with_available(1, 2, 3)
+    ctx.my_roster = roster("RB", "RB", "WR", "WR", "TE", "WR", "QB")
+    prompt = _build_prompt(ctx)
+    assert "Roster Construction" in prompt
+    assert "SHORT at RB" in prompt
+    # The old dead-end wording must be gone — it ended the section on a shrug
+    # for the entire back half of the draft.
+    assert "every remaining pick is depth or upside" not in prompt
+
+
+def test_cost_of_waiting_prefers_points_over_adp_when_known():
+    board = [{"id": 1, "rank": 1, "name": "Now RB", "position": "RB",
+              "team": "X", "adp": 30.0, "sleeper_id": None},
+             {"id": 2, "rank": 2, "name": "Later RB", "position": "RB",
+              "team": "X", "adp": 95.0, "sleeper_id": None}]
+    metrics = {1: {"fantasy_points_avg": 15.2}, 2: {"fantasy_points_avg": 11.1}}
+    out = _format_positional_dropoff(board, horizon_pick=70, player_metrics=metrics)
+    assert "PPR ppg" in out and "15.2 -> 11.1" in out
+
+
+def test_cost_of_waiting_falls_back_to_adp_without_metrics():
+    board = [{"id": 1, "rank": 1, "name": "Now RB", "position": "RB",
+              "team": "X", "adp": 30.0, "sleeper_id": None},
+             {"id": 2, "rank": 2, "name": "Later RB", "position": "RB",
+              "team": "X", "adp": 95.0, "sleeper_id": None}]
+    out = _format_positional_dropoff(board, horizon_pick=70, player_metrics={})
+    assert "ADP points" in out and "PPR ppg" not in out
+
+
+def test_system_prompt_forbids_calling_a_base_filled_position_secure():
+    sp = _build_system_prompt("ppr")
+    assert "A LEGAL LINEUP IS NOT A COMPLETE ROSTER" in sp
+    assert "zero cover" in sp
