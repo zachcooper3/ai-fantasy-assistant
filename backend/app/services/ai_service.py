@@ -2171,6 +2171,118 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
 # Response parser
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dominated-pick guard
+#
+# "Dominated" in the decision-theory sense: player X dominates Y if X is at
+# least as good on every axis and better on at least one. Here, restricted to
+# ADP and VOR, and to players at the SAME position.
+#
+# Same-position only, deliberately. Across positions, taking a "worse" player
+# is routinely correct — you need a tight end and the dominating player is a
+# receiver you're already deep at — so a cross-position check fires constantly
+# and degrades into the same noise the first roster-imbalance flag did. Within
+# a position, roster need cannot explain the gap: if a receiver has both the
+# better market price and the higher value over replacement, and you took the
+# other receiver, that wants a reason.
+#
+# This is what happened live at pick 17: Rashee Rice (ADP 11.5, VOR +6.9) sat
+# on the board while the model took George Pickens (ADP 21.3, VOR +5.3) and
+# claimed Pickens' efficiency was superior, which was false on every metric
+# shown.
+#
+# ADVISORY ONLY. It never blocks, never rewrites the pick, and never sends
+# anything back to the model — it appends an alert the user reads. Legitimate
+# reasons to take a dominated player exist (injury news in the retrieved
+# section, a bye-week conflict this app cannot see, plain disagreement with
+# last season's numbers), and the person drafting is better placed to judge
+# them than a two-variable rule.
+# ---------------------------------------------------------------------------
+
+# Margins, so trivial differences stay quiet. A player 1 pick earlier with
+# 0.2 more ppg of value is not meaningfully better, and an alert that fires
+# on noise gets ignored — including on the occasions it is right.
+_DOMINANCE_ADP_MARGIN = 2.0
+_DOMINANCE_VOR_MARGIN = 0.5
+
+
+def _find_dominating_player(
+    pick: PickSuggestion,
+    ctx: RecommendationContext,
+) -> dict | None:
+    """
+    An available player at the same position with both a materially better
+    ADP and a materially higher VOR than the recommended one, or None.
+
+    Scoped to the players actually shown to the model (_LISTED_PLAYERS). A
+    complaint about someone it was never given would be unfair and, worse,
+    unactionable — that would be a symptom of the board being too short,
+    which is a different problem with a different fix.
+
+    Returns None whenever either side lacks a VOR: a rookie with no prior
+    season has unknown value, not low value, and this guard must never imply
+    otherwise.
+    """
+    if not ctx.replacement_ppg:
+        return None
+    mine = _vor({"id": pick.player_id, "position": pick.position},
+                ctx.player_metrics, ctx.replacement_ppg)
+    if mine is None:
+        return None
+
+    best: dict | None = None
+    best_vor = mine + _DOMINANCE_VOR_MARGIN
+    for p in ctx.top_available[:_LISTED_PLAYERS]:
+        if p["id"] == pick.player_id or p["position"] != pick.position:
+            continue
+        if p["adp"] > pick.adp - _DOMINANCE_ADP_MARGIN:
+            continue
+        v = _vor(p, ctx.player_metrics, ctx.replacement_ppg)
+        if v is not None and v >= best_vor:
+            best, best_vor = p, v
+    return best
+
+
+def _dominance_alert(
+    pick: PickSuggestion,
+    ctx: RecommendationContext,
+    engaged_text: str = "",
+) -> str | None:
+    """
+    The user-facing wording for _find_dominating_player, or None.
+
+    Suppressed when `engaged_text` — the model's own verdicts, reasoning and
+    alternatives — already names the dominating player. That distinction is
+    the whole point of the guard: taking a dominated player after weighing
+    him is a judgement call this rule has no business overriding, while
+    taking one without ever mentioning him is the omission failure that
+    produced Rice and A.J. Brown.
+
+    It also fixes the rule's specificity problem. Against a real board, 20 of
+    the top 25 players are dominated by someone at their position, so a
+    check on the pick alone fires on almost any non-leader; tightening the
+    margins far enough to quieten it also loses the case it was built for.
+    Filtering on "was he considered" targets the actual defect instead of
+    guessing at thresholds.
+    """
+    other = _find_dominating_player(pick, ctx)
+    if other is None:
+        return None
+    if other["name"].lower() in engaged_text.lower():
+        return None
+    mine = _vor({"id": pick.player_id, "position": pick.position},
+                ctx.player_metrics, ctx.replacement_ppg)
+    theirs = _vor(other, ctx.player_metrics, ctx.replacement_ppg)
+    return (
+        f"Check this: {other['name']} ({other['position']}, ADP {other['adp']:g}, "
+        f"VOR {theirs:+.1f}) has both a better ADP and a higher VOR than the "
+        f"recommended {pick.player_name} (ADP {pick.adp:g}, VOR {mine:+.1f}), and "
+        f"plays the same position — so roster need does not explain the gap. There "
+        f"may still be a good reason (injury news, a bye conflict this app cannot "
+        f"see); this is a prompt to check, not a verdict."
+    )
+
+
 def _clean_text(value) -> str:
     """
     Free-text field from Claude's JSON, or "" if it isn't a string.
@@ -2304,6 +2416,28 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
 
     alerts = [str(a) for a in data.get("alerts", []) if a]
     considered = [str(x) for x in data.get("considered", []) if x]
+
+    # Appended last so it reads as the final word on the pick. Computed here
+    # rather than asked of the model, because the model is the thing being
+    # checked — see _find_dominating_player.
+    #
+    # Everything the model wrote counts as engagement: a player named in the
+    # verdicts, in the reasoning, or offered as an alternative was considered,
+    # and the guard stays quiet about him.
+    engaged = " ".join([
+        *considered,
+        recommendation.reasoning,
+        *(a.player_name for a in alternatives),
+        *(a.reasoning for a in alternatives),
+        *(a.tradeoff for a in alternatives),
+    ])
+    dominance = _dominance_alert(recommendation, ctx, engaged)
+    if dominance:
+        logger.info(
+            "Dominated pick: %s was recommended over a same-position player with "
+            "better ADP and higher VOR.", recommendation.player_name,
+        )
+        alerts.append(dominance)
 
     # Logged, not enforced. A missing verdict is worth knowing about — it's
     # the exact failure this section exists to catch — but rejecting an

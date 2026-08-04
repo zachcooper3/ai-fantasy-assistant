@@ -13,6 +13,7 @@ import pytest
 
 from backend.app.services.ai_service import (
     RecommendationContext,
+    PickSuggestion,
     _compute_roster_gaps,
     _parse_response,
     _build_prompt,
@@ -23,6 +24,8 @@ from backend.app.services.ai_service import (
     _compute_roster_depth,
     _compute_adp_tiers,
     _draft_value,
+    _find_dominating_player,
+    _dominance_alert,
     _shortlist,
     _format_shortlist_section,
     _TEMPERATURE,
@@ -1219,3 +1222,106 @@ def test_prompt_requires_alternatives_to_span_two_positions():
 
 def test_temperature_allows_variation_without_being_random():
     assert 0.0 < _TEMPERATURE <= 0.5
+
+
+# ---------------------------------------------------------------------------
+# Dominated-pick guard
+#
+# Same-position only. Across positions, taking a "worse" player is routinely
+# correct (you need a TE; the dominating player is a WR you're deep at), so a
+# cross-position check fires constantly and becomes noise. Within a position,
+# roster need cannot explain the gap.
+#
+# Advisory: it appends an alert and never blocks. And it stays quiet when the
+# model actually engaged with the dominating player — taking him after
+# weighing him is judgement, not the omission this guard exists to catch.
+# ---------------------------------------------------------------------------
+
+def _dom_ctx():
+    board = [
+        {"id": 1, "rank": 1, "name": "Best WR", "position": "WR", "team": "X",
+         "adp": 11.5, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "Worse WR", "position": "WR", "team": "X",
+         "adp": 21.3, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "Some RB", "position": "RB", "team": "X",
+         "adp": 9.0, "sleeper_id": None},
+        {"id": 4, "rank": 4, "name": "Rookie WR", "position": "WR", "team": "X",
+         "adp": 10.0, "sleeper_id": None},   # no metrics -> unknown VOR
+    ]
+    ctx = RecommendationContext(
+        pick_number=17, round_number=2, my_slot=1, league_size=12,
+        is_my_turn=True, picks_until_my_turn=0, my_next_pick_number=17,
+        top_available=board,
+        player_metrics={1: {"fantasy_points_avg": 18.8},
+                        2: {"fantasy_points_avg": 17.2},
+                        3: {"fantasy_points_avg": 24.0}},
+        replacement_ppg={"WR": 11.9, "RB": 11.1},
+    )
+    return ctx
+
+
+def _sugg(ctx, pid):
+    p = next(x for x in ctx.top_available if x["id"] == pid)
+    return PickSuggestion(p["id"], p["name"], p["position"], p["adp"], "")
+
+
+def test_dominating_player_is_found_at_the_same_position():
+    ctx = _dom_ctx()
+    found = _find_dominating_player(_sugg(ctx, 2), ctx)
+    assert found is not None and found["id"] == 1
+
+
+def test_the_position_leader_is_never_dominated():
+    ctx = _dom_ctx()
+    assert _find_dominating_player(_sugg(ctx, 1), ctx) is None
+
+
+def test_a_better_player_at_another_position_never_triggers_it():
+    # "Some RB" has a better ADP and a far higher VOR than "Worse WR", but
+    # wanting a receiver is a complete explanation, so this must stay quiet.
+    ctx = _dom_ctx()
+    found = _find_dominating_player(_sugg(ctx, 2), ctx)
+    assert found["position"] == "WR"
+
+
+def test_unknown_vor_on_either_side_suppresses_the_check():
+    ctx = _dom_ctx()
+    # Rookie with no prior season cannot dominate: unknown is not high.
+    assert _find_dominating_player(_sugg(ctx, 4), ctx) is None
+    ctx.replacement_ppg = {}
+    assert _find_dominating_player(_sugg(ctx, 2), ctx) is None
+
+
+def test_trivial_differences_stay_quiet():
+    ctx = _dom_ctx()
+    ctx.top_available[0]["adp"] = 20.5          # inside the ADP margin
+    assert _find_dominating_player(_sugg(ctx, 2), ctx) is None
+
+
+def test_alert_is_advisory_wording_not_a_verdict():
+    ctx = _dom_ctx()
+    msg = _dominance_alert(_sugg(ctx, 2), ctx)
+    assert "prompt to check, not a verdict" in msg
+    assert "Best WR" in msg and "Worse WR" in msg
+
+
+def test_alert_suppressed_when_the_model_engaged_with_that_player():
+    # Passing on him deliberately is a judgement call; only silent omission
+    # is the failure mode this guard targets.
+    ctx = _dom_ctx()
+    assert _dominance_alert(_sugg(ctx, 2), ctx, "Best WR — passed, injury risk") is None
+    assert _dominance_alert(_sugg(ctx, 2), ctx, "unrelated text") is not None
+
+
+def test_guard_appends_an_alert_without_rejecting_the_pick():
+    ctx = _dom_ctx()
+    payload = {
+        "recommendation": {"player_id": 2, "player_name": "Worse WR",
+                           "position": "WR", "adp": 21.3, "reasoning": "volume"},
+        "alternatives": [], "alerts": ["existing alert"],
+    }
+    result = _parse_response(json.dumps(payload), ctx)
+    assert result is not None                      # never blocks
+    assert result.recommendation.player_id == 2    # never rewrites the pick
+    assert result.alerts[0] == "existing alert"    # appended last
+    assert any(a.startswith("Check this") for a in result.alerts)
