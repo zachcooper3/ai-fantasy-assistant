@@ -195,6 +195,13 @@ class RecommendationContext:
     # Empty when I pick again immediately or when the caller predates this.
     upcoming_pick_slots: list[int] = field(default_factory=list)
 
+    # {position: ppg of the last startable player league-wide}, from
+    # compute_replacement_levels over the whole player pool — not just the
+    # available slice, since replacement level is a property of the position
+    # in this league, not of who happens to be left. Empty means the VOR
+    # column is omitted rather than guessed.
+    replacement_ppg: dict[str, float] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Starting lineup gaps — gives Claude a concrete target, not just "consider
@@ -544,6 +551,82 @@ def compute_position_scarcity(
         else:
             tiers[pos] = "ok"
     return tiers
+
+
+# ---------------------------------------------------------------------------
+# Value over replacement — the cross-position common currency
+#
+# Diagnosed from a live draft that took five receivers in seven rounds. Two
+# facts about this data explain it, and the prompt expressed neither:
+#
+#   1. The board is WR-dense at every depth. In the top 24 by ADP there are
+#      12 WRs and 11 RBs; by ADP 97-144 it's 20 WRs to 10 RBs. Working down
+#      an ADP-sorted board takes more receivers than backs by construction.
+#   2. Raw points per game are nearly identical between the two at every
+#      rank (RB12 15.2 vs WR12 14.7), so the metrics section gives no reason
+#      to prefer either.
+#
+# What differs is REPLACEMENT level: the worst starter you could still roster
+# at that position. RB30 scores 11.1, WR30 scores 11.9, and the gap widens
+# deeper (RB36 9.1 vs WR36 11.3). So a 15.2 ppg back is worth +4.1 over the
+# back who'd replace him while a 14.7 ppg receiver is worth only +2.8 — at
+# equal ADP and near-equal raw points, the back is worth appreciably more.
+# Across the top 36 by ADP, mean VOR is +6.02 for RBs against +4.28 for WRs.
+#
+# This is the only quantity here that compares a back to a receiver on one
+# scale, which is exactly what "best player available" requires and what the
+# prompt previously had no way to say.
+#
+# Deliberately NOT used as a ranking on its own. Simulating 12-team drafts
+# against this data, a VOR-greedy strategy beat ADP-greedy when last season's
+# points were treated as truth (112.9 vs 107.4) but fell BELOW it once
+# outcomes were regressed toward the market's view (104.9 vs 114.4) — VOR
+# built on trailing data is fragile precisely where trailing data is wrong.
+# It's offered to the model as one signal beside ADP, with the divergence
+# between them called out, rather than as an ordering to follow.
+# ---------------------------------------------------------------------------
+
+def compute_replacement_levels(
+    ppg_by_position: dict[str, list[float]],
+    league_size: int,
+    starter_slots: dict[str, int] | None = None,
+) -> dict[str, float]:
+    """
+    Returns {position: ppg of the last startable player league-wide} — the
+    baseline a player at that position has to beat to be worth anything.
+
+    `ppg_by_position` holds every rostered-quality player's prior-season
+    points per game, per position, in any order. `starter_slots` is per-team
+    demand including a share of the FLEX (defaults to _STARTER_SLOTS, the
+    same 1/3/3/1 shape the scarcity math uses, so the two can't disagree
+    about how many backs a league starts).
+
+    A position with fewer players on file than the league needs falls back to
+    its worst known player rather than raising — an incomplete pool is a data
+    gap, and draft day is not the time to crash over one.
+    """
+    starter_slots = starter_slots or _STARTER_SLOTS
+    levels: dict[str, float] = {}
+    for pos, slots in starter_slots.items():
+        pool = sorted((v for v in ppg_by_position.get(pos, []) if v is not None), reverse=True)
+        if not pool:
+            continue
+        rank = max(1, int(league_size * slots))
+        levels[pos] = pool[min(rank, len(pool)) - 1]
+    return levels
+
+
+def _vor(player: dict, player_metrics: dict[int, dict], replacement: dict[str, float]) -> float | None:
+    """Points per game above this player's positional replacement level, or
+    None when he has no prior-season data. None is not zero: a rookie with no
+    NFL snaps has an unknown VOR, and rendering it as 0.0 would read as
+    'exactly replacement-level', which is a claim the data doesn't support."""
+    m = player_metrics.get(player["id"]) if player_metrics else None
+    ppg = m.get("fantasy_points_avg") if m else None
+    base = replacement.get(player["position"])
+    if ppg is None or base is None:
+        return None
+    return ppg - base
 
 
 # ---------------------------------------------------------------------------
@@ -1533,14 +1616,33 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "Signals / Player News sections to choose among them, rather than the exact "
         "ADP decimal. A gap between tiers is more likely to reflect real drop-off."
     )
+    if ctx.replacement_ppg:
+        repl_str = ", ".join(
+            f"{pos} {v:.1f}" for pos, v in sorted(ctx.replacement_ppg.items())
+        )
+        lines.append(
+            f"VOR = prior-season PPR ppg minus the last startable player at that "
+            f"position league-wide ({repl_str}). It is the ONLY figure here that "
+            f"compares players at different positions on one scale: equal ADP and "
+            f"equal points per game do not mean equal value, because what replaces "
+            f"them differs. VOR is backward-looking where ADP is the market's "
+            f"forward view — when the two disagree sharply, say so rather than "
+            f"silently trusting one. '--' means no prior-season data (usually a "
+            f"rookie), which is unknown value, NOT replacement-level value."
+        )
     tiers = _compute_adp_tiers(ctx.top_available[:_LISTED_PLAYERS])
     for i, tier in enumerate(tiers, start=1):
         adp_lo, adp_hi = tier[0]["adp"], tier[-1]["adp"]
         lines.append(f"\nTier {i} (ADP {adp_lo:g}-{adp_hi:g}):")
         for p in tier:
-            lines.append(
-                f"  {p['rank']:<5} {p['name']:<22} {p['position']:<5} {p['team']:<6} ADP {p['adp']}"
+            row = (
+                f"  {p['rank']:<5} {p['name']:<22} {p['position']:<5} "
+                f"{p['team']:<6} ADP {p['adp']:<6}"
             )
+            if ctx.replacement_ppg:
+                v = _vor(p, ctx.player_metrics, ctx.replacement_ppg)
+                row += f" VOR {v:+.1f}" if v is not None else " VOR   --"
+            lines.append(row)
     lines.append("")
 
     # Positional availability + scarcity tier (run-risk context). Starter
@@ -1754,7 +1856,21 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "way to lose a draft you were winning. Never describe a position as secure "
         "merely because its base requirement is met.\n\n"
 
-        "RULE 4 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
+        "RULE 4 — COMPARE POSITIONS BY VOR, NOT BY RAW POINTS. Equal points per game "
+        "at different positions are not equal value, because what replaces each player "
+        "differs: in this data a 15.2 ppg back is +4.1 over the back who'd replace him "
+        "while a 14.7 ppg receiver is only +2.8 over his. The VOR column on the board "
+        "is the one figure that puts every position on a single scale — use it whenever "
+        "you are choosing ACROSS positions, and note that an ADP-sorted board naturally "
+        "surfaces more receivers than backs, which is a property of the list and not a "
+        "judgement about them. Two limits on it: VOR is computed from last season and "
+        "ADP is the market's forward view, so when they disagree sharply say so instead "
+        "of silently picking one; and VOR only measures a player's value AS A STARTER. "
+        "Once a position's starting slots are full, the next player there rides your "
+        "bench and is worth a fraction of his VOR — insurance, not points — so a high "
+        "VOR never justifies stacking a fourth player at a position that starts one.\n\n"
+
+        "RULE 5 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
         "Within a tier, ADP differences are noise and must not decide anything; break "
         "those ties on Opportunity & Performance Signals (usage, efficiency, "
         "consistency) and Player News. Between tiers, the gap is likely real drop-off "
@@ -1762,7 +1878,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "carries, red zone touches, snap share — outstrips his tier is a breakout "
         "candidate; say so explicitly rather than defaulting to the safest name.\n\n"
 
-        "RULE 5 — SAMPLES AND DURABILITY. A per-game average is only as good as the "
+        "RULE 6 — SAMPLES AND DURABILITY. A per-game average is only as good as the "
         "sample behind it. A line flagged '[SMALL SAMPLE — weigh this average with "
         "caution]' covers a shortened, often injury-affected season and is not "
         "comparable to a healthy player's full-season average even when the number is "
@@ -1771,7 +1887,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "injury-affected sample outweigh a healthier, more available player who "
         "already has the better ADP tier.\n\n"
 
-        "RULE 6 — MISSING DATA IS NOT BAD DATA. Players showing 'No retrieved data' or "
+        "RULE 7 — MISSING DATA IS NOT BAD DATA. Players showing 'No retrieved data' or "
         "'No prior-season metrics' have no prior NFL season to compute from. That is a "
         "coverage gap in this app, never evidence against the player, and must not be "
         "the reason you pass on someone. Rookies frequently show draft capital "
@@ -1780,7 +1896,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "Day 1-2 pick in a favorable offense is a legitimate breakout call with zero "
         "NFL snaps.\n\n"
 
-        "RULE 7 — YOUNG PLAYERS ARE ASCENDING; TREAT THEIR NUMBERS AS A FLOOR. Some "
+        "RULE 8 — YOUNG PLAYERS ARE ASCENDING; TREAT THEIR NUMBERS AS A FLOOR. Some "
         "stat lines are tagged with the player's NFL season and draft capital, e.g. "
         "'2nd NFL season, 1st-round pick (#19 overall)'. That tag changes what the "
         "numbers mean. A first- or second-year player's per-game average was produced "
@@ -1793,7 +1909,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "— the market is pricing in growth you can see the reason for right in the "
         "tag.\n\n"
 
-        "RULE 8 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
+        "RULE 9 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
         "scheme, or opponent-strength data for any position, so nothing grounds a "
         "claim that one defense or kicker is better than another; ADP order is the "
         "only signal you have for them. Never invent outside knowledge about which "
@@ -1802,7 +1918,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "earlier costs you a skill player for a position that will still be freely "
         "available at the end.\n\n"
 
-        "RULE 9 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
+        "RULE 10 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
         "trace to something in the prompt. You have no bye-week data, no depth-chart "
         "narrative beyond what is shown, no 2026 projections, and no injury news past "
         "what appears in Player News & Analysis — so do not reason about bye-week "
@@ -2215,6 +2331,24 @@ def _build_preview_context(top_n: int = 60) -> RecommendationContext:
             for pid, d in draft_profile_repo.get_draft_profiles_bulk(session, ids).items()
         }
 
+        # Replacement levels over the whole pool, same as the live path — the
+        # preview is only useful if the VOR column it shows is the real one.
+        from sqlmodel import select as _select
+
+        from backend.db.models import Player as _Player
+        from backend.db.models import PlayerMetrics as _PM
+
+        pool: dict[str, list[float]] = {}
+        for pos, ppg in session.exec(
+            _select(_Player.position, _PM.fantasy_points_avg)
+            .join(_PM, _PM.player_id == _Player.id)
+            .where(_PM.fantasy_points_avg.is_not(None))
+        ):
+            pool.setdefault(pos, []).append(ppg)
+        replacement_ppg = compute_replacement_levels(
+            pool, 12, {"QB": 1, "RB": 2.5, "WR": 2.5, "TE": 1}
+        )
+
     # Slot 1 of a 12-team snake: picking at #1 means waiting until #24, with
     # slots 2-12 then 12-2 in between. Hardcoded here (the real app derives
     # it from DraftStateService) purely so the preview actually exercises the
@@ -2229,6 +2363,7 @@ def _build_preview_context(top_n: int = 60) -> RecommendationContext:
         available_counts=available_counts,
         player_metrics=player_metrics,
         draft_profiles=draft_profiles,
+        replacement_ppg=replacement_ppg,
     )
 
 

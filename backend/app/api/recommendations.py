@@ -10,14 +10,20 @@ Author: Zach Cooper
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from backend.db.database import get_session
 from backend.db import player_repo as repo
 from backend.db import metrics_repo
 from backend.db import draft_profile_repo
 from backend.app.schemas import PlayerResponse
-from backend.app.services.ai_service import AIService, RecommendationContext, compute_position_scarcity
+from backend.db.models import Player, PlayerMetrics
+from backend.app.services.ai_service import (
+    AIService,
+    RecommendationContext,
+    compute_position_scarcity,
+    compute_replacement_levels,
+)
 from backend.app.services.draft_state import DraftStateService
 
 router = APIRouter(prefix="/api/recommend", tags=["recommendations"])
@@ -198,6 +204,36 @@ def _build_context(
         if slot != svc.config.my_draft_position
     }
 
+    # Replacement level per position, over the WHOLE player pool rather than
+    # the available slice — it's a property of the position in this league
+    # ("what does the worst startable back score"), not of who happens to be
+    # left on the board. Drafted players still define that baseline.
+    #
+    # This is what lets the prompt compare a back to a receiver at all. See
+    # compute_replacement_levels for the live diagnosis it came from.
+    ppg_by_position: dict[str, list[float]] = {}
+    for pos, ppg in db.exec(
+        select(Player.position, PlayerMetrics.fantasy_points_avg)
+        .join(PlayerMetrics, PlayerMetrics.player_id == Player.id)
+        .where(PlayerMetrics.fantasy_points_avg.is_not(None))  # type: ignore[union-attr]
+    ):
+        ppg_by_position.setdefault(pos, []).append(ppg)
+
+    cfg = svc.config
+    replacement_ppg = compute_replacement_levels(
+        ppg_by_position,
+        cfg.league_size,
+        # Per-team demand with the FLEX split evenly between RB and WR — the
+        # same assumption the scarcity block makes, so the two can't disagree
+        # about how many backs a league starts.
+        {
+            "QB": cfg.qb_slots,
+            "RB": cfg.rb_slots + cfg.flex_slots / 2,
+            "WR": cfg.wr_slots + cfg.flex_slots / 2,
+            "TE": cfg.te_slots,
+        },
+    )
+
     # Look-ahead: the turn AFTER the one being advised on, plus every team
     # that picks in between. This is the opportunity-cost horizon the
     # recommendation prompt reasons against — see
@@ -242,6 +278,7 @@ def _build_context(
         draft_profiles=draft_profiles,
         my_following_pick_number=my_following_pick_number,
         upcoming_pick_slots=upcoming_pick_slots,
+        replacement_ppg=replacement_ppg,
     )
 
 

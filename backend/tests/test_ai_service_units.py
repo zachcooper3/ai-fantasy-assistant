@@ -9,6 +9,8 @@ gap (see the function's docstring in ai_service.py).
 
 import json
 
+import pytest
+
 from backend.app.services.ai_service import (
     RecommendationContext,
     _compute_roster_gaps,
@@ -19,6 +21,8 @@ from backend.app.services.ai_service import (
     _format_metrics_section,
     _infer_current_season,
     _compute_roster_depth,
+    compute_replacement_levels,
+    _vor,
     _format_roster_depth_section,
     _is_trustworthy,
     _format_metrics_line,
@@ -783,3 +787,98 @@ def test_system_prompt_forbids_calling_a_base_filled_position_secure():
     sp = _build_system_prompt("ppr")
     assert "A LEGAL LINEUP IS NOT A COMPLETE ROSTER" in sp
     assert "zero cover" in sp
+
+
+# ---------------------------------------------------------------------------
+# Value over replacement
+#
+# Live failure: five receivers in seven rounds. Root cause was that nothing
+# in the prompt compared positions on one scale — an ADP-sorted board is
+# WR-dense at every depth (12 WR vs 11 RB in the top 24; 20 vs 10 by ADP
+# 97-144) and raw ppg is near-identical between them (RB12 15.2, WR12 14.7).
+# What differs is replacement level, which the prompt never stated.
+# ---------------------------------------------------------------------------
+
+_POOL = {
+    # 40 backs descending from 24.0, 40 receivers descending from 23.0.
+    "RB": [24.0 - 0.4 * i for i in range(40)],
+    "WR": [23.0 - 0.3 * i for i in range(40)],
+    "TE": [18.0 - 0.6 * i for i in range(20)],
+    "QB": [23.0 - 0.5 * i for i in range(20)],
+}
+
+
+def test_replacement_level_is_the_last_startable_player_league_wide():
+    levels = compute_replacement_levels(_POOL, league_size=12,
+                                        starter_slots={"RB": 2.5, "WR": 2.5})
+    # 12 teams x 2.5 startable = rank 30.
+    assert levels["RB"] == pytest.approx(24.0 - 0.4 * 29)
+    assert levels["WR"] == pytest.approx(23.0 - 0.3 * 29)
+
+
+def test_deeper_position_has_the_higher_replacement_level():
+    # This is the whole point: receivers are deeper, so each one is worth
+    # less over the man who'd replace him even at identical raw points.
+    levels = compute_replacement_levels(_POOL, 12, {"RB": 2.5, "WR": 2.5})
+    assert levels["WR"] > levels["RB"]
+
+
+def test_equal_points_at_different_positions_are_not_equal_value():
+    levels = compute_replacement_levels(_POOL, 12, {"RB": 2.5, "WR": 2.5})
+    metrics = {1: {"fantasy_points_avg": 15.0}, 2: {"fantasy_points_avg": 15.0}}
+    rb = {"id": 1, "position": "RB"}
+    wr = {"id": 2, "position": "WR"}
+    assert _vor(rb, metrics, levels) > _vor(wr, metrics, levels)
+
+
+def test_shallow_position_pool_falls_back_instead_of_raising():
+    # A league that needs more starters than the DB has players on file is a
+    # data gap; draft day is not the time to crash over one.
+    levels = compute_replacement_levels({"TE": [12.0, 10.0]}, 12, {"TE": 1})
+    assert levels["TE"] == 10.0
+
+
+def test_positions_absent_from_the_pool_are_omitted_not_zeroed():
+    levels = compute_replacement_levels({"RB": [10.0]}, 12, {"RB": 2, "WR": 2})
+    assert "WR" not in levels
+
+
+def test_vor_is_none_for_a_player_with_no_prior_season():
+    # A rookie's VOR is unknown. Rendering it as 0.0 would assert he is
+    # exactly replacement-level, which the data does not support.
+    assert _vor({"id": 99, "position": "RB"}, {}, {"RB": 11.1}) is None
+
+
+def test_vor_is_none_when_the_position_has_no_replacement_level():
+    metrics = {1: {"fantasy_points_avg": 15.0}}
+    assert _vor({"id": 1, "position": "DST"}, metrics, {"RB": 11.1}) is None
+
+
+def test_board_renders_vor_and_marks_unknowns():
+    ctx = ctx_with_available(1, 2)
+    ctx.top_available[1]["position"] = "WR"
+    ctx.replacement_ppg = {"RB": 11.1, "WR": 11.9}
+    ctx.player_metrics = {1: {"fantasy_points_avg": 15.2}}   # id 2 has none
+    prompt = _build_prompt(ctx)
+    assert "VOR +4.1" in prompt
+    assert "VOR   --" in prompt
+    assert "unknown value, NOT replacement-level value" in prompt
+
+
+def test_board_omits_vor_entirely_without_replacement_levels():
+    # Older callers and tests that never set replacement_ppg must render the
+    # board exactly as before rather than showing a column of dashes.
+    ctx = ctx_with_available(1, 2)
+    prompt = _build_prompt(ctx)
+    assert "VOR" not in prompt
+
+
+def test_system_prompt_guards_against_stacking_on_high_vor():
+    # The failure mode a draft simulation surfaced: VOR-greedy drafting takes
+    # six tight ends, because VOR measures starter value and says nothing
+    # about a position you can only start one of.
+    sp = _build_system_prompt("ppr")
+    assert "COMPARE POSITIONS BY VOR" in sp
+    assert "stacking a fourth player at a position that starts one" in sp
+    # And the honest caveat about where the number comes from.
+    assert "computed from last season" in sp
