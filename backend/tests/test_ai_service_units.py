@@ -405,10 +405,14 @@ def test_run_risk_excludes_dst_and_k_demand():
 
 
 def test_dst_and_k_are_deferred_out_of_the_urgency_math():
+    # available_counts must contain kickers: the K requirement is dropped
+    # entirely when none exist to draft (this app's real ADP feed has none),
+    # and this test is about the deferral math, not that data gap.
     # Round 13 of 15 needing QB + DST + K: only ONE round is genuinely
     # available for the QB, because the last two are owed to DST and K.
     # The old math saw 2 rounds free and stayed quiet.
     ctx = ctx_with_available(1, 2, 3)
+    ctx.available_counts = {"K": 12, "DST": 12}
     ctx.round_number = 13
     ctx.total_rounds = 15
     ctx.my_roster = roster("RB", "RB", "WR", "WR", "TE", "RB")
@@ -420,6 +424,7 @@ def test_dst_and_k_are_deferred_out_of_the_urgency_math():
 
 def test_dst_and_k_are_demanded_once_the_reserved_rounds_arrive():
     ctx = ctx_with_available(1, 2, 3)
+    ctx.available_counts = {"K": 12, "DST": 12}
     ctx.round_number = 14
     ctx.total_rounds = 15
     ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR", "TE", "RB")
@@ -962,3 +967,54 @@ def test_board_no_longer_claims_distant_players_are_interchangeable():
     prompt = _build_prompt(ctx)
     assert "roughly interchangeable" not in prompt
     assert "NOT interchangeable with a higher one" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Kicker requirement vs. kicker availability
+#
+# Live failure: a full 15-round draft ended with no kicker. _K_SLOTS asserted
+# the league starts one, but this app's ADP source returns zero kickers (226
+# players, 0 K — FantasyFootballCalculator simply doesn't include them), and
+# _parse_response only accepts a player_id drawn from the available board. So
+# the prompt demanded a pick that could not physically be made, and the
+# reserved-rounds math held a round open for it.
+# ---------------------------------------------------------------------------
+
+def _late_ctx(k_available: int, round_number: int = 15):
+    ctx = ctx_with_available(1)
+    ctx.available_counts = {"DST": 12, "K": k_available}
+    ctx.round_number = round_number
+    ctx.total_rounds = 15
+    ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR", "TE", "RB", "DST")
+    return ctx
+
+
+def test_kicker_requirement_dropped_when_none_can_be_drafted():
+    prompt = _build_prompt(_late_ctx(k_available=0))
+    assert "Still owed" not in prompt
+    assert "K x1" not in prompt
+
+
+def test_missing_kickers_are_announced_not_silently_dropped():
+    # Silently omitting it would mean the user finds out in week 1.
+    prompt = _build_prompt(_late_ctx(k_available=0))
+    assert "no kickers at all" in prompt
+    assert "waivers" in prompt
+
+
+def test_kicker_requirement_stands_when_kickers_exist():
+    prompt = _build_prompt(_late_ctx(k_available=12))
+    assert "Still owed" in prompt and "K x1" in prompt
+    assert "no kickers at all" not in prompt
+
+
+def test_absent_kickers_do_not_consume_a_reserved_round():
+    # The deferral math holds the tail of the draft for DST+K. An
+    # undraftable kicker must not reserve a round: doing so makes the
+    # urgency check pessimistic by a full round for the whole back half.
+    # (This roster already has its DST, so K is the only late slot at
+    # issue — with no kicker there is nothing left to reserve for.)
+    no_k = _build_prompt(_late_ctx(k_available=0, round_number=13))
+    with_k = _build_prompt(_late_ctx(k_available=12, round_number=13))
+    assert "Still owed" not in no_k
+    assert "final 1 round(s)" in with_k

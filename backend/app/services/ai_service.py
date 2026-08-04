@@ -452,15 +452,27 @@ def _format_roster_depth_section(
     return "\n".join(lines)
 
 
-def _full_lineup(lineup: dict[str, int]) -> dict[str, int]:
+def _full_lineup(lineup: dict[str, int], kickers_available: bool = True) -> dict[str, int]:
     """
     The configured lineup plus the kicker DraftConfig doesn't model — see
     _K_SLOTS. Everything downstream (gap math, scarcity, the roster-shape
     line) reads the lineup through here so the kicker requirement can't be
     visible in one place and missing in another.
+
+    `kickers_available` exists because the requirement is worthless when
+    there is nothing to satisfy it with. This app's ADP source returns no
+    kickers at all — 226 players, zero K, confirmed live — so _K_SLOTS
+    produced an instruction the model physically could not follow: the
+    parser only accepts a player_id drawn from the available board, and no
+    kicker is ever on it. A full draft ended with the final round spent on a
+    receiver while the prompt insisted a kicker was still owed.
+
+    Asserting a requirement the data cannot meet is worse than omitting it,
+    because it also distorts the rounds-remaining math that reserves the end
+    of the draft for DST and K.
     """
-    if not _K_SLOTS:
-        return dict(lineup)
+    if not _K_SLOTS or not kickers_available:
+        return {k: v for k, v in lineup.items() if k != "K"}
     return {**lineup, "K": lineup.get("K", _K_SLOTS)}
 
 
@@ -1549,7 +1561,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # _compute_roster_gaps' docstring for why this exists: without it,
     # nothing told Claude it still needed a starting QB, and it never
     # once got recommended across a full draft as a result)
-    lineup = _full_lineup(ctx.starting_lineup)
+    # Kickers only count as a requirement if any exist to draft — see
+    # _full_lineup. available_counts is the live board, so this also
+    # correctly drops the requirement once the last kicker is gone.
+    kickers_available = bool(ctx.available_counts.get("K", 0))
+    lineup = _full_lineup(ctx.starting_lineup, kickers_available)
     gaps = _compute_roster_gaps(ctx.my_roster, lineup)
 
     # Split the gaps: DST/K are roster taxes you pay at the end (see
@@ -1601,6 +1617,18 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         # old "every remaining pick is depth or upside" wording ended the
         # section on a shrug for the entire back half of the draft.
         lines.append("All base starting slots filled — see roster construction below.")
+
+    if _K_SLOTS and not kickers_available:
+        # Stated rather than silently omitted: the league does start a kicker,
+        # so a draft that ends without one leaves a hole the user has to fill
+        # from waivers. Dropping the requirement quietly would mean nobody
+        # finds out until week 1.
+        lines.append(
+            "NOTE: this league starts a kicker, but this app's ADP data contains no "
+            "kickers at all, so one cannot be drafted here and K is excluded from the "
+            "requirements above. Do NOT spend a pick trying — add a kicker from "
+            "waivers after the draft instead."
+        )
 
     if late_gaps:
         late_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(late_gaps.items()))
