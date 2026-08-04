@@ -1018,3 +1018,52 @@ def test_absent_kickers_do_not_consume_a_reserved_round():
     with_k = _build_prompt(_late_ctx(k_available=12, round_number=13))
     assert "Still owed" not in no_k
     assert "final 1 round(s)" in with_k
+
+
+# ---------------------------------------------------------------------------
+# Availability wording
+#
+# Live failure, mid-draft: the bucket for "on the board now, but not at your
+# next turn" was named GONE and headed "Almost certainly gone by then". The
+# model read that as unavailable and recommended around those players —
+# "the highest-value receiver available after Rice and Brown disappear" —
+# while Rice and Brown were both on the board. That inverts RULE 1: the
+# group you must act on first became the group it believed it couldn't have.
+# ---------------------------------------------------------------------------
+
+def _survival_ctx():
+    ctx = ctx_with_available(1, 2, 3)
+    for i, adp in enumerate((10.0, 12.0, 90.0)):
+        ctx.top_available[i]["adp"] = adp
+    ctx.my_next_pick_number = 20
+    ctx.my_following_pick_number = 45
+    ctx.pick_number = 20
+    return ctx
+
+
+def test_no_bucket_label_says_a_listed_player_is_gone():
+    # "gone" next to a draftable name is what caused the failure.
+    prompt = _build_prompt(_survival_ctx())
+    section = prompt.split("## Opportunity Cost")[1].split("##")[0]
+    assert "gone by then" not in section.lower()
+    assert "GONE" not in section
+
+
+def test_opportunity_cost_states_everyone_listed_is_draftable_now():
+    prompt = _build_prompt(_survival_ctx())
+    assert "AVAILABLE RIGHT NOW AND CAN BE DRAFTED WITH THIS PICK" in prompt
+    assert "do NOT describe who is on the board today" in prompt
+
+
+def test_urgent_bucket_label_is_an_instruction_to_act():
+    prompt = _build_prompt(_survival_ctx())
+    assert "TAKE NOW OR LOSE HIM" in prompt
+    assert "on the board now, will not be at your next turn" in prompt
+
+
+def test_system_prompt_forbids_recommending_around_a_listed_player():
+    sp = _build_system_prompt("ppr")
+    assert "EVERY LISTED PLAYER IS AVAILABLE" in sp
+    # The exact reasoning pattern observed live must be named as an error.
+    assert "the best option once X and Y are gone" in sp
+    assert "one of THEM is the pick" in sp

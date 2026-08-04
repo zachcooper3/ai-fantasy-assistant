@@ -712,9 +712,21 @@ _ADP_NOISE_RATIO = 0.25
 # Labels, not probabilities. A calibrated percentage would imply a precision
 # this heuristic doesn't have, and would invite the model to do arithmetic
 # with it; three buckets communicate the same actionable distinction.
-_SURVIVAL_GONE = "GONE"
-_SURVIVAL_TOSSUP = "TOSS-UP"
-_SURVIVAL_SAFE = "LIKELY THERE"
+# Label wording is load-bearing, and the first version got it dangerously
+# wrong. The bucket meaning "on the board now, but not at your next turn"
+# was called GONE and headed "Almost certainly gone by then". Confirmed
+# live mid-draft: the model read that as "these players are unavailable"
+# and recommended the best receiver it believed was left *after* them,
+# writing "the highest-value receiver available after Rice and Brown
+# disappear" — while Rice and Brown were both sitting on the board.
+#
+# That inverts RULE 1 exactly: the group you must act on first got read as
+# the group you cannot have. Every label below now leads with present
+# availability, and the section header states outright that all three
+# groups are available right now.
+_SURVIVAL_GONE = "TAKE NOW OR LOSE HIM"
+_SURVIVAL_TOSSUP = "MIGHT LAST"
+_SURVIVAL_SAFE = "WILL LAST"
 
 
 def _survival(adp: float, horizon_pick: int | None) -> str | None:
@@ -767,16 +779,19 @@ def _format_survival_section(
 
     lines = [
         f"## Opportunity Cost — {picks_between} pick(s) happen before your next turn (#{horizon_pick})",
-        "Estimated from each player's ADP versus that pick number. This is the "
-        "decisive comparison: taking a LIKELY THERE player now forfeits every GONE "
-        "player for nothing, since the LIKELY THERE player can still be had at your "
-        "next turn. Only pass on a GONE player for someone clearly better, not for "
+        "EVERY PLAYER LISTED BELOW IS AVAILABLE RIGHT NOW AND CAN BE DRAFTED WITH "
+        "THIS PICK. The groups describe what is likely to happen by pick "
+        f"#{horizon_pick} — they do NOT describe who is on the board today. Never "
+        "reason about a player here as though he is already taken.",
+        "Given that: a 'WILL LAST' player can still be had at your next turn, so "
+        "spending this pick on him forfeits every 'TAKE NOW OR LOSE HIM' player for "
+        "nothing. Only pass on a TAKE NOW player for someone clearly better, not for "
         "someone merely similar.",
     ]
     for label, header in (
-        (_SURVIVAL_GONE, "Almost certainly gone by then — available now only"),
-        (_SURVIVAL_TOSSUP, "Coin flip — could go either way"),
-        (_SURVIVAL_SAFE, "Very likely still on the board at your next turn"),
+        (_SURVIVAL_GONE, "TAKE NOW OR LOSE HIM — on the board now, will not be at your next turn"),
+        (_SURVIVAL_TOSSUP, "MIGHT LAST — on the board now, could go either way"),
+        (_SURVIVAL_SAFE, "WILL LAST — on the board now, and very likely still there at your next turn"),
     ):
         names = buckets[label]
         if names:
@@ -1780,10 +1795,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "WITHIN a tier — those are noise. Do not treat a lower tier as equivalent to a "
         "higher one: tier boundaries sit at the real gaps on this board, so dropping a "
         "tier costs something and needs a reason beyond a nicer-looking stat line.",
-        "2. SUBTRACT WHAT WILL KEEP. Remove anyone in the 'Very likely still on the "
-        "board at your next turn' bucket unless they are clearly, not marginally, "
-        "better than everyone in the GONE bucket. You can have them later; you cannot "
-        "have the GONE players later. This step decides most picks.",
+        "2. DEPRIORITISE WHAT WILL KEEP. Every player in the Opportunity Cost section "
+        "is available to draft with this pick — the groups say what happens LATER, not "
+        "what is on the board now, and you must never treat a listed player as already "
+        "taken. Given that, deprioritise the 'WILL LAST' group unless one of them is "
+        "clearly, not marginally, better than everyone in 'TAKE NOW OR LOSE HIM': you "
+        "can still get a WILL LAST player at your next turn and you cannot get the "
+        "others. This step decides most picks.",
         "3. WEIGH THE COST OF WAITING AGAINST YOUR ROSTER. Use the Cost of Waiting "
         "table, Run Risk, and the Roster Construction table together. A large drop-off "
         "at a position you still need to start — or at one sitting at zero cover — "
@@ -1903,9 +1921,17 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "who will not survive to your next turn and plan to take the other one later. "
         "The prompt tells you explicitly which players fall in each bucket and what "
         "the drop-off at each position is if you wait; use those numbers rather than "
-        "estimating. Never spend a pick on a player labeled 'very likely still on the "
-        "board at your next turn' unless he is clearly — not marginally — better than "
-        "everything that's about to disappear.\n\n"
+        "estimating. Never spend a pick on a player labeled 'WILL LAST' unless he is "
+        "clearly — not marginally — better than everything about to disappear.\n\n"
+
+        "RULE 1a — EVERY LISTED PLAYER IS AVAILABLE. Every name anywhere in this "
+        "prompt is on the board and can be drafted with this pick; already-drafted "
+        "players are removed before you see it. The Opportunity Cost groups forecast "
+        "what will be true at your NEXT turn — they never mean a player is unavailable "
+        "now. Reasoning such as 'the best option once X and Y are gone' is a serious "
+        "error when X and Y are listed: if they are the better players, one of THEM is "
+        "the pick. Recommend around a player only if he is genuinely absent from the "
+        "board above.\n\n"
 
         "RULE 2 — VALUE OVER NEED, UNTIL LEGALITY IS AT RISK. Draft the best player "
         "relative to positional replacement level, not the next recognizable name and "
