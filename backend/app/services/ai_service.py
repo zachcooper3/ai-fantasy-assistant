@@ -298,12 +298,24 @@ def _compute_roster_gaps(
 # is quantified live in the Cost of Waiting section.
 # ---------------------------------------------------------------------------
 
-# Positions a FLEX realistically absorbs. Deliberately excludes TE even
-# though a TE is flex-eligible: counting TE as 2-startable would flag every
-# roster as short a tight end, which is not how anyone plays. Matches the
-# FLEX handling in the Positional Availability scarcity block, so the two
-# sections can't disagree about how many RBs a team can start.
-_FLEX_ABSORBS = ("RB", "WR")
+# A note on the FLEX, because two earlier versions of this section got it
+# wrong in opposite directions and both produced a flag that fired on nearly
+# every roster:
+#
+#   1. Adding the FLEX to each eligible position's startable count credited
+#      one slot to both RB and WR, so the counts summed to 8 against a
+#      7-slot lineup. A roster holding exactly 2 RB was reported "short"
+#      whether or not it was, and a deliberately RB-heavy 4RB/2WR roster was
+#      reported short at WR.
+#   2. Allocating the FLEX to whichever position had the largest surplus
+#      fixed the arithmetic but made the result depend on an arbitrary
+#      tie-break: a balanced 3RB/3WR roster has one spare either way, yet
+#      whichever side lost the tie looked exposed and the other looked deep.
+#
+# Measuring `beyond` against the BASE requirement alone sidesteps both. The
+# FLEX is a use for a spare player, not a second requirement, so it never
+# enters the exposure math — it's mentioned once in the rendered table so
+# the counts aren't misread, and that's all.
 
 
 def _compute_roster_depth(
@@ -311,40 +323,45 @@ def _compute_roster_depth(
     lineup: dict[str, int],
 ) -> dict[str, dict[str, int]]:
     """
-    Returns {position: {"hold", "max_starts", "cover"}} for the skill
-    positions, where max_starts is how many could appear in one week's
-    lineup (base slot + FLEX for RB/WR) and cover is the surplus beyond it.
+    Returns {position: {"hold", "required", "beyond", "base_met"}} for the
+    skill positions, where `required` is that position's mandatory starting
+    slots and `beyond` is how many you hold in excess of them.
 
-    cover == 0 means a legal lineup today and no answer to an injury, a bye,
-    or a bust. cover < 0 means you cannot even fill a FLEX-heavy week from
-    this position. Both are invisible to _compute_roster_gaps, which reports
-    nothing at all once the base requirement is met.
+    `beyond` is measured against the BASE requirement, deliberately not
+    against base-plus-FLEX. The FLEX is a *use* for a spare player, not a
+    second requirement, and folding it into the denominator produces
+    artifacts: a perfectly balanced 3RB/3WR roster has one spare who could
+    flex at either position, but crediting the FLEX to whichever side wins
+    an arbitrary tie-break makes that side look exposed and the other look
+    deep. Measuring against base alone is assignment-independent — 3RB/3WR
+    correctly reads as one spare at each and raises nothing.
+
+    beyond == 0 means every player you hold there is locked into a mandatory
+    slot: one injury or bye and that slot goes to a waiver pickup. That state
+    is entirely invisible to _compute_roster_gaps, which reports nothing once
+    the base requirement is met, and it's what let a live draft sit on two
+    backs from round 3 to round 11 while the prompt called RB satisfied.
     """
     have: dict[str, int] = {}
     for p in my_roster:
         have[p["position"]] = have.get(p["position"], 0) + 1
 
-    flex = lineup.get("FLEX", 0)
     depth: dict[str, dict[str, int]] = {}
     for pos in ("QB", "RB", "WR", "TE"):
-        base = lineup.get(pos, 0)
-        if base == 0 and not have.get(pos):
+        required = lineup.get(pos, 0)
+        if required == 0 and not have.get(pos):
             continue
-        max_starts = base + (flex if pos in _FLEX_ABSORBS else 0)
         hold = have.get(pos, 0)
         depth[pos] = {
             "hold": hold,
-            "base": base,
-            "max_starts": max_starts,
-            "cover": hold - max_starts,
-            # Whether the base starting requirement is met at all. Positions
-            # that fail it are NOT depth problems — they're unfilled starting
-            # slots, already reported by the gap section above. Without this
-            # distinction the depth callout fires on every position for the
-            # first several rounds ("zero cover at QB, RB, WR, TE" after two
-            # picks), which is true, useless, and drowns the one position
-            # that genuinely is a depth problem.
-            "base_met": hold >= base,
+            "required": required,
+            "beyond": hold - required,
+            # Positions failing their base requirement are NOT depth problems
+            # — they're unfilled starting slots, already reported above.
+            # Without this distinction the callout fires on every position
+            # for the first several rounds, which is true, useless, and
+            # drowns the one position that genuinely is a depth problem.
+            "base_met": hold >= required,
         }
     return depth
 
@@ -352,6 +369,7 @@ def _compute_roster_depth(
 def _format_roster_depth_section(
     depth: dict[str, dict[str, int]],
     spots_left: int,
+    lineup_has_flex: bool = True,
 ) -> str:
     """
     The roster table plus an explicit read on which positions have no cover.
@@ -365,19 +383,12 @@ def _format_roster_depth_section(
         return ""
 
     lines = [
-        "## Roster Construction (what you hold vs. what you can start in one week)",
-        f"  {'pos':<5}{'hold':>6}{'max starts':>12}{'cover':>7}",
+        "## Roster Construction (holdings vs. mandatory starting slots)",
+        f"  {'pos':<5}{'hold':>6}{'required':>10}{'beyond':>8}",
     ]
-    # Two severities, deliberately kept apart. "Short" means you own the
-    # minimum but fewer than you can actually field in a FLEX-heavy week —
-    # the exact state that let a draft run RB2 from round 3 to round 11 with
-    # the prompt calling it satisfied. "Thin" means exactly enough for a
-    # normal week and nothing spare. Only positions whose base requirement is
-    # already met can be either; the rest are starting-slot gaps, reported
-    # above, and repeating them here would bury the real signal.
-    short: list[str] = []
-    thin: list[str] = []
-    surplus: list[str] = []
+    unfilled: list[str] = []
+    exposed: list[str] = []   # multi-slot position with nothing spare
+    spare: list[str] = []
     for pos in ("QB", "RB", "WR", "TE"):
         d = depth.get(pos)
         if d is None:
@@ -385,37 +396,50 @@ def _format_roster_depth_section(
         note = ""
         if not d["base_met"]:
             note = "  <-- starting slot still unfilled (see above)"
-        elif d["cover"] < 0:
-            note = f"  <-- SHORT: can start {d['max_starts']} in a FLEX-heavy week, hold {d['hold']}"
-            short.append(pos)
-        elif d["cover"] == 0:
-            note = "  <-- thin: no cover for an injury, bye, or bust"
-            thin.append(pos)
-        elif d["cover"] >= 3:
-            surplus.append(pos)
+            unfilled.append(pos)
+        elif d["beyond"] == 0:
+            note = "  <-- every one of them is a mandatory starter"
+            # Only positions with two or more mandatory slots count as
+            # exposed. Holding exactly one QB and one TE is the normal,
+            # correct state of nearly every roster in a 1-QB league —
+            # flagging those made this callout fire on 30 of 30 roster
+            # shapes, a constant with no information in it. Keyed off
+            # `required >= 2` rather than a hardcoded {RB, WR} so a
+            # superflex or 2-TE league is handled by the same logic.
+            if d["required"] >= 2:
+                exposed.append(pos)
+        elif d["beyond"] >= 2:
+            spare.append(pos)
         lines.append(
-            f"  {pos:<5}{d['hold']:>6}{d['max_starts']:>12}{d['cover']:>+7}{note}"
+            f"  {pos:<5}{d['hold']:>6}{d['required']:>10}{d['beyond']:>+8}{note}"
         )
 
+    if lineup_has_flex:
+        lines.append(
+            "  (your FLEX is filled by one of the 'beyond' players — an RB, WR or TE)"
+        )
     lines.append(f"Roster spots left to fill after this pick: {max(0, spots_left - 1)}.")
 
-    if short:
-        lines.append(
-            f"SHORT at {', '.join(short)} — you hold fewer than you can start in a "
-            f"single week, so a FLEX-heavy week or one injury already forces a "
-            f"replacement. Meeting the base requirement at these positions did not "
-            f"make them safe. Check the Cost of Waiting figures for what that "
-            f"replacement actually costs you in points."
+    # The callout describes an IMBALANCE, not a state. "No spare anywhere" in
+    # round 8 is true of nearly every roster in the league and implies no
+    # particular action; "spare at WR while RB has none" names a specific
+    # trade you are making and can still unmake. Requiring both sides means
+    # this stays silent on balanced rosters instead of adding a fixed line to
+    # every prompt.
+    #
+    # Held back until every base slot is filled: before that, "no spare at
+    # RB" competes with "you have no WR2", and the unfilled slot is
+    # unambiguously more urgent and already stated above.
+    if exposed and spare and not unfilled:
+        exposed_str = ", ".join(
+            f"{p} (start {depth[p]['required']}, hold {depth[p]['hold']})" for p in exposed
         )
-    if thin:
         lines.append(
-            f"No cover at {', '.join(thin)} — enough for a normal week, nothing spare."
-        )
-    if surplus:
-        lines.append(
-            f"Already deep at {', '.join(surplus)} — at least three more than you can "
-            f"start in any single week. Another one upgrades only your bench, and only "
-            f"if he beats the players already on it."
+            f"Imbalance: two or more spare at {', '.join(spare)}, none at "
+            f"{exposed_str}. Adding to a position that already has spare, while a "
+            f"multi-slot position has none, is a common way to lose a draft you were "
+            f"winning — but only when the replacement there is genuinely worse. Use "
+            f"the Cost of Waiting figures to decide that, not this line alone."
         )
     lines.append("")
     return "\n".join(lines)
@@ -1487,7 +1511,8 @@ def _build_prompt(ctx: RecommendationContext) -> str:
 
     for section in (
         _format_roster_depth_section(
-            _compute_roster_depth(ctx.my_roster, lineup), spots_left
+            _compute_roster_depth(ctx.my_roster, lineup), spots_left,
+            lineup_has_flex=bool(lineup.get("FLEX")),
         ),
         _format_survival_section(
             ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between

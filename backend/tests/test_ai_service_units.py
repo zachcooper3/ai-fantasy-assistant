@@ -656,74 +656,105 @@ def test_missing_games_played_does_not_suppress_everything():
 _PPR_LINEUP = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1, "K": 1}
 
 
-def test_two_backs_read_as_short_not_satisfied():
-    # THE regression. 2 RB meets the base requirement but you can start 3 in
-    # a FLEX week, so the position is not covered and must not read as done.
+def test_holding_only_your_mandatory_starters_reads_as_exposed():
+    # THE regression: 2 RB meets the base requirement, so the gap logic went
+    # silent on RB from round 3 to round 11 of a real draft. `beyond == 0`
+    # is the state it couldn't express — every back you own is a starter.
     depth = _compute_roster_depth(roster("RB", "RB"), _PPR_LINEUP)
     assert depth["RB"]["base_met"] is True
-    assert depth["RB"]["max_starts"] == 3
-    assert depth["RB"]["cover"] == -1
-    out = _format_roster_depth_section(depth, spots_left=13)
-    assert "SHORT at RB" in out
+    assert depth["RB"]["required"] == 2
+    assert depth["RB"]["beyond"] == 0
 
 
-def test_flex_inflates_rb_and_wr_but_not_te():
-    depth = _compute_roster_depth(roster("RB", "WR", "TE", "QB"), _PPR_LINEUP)
-    assert depth["RB"]["max_starts"] == 3      # 2 + FLEX
-    assert depth["WR"]["max_starts"] == 3      # 2 + FLEX
-    # TE is flex-eligible in the rules but nobody starts two; counting it
-    # that way would flag every roster as short a tight end.
-    assert depth["TE"]["max_starts"] == 1
-    assert depth["QB"]["max_starts"] == 1
+def test_beyond_is_measured_against_base_not_base_plus_flex():
+    # The FLEX is a use for a spare player, not a second requirement.
+    # Counting it as one credited the same slot to both RB and WR, making
+    # the startable counts sum to 8 against a 7-slot lineup.
+    depth = _compute_roster_depth(roster("RB", "RB", "WR", "WR", "TE", "QB"),
+                                  _PPR_LINEUP)
+    assert depth["RB"]["required"] == 2 and depth["WR"]["required"] == 2
+    assert depth["TE"]["required"] == 1 and depth["QB"]["required"] == 1
+    assert sum(d["required"] for d in depth.values()) == 6  # + FLEX = 7 slots
 
 
-def test_unfilled_starting_slots_are_not_reported_as_depth_problems():
-    # After two picks everything is technically "uncovered". Saying so for
-    # all four positions is true, useless, and buries the one position that
-    # is genuinely a depth problem.
+def test_balanced_roster_raises_nothing():
+    # 3RB/3WR has one spare at each; whichever fills the FLEX, neither side
+    # is exposed. An earlier version allocated the FLEX by surplus and made
+    # whichever position lost an arbitrary tie-break look short.
     out = _format_roster_depth_section(
-        _compute_roster_depth(roster("RB", "RB"), _PPR_LINEUP), spots_left=13
-    )
-    assert "SHORT at RB" in out
-    for pos in ("WR", "TE", "QB"):
-        assert f"SHORT at {pos}" not in out
-    assert "starting slot still unfilled" in out  # flagged, but deferred upward
+        _compute_roster_depth(roster("QB", "TE", *(["RB"] * 3), *(["WR"] * 3)),
+                              _PPR_LINEUP), spots_left=8)
+    assert "Imbalance" not in out
 
 
-def test_exactly_enough_reads_as_thin_not_short():
-    depth = _compute_roster_depth(
-        roster("QB", "RB", "RB", "RB", "WR", "WR", "WR", "TE"), _PPR_LINEUP)
-    assert depth["RB"]["cover"] == 0
-    out = _format_roster_depth_section(depth, spots_left=7)
-    assert "SHORT" not in out
-    assert "No cover at" in out and "TE" in out
+def test_roster_with_no_spare_anywhere_raises_nothing():
+    # Legal, nothing spare, nothing to rebalance — there is no action this
+    # could recommend, so it must stay quiet rather than add a fixed line.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("QB", "RB", "RB", "WR", "WR", "TE"),
+                              _PPR_LINEUP), spots_left=9)
+    assert "Imbalance" not in out
 
 
-def test_surplus_position_is_called_out():
-    # The other half of the live failure: seven receivers for three slots.
-    depth = _compute_roster_depth(roster(*(["WR"] * 7), "RB", "RB"), _PPR_LINEUP)
-    assert depth["WR"]["cover"] == 4
-    out = _format_roster_depth_section(depth, spots_left=6)
-    assert "Already deep at WR" in out
-    assert "SHORT at RB" in out  # both signals present simultaneously
+def test_single_slot_positions_never_count_as_exposed():
+    # Holding one QB and one TE is the normal state of nearly every roster
+    # in a 1-QB league. Flagging them made the callout fire on every roster
+    # shape tested — a constant with no information in it.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("QB", "TE", "RB", "RB", *(["WR"] * 5)),
+                              _PPR_LINEUP), spots_left=6)
+    assert "Imbalance" in out
+    assert "none at RB" in out
+    assert "QB" not in out.split("Imbalance")[1]
+    assert "TE" not in out.split("Imbalance")[1]
 
 
-def test_the_replayed_draft_flags_rb_at_every_pick_it_was_missed():
-    # Rounds 3, 6 and 9 of the real draft all took a WR while sitting on two
-    # backs. Each must now say so.
-    seq = ["RB", "RB", "WR", "WR", "TE", "WR", "QB", "WR"]
-    for through in (2, 5, 8):
-        depth = _compute_roster_depth(roster(*seq[:through]), _PPR_LINEUP)
-        out = _format_roster_depth_section(depth, spots_left=15 - through)
-        assert "SHORT at RB" in out, f"missed at pick {through + 1}"
+def test_exposure_generalises_to_a_superflex_league():
+    # Keyed off required >= 2, not a hardcoded {RB, WR}.
+    superflex = {"QB": 2, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1, "K": 1}
+    out = _format_roster_depth_section(
+        _compute_roster_depth(
+            roster("QB", "QB", "TE", *(["RB"] * 4), "WR", "WR"), superflex),
+        spots_left=6)
+    assert "none at QB" in out
+
+
+def test_imbalance_fires_on_the_real_draft_shape():
+    # Round 9 of the reviewed draft: two backs, four receivers.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("QB", "TE", "RB", "RB", *(["WR"] * 4)),
+                              _PPR_LINEUP), spots_left=7)
+    assert "Imbalance" in out
+    assert "spare at WR" in out and "none at RB" in out
+
+
+def test_imbalance_is_symmetric_not_rb_biased():
+    # The mirror image must read identically — this encodes no opinion that
+    # RB is special, only that a multi-slot position with no spare while
+    # another has two is worth naming.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("QB", "TE", *(["RB"] * 5), "WR", "WR"),
+                              _PPR_LINEUP), spots_left=6)
+    assert "spare at RB" in out and "none at WR" in out
+
+
+def test_unfilled_starting_slots_suppress_the_depth_callout():
+    # An unfilled WR2 is unambiguously more urgent than RB depth and is
+    # already reported by the gap section; running both at once is how the
+    # first version flagged all four positions in round 3.
+    out = _format_roster_depth_section(
+        _compute_roster_depth(roster("RB", "RB", "RB", "RB", "WR"), _PPR_LINEUP),
+        spots_left=10)
+    assert "Imbalance" not in out
+    assert "starting slot still unfilled" in out
 
 
 def test_depth_section_appears_in_the_built_prompt():
     ctx = ctx_with_available(1, 2, 3)
-    ctx.my_roster = roster("RB", "RB", "WR", "WR", "TE", "WR", "QB")
+    ctx.my_roster = roster("RB", "RB", "WR", "WR", "TE", "WR", "WR", "QB")
     prompt = _build_prompt(ctx)
     assert "Roster Construction" in prompt
-    assert "SHORT at RB" in prompt
+    assert "Imbalance" in prompt and "none at RB" in prompt
     # The old dead-end wording must be gone — it ended the section on a shrug
     # for the entire back half of the draft.
     assert "every remaining pick is depth or upside" not in prompt
