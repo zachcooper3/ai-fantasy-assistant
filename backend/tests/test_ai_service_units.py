@@ -26,6 +26,7 @@ from backend.app.services.ai_service import (
     _draft_value,
     _find_dominating_player,
     _dominance_alert,
+    _mentions_player,
     _shortlist,
     _format_shortlist_section,
     _TEMPERATURE,
@@ -1325,3 +1326,88 @@ def test_guard_appends_an_alert_without_rejecting_the_pick():
     assert result.recommendation.player_id == 2    # never rewrites the pick
     assert result.alerts[0] == "existing alert"    # appended last
     assert any(a.startswith("Check this") for a in result.alerts)
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes
+# ---------------------------------------------------------------------------
+
+def test_shortlist_axes_are_not_secretly_the_same_axis():
+    # Regression: "biggest faller" scored (pick_number - adp). pick_number is
+    # constant across the board, so maximising it is just minimising ADP —
+    # the axis returned the identical players to the ADP axis and the
+    # shortlist was silently one axis narrower than it looked.
+    board = [{"id": i, "rank": i, "name": f"P{i}", "position": "WR",
+              "team": "X", "adp": float(i * 3), "sleeper_id": None}
+             for i in range(1, 11)]
+    by_adp = [p["id"] for p in sorted(board, key=lambda p: p["adp"])[:3]]
+    by_fall = [p["id"] for p in sorted(board, key=lambda p: -(20 - p["adp"]))[:3]]
+    assert by_adp == by_fall, "the two orderings are provably identical"
+    # So the shortlist must derive its extra breadth from somewhere else.
+    sl = _shortlist(board, 20, {}, {})
+    assert [p["id"] for p in sl][:3] != by_adp or len(sl) <= 3
+
+
+def test_shortlist_spans_positions_on_a_lopsided_board():
+    # Without a per-position axis, a board whose top is all receivers yields
+    # an all-receiver shortlist and the cross-position call never gets forced.
+    board = ([{"id": i, "rank": i, "name": f"W{i}", "position": "WR",
+               "team": "X", "adp": float(i), "sleeper_id": None}
+              for i in range(1, 9)]
+             + [{"id": 20, "rank": 20, "name": "The RB", "position": "RB",
+                 "team": "X", "adp": 40.0, "sleeper_id": None}])
+    positions = {p["position"] for p in _shortlist(board, 20, {}, {})}
+    assert "RB" in positions and "WR" in positions
+
+
+def test_mentions_player_is_not_fooled_by_a_generational_suffix():
+    # A verdict about the junior must not count as engagement with the
+    # senior. Word boundaries alone don't catch this: "Michael Pittman Jr."
+    # contains "Michael Pittman" followed by a space.
+    assert not _mentions_player("Michael Pittman Jr. — passed", "Michael Pittman")
+    assert _mentions_player("Michael Pittman Jr. — passed", "Michael Pittman Jr.")
+    assert not _mentions_player("James Cook III — taken", "James Cook")
+
+
+def test_mentions_player_handles_punctuation_and_case():
+    assert _mentions_player("A.J. Brown — taken", "A.J. Brown")
+    assert _mentions_player("rashee rice was risky", "Rashee Rice")
+    assert _mentions_player("De'Von Achane passed", "De'Von Achane")
+
+
+def test_mentions_player_does_not_match_a_different_surname():
+    assert not _mentions_player("Chase Brown — taken", "A.J. Brown")
+    assert not _mentions_player("", "Rashee Rice")
+
+
+def test_cap_never_truncates_the_per_position_representatives():
+    # The cap truncates, and QB/TE carry late ADP by nature — so an
+    # ADP-ordered cap dropped exactly the entries the per-position axis
+    # exists to guarantee. Reproduced with four distinct receivers winning
+    # both the ADP and VOR axes: RB and TE were cut and the shortlist
+    # collapsed back onto one position.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR",
+              "team": "X", "adp": float(i), "sleeper_id": None}
+             for i in range(1, 9)]
+    board += [{"id": 50, "rank": 50, "name": "The QB", "position": "QB",
+               "team": "X", "adp": 90.0, "sleeper_id": None},
+              {"id": 51, "rank": 51, "name": "The TE", "position": "TE",
+               "team": "X", "adp": 95.0, "sleeper_id": None},
+              {"id": 52, "rank": 52, "name": "The RB", "position": "RB",
+               "team": "X", "adp": 99.0, "sleeper_id": None}]
+    # Top VOR belongs to WR5/WR6, not the top-ADP pair, so the two axes
+    # contribute four different receivers and crowd the list.
+    metrics = {5: {"fantasy_points_avg": 40.0}, 6: {"fantasy_points_avg": 39.0},
+               1: {"fantasy_points_avg": 12.0}}
+    repl = {"WR": 11.9, "RB": 11.1, "QB": 17.5, "TE": 10.6}
+    positions = {p["position"] for p in _shortlist(board, 20, metrics, repl)}
+    assert {"QB", "RB", "TE", "WR"} <= positions
+
+
+def test_shortlist_respects_the_cap():
+    board = [{"id": i, "rank": i, "name": f"P{i}",
+              "position": ["QB", "RB", "WR", "TE"][i % 4], "team": "X",
+              "adp": float(i), "sleeper_id": None} for i in range(1, 30)]
+    metrics = {i: {"fantasy_points_avg": 30.0 - i} for i in range(1, 30)}
+    repl = {"WR": 11.9, "RB": 11.1, "QB": 17.5, "TE": 10.6}
+    assert len(_shortlist(board, 20, metrics, repl)) <= 6

@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -767,7 +768,7 @@ def _draft_value(adp: float, pick_number: int) -> str:
 # How many players get flagged as mandatory evaluations. Small on purpose:
 # the point is to stop the top of the board being skipped, not to hand over
 # a slate so long that the requirement becomes busywork.
-_MUST_EVALUATE = 5
+_MUST_EVALUATE = 6
 
 
 def _shortlist(
@@ -786,31 +787,56 @@ def _shortlist(
     the merits. Rules about how to choose cannot fix a player never being
     considered; only a required consideration set can.
 
-    Deliberately three different rankings rather than one composite score. A
+    Deliberately several separate rankings rather than one composite score. A
     composite would be a ranking, and ranking the board for the model is
     exactly the over-constraint to avoid: it should still decide, it just
-    has to look first. Three axes also surface genuinely different players —
-    the best ADP and the best VOR are frequently not the same man, and that
+    has to look first. Separate axes also surface genuinely different players
+    — the best ADP and the best VOR are frequently not the same man, and that
     disagreement is the interesting part of the pick.
+
+    NOTE: an earlier version used "biggest faller" as the third axis, scoring
+    players by (pick_number - adp). Since pick_number is the same constant
+    for everyone on the board, maximising that is just minimising ADP — it
+    returned the identical players to the ADP axis and the shortlist was
+    silently only two axes wide. Replaced with best-available-per-position,
+    which is the axis that was actually missing: without it a board whose top
+    is all receivers produces an all-receiver shortlist, and the
+    cross-position call never gets forced.
     """
     if not board:
         return []
 
-    by_adp = sorted(board, key=lambda p: p["adp"])[:3]
-    with_vor = [
-        (v, p) for p in board
-        if (v := _vor(p, player_metrics, replacement)) is not None
-    ]
-    by_vor = [p for _, p in sorted(with_vor, key=lambda t: -t[0])[:3]]
-    by_fall = sorted(board, key=lambda p: -(pick_number - p["adp"]))[:2]
+    def vor_of(p: dict) -> float | None:
+        return _vor(p, player_metrics, replacement)
 
+    by_adp = sorted(board, key=lambda p: p["adp"])[:2]
+    with_vor = [(v, p) for p in board if (v := vor_of(p)) is not None]
+    by_vor = [p for _, p in sorted(with_vor, key=lambda t: -t[0])[:2]]
+
+    # Best available at each position, so the shortlist can never collapse
+    # onto one position and hide the choice that matters most.
+    per_position: list[dict] = []
+    for pos in ("QB", "RB", "WR", "TE"):
+        at_pos = [p for p in board if p["position"] == pos]
+        if at_pos:
+            per_position.append(min(at_pos, key=lambda p: p["adp"]))
+
+    # Priority order is load-bearing, because the cap truncates. Position
+    # representatives go first: quarterbacks and tight ends have late ADP by
+    # nature, so a cap applied to an ADP-sorted union drops exactly the
+    # entries this axis exists to guarantee. Verified: with four distinct
+    # receivers winning the ADP and VOR axes, the RB and TE reps were being
+    # cut and the shortlist collapsed back to one position.
+    #
+    # The global best ADP is always some position's representative, so
+    # `by_adp` mostly reinforces rather than adds — it ranks last.
     seen: set[int] = set()
     out: list[dict] = []
-    for p in [*by_adp, *by_vor, *by_fall]:
-        if p["id"] not in seen:
+    for p in [*per_position, *by_vor, *by_adp]:
+        if p["id"] not in seen and len(out) < _MUST_EVALUATE:
             seen.add(p["id"])
             out.append(p)
-    return sorted(out, key=lambda p: p["adp"])[:_MUST_EVALUATE]
+    return sorted(out, key=lambda p: p["adp"])
 
 
 def _format_shortlist_section(
@@ -2206,6 +2232,38 @@ _DOMINANCE_ADP_MARGIN = 2.0
 _DOMINANCE_VOR_MARGIN = 0.5
 
 
+def _mentions_player(text: str, name: str) -> bool:
+    """
+    Whether `text` names this player, matched on whole-word boundaries.
+
+    A plain substring test looks correct and is a latent false-negative: with
+    a suffixed pair like "Michael Pittman" and "Michael Pittman Jr.", a
+    verdict about the junior counts as engagement with the senior, and the
+    dominance alert is silently suppressed for a player nobody considered.
+    The current ADP feed happens to contain no such pair — checked, zero
+    collisions — but that is a property of today's data, not of the code, and
+    one refresh could introduce one.
+
+    Anchoring on word boundaries makes "Pittman Jr." stop matching "Pittman"
+    unless the exact name appears. Punctuation in names ("A.J. Brown",
+    "De'Von Achane") is escaped rather than special.
+    """
+    if not text or not name:
+        return False
+    # Word boundaries alone are insufficient: "Michael Pittman Jr." genuinely
+    # contains "Michael Pittman" followed by a space, so the boundary test
+    # passes and the two players collapse. The trailing lookahead rejects a
+    # match immediately followed by a generational suffix, which is the only
+    # way this collision arises in practice — and the way Sleeper's own
+    # player data differs from the ADP feed (see sync_sleeper_ids.py, where
+    # suffix handling was already a source of 16 unmatched players).
+    return re.search(
+        rf"(?<!\w){re.escape(name)}(?!\w)(?!\s+(?:Jr|Sr|II|III|IV|V)\b\.?)",
+        text,
+        re.IGNORECASE,
+    ) is not None
+
+
 def _find_dominating_player(
     pick: PickSuggestion,
     ctx: RecommendationContext,
@@ -2268,7 +2326,7 @@ def _dominance_alert(
     other = _find_dominating_player(pick, ctx)
     if other is None:
         return None
-    if other["name"].lower() in engaged_text.lower():
+    if _mentions_player(engaged_text, other["name"]):
         return None
     mine = _vor({"id": pick.player_id, "position": pick.position},
                 ctx.player_metrics, ctx.replacement_ppg)
