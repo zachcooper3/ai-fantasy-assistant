@@ -862,8 +862,14 @@ def _format_metrics_line(m: dict) -> str | None:
         for label, key, fmt in _TREND_FIELDS
         if m.get(key) is not None
     ]
-    if m.get("is_rookie_or_second_year"):
-        trend_parts.append("rookie/2nd-year")
+    # NOTE: the `is_rookie_or_second_year` column used to be read here. It was
+    # removed rather than fixed: no ingestion script has ever written it (it's
+    # declared on PlayerMetrics, read in three places, set by nothing — 0 of
+    # 182 rows populated), so this branch was dead code that silently never
+    # fired. Experience is now derived from DraftProfile.draft_year, which IS
+    # populated, in _format_metrics_section — where the draft profile is in
+    # scope. Leaving both would give the same fact two sources of truth and
+    # print it twice the day fetch_metrics.py starts populating the column.
 
     if not parts and not trend_parts:
         return None
@@ -872,6 +878,83 @@ def _format_metrics_line(m: dict) -> str | None:
     if trend_parts:
         line += (" | " if line else "") + ", ".join(trend_parts)
     return line
+
+
+# Players this many NFL seasons in or fewer keep their draft capital attached
+# to their stat line. Beyond that, where a player was drafted stops carrying
+# predictive weight relative to what he's actually done on the field, and the
+# line is just noise.
+_DRAFT_CAPITAL_EXPERIENCE_LIMIT = 2
+
+_ORDINALS = {0: "rookie", 1: "2nd", 2: "3rd"}
+
+
+def _infer_current_season(
+    player_metrics: dict[int, dict],
+    draft_profiles: dict[int, dict],
+) -> int | None:
+    """
+    The season being drafted for, inferred from the data itself rather than
+    the system clock.
+
+    Two independent signals, and the later one wins: PlayerMetrics holds the
+    *prior* completed season (so +1), and the newest DraftProfile draft_year
+    is the class that just came in (so as-is). During draft season both agree.
+    Deriving it this way means a stale DB reports stale-but-consistent
+    experience numbers instead of silently aging every player by a year every
+    January, and a data refresh self-corrects with no code change.
+
+    Returns None when neither table has anything to go on, in which case
+    experience is simply not rendered — better than a guess that quietly
+    mislabels a veteran as a rookie.
+    """
+    candidates: list[int] = []
+    seasons = [m.get("season") for m in player_metrics.values() if m.get("season")]
+    if seasons:
+        candidates.append(max(seasons) + 1)
+    years = [d.get("draft_year") for d in draft_profiles.values() if d.get("draft_year")]
+    if years:
+        candidates.append(max(years))
+    return max(candidates) if candidates else None
+
+
+def _experience_context(dp: dict | None, current_season: int | None) -> str:
+    """
+    A short "2nd NFL season, 1st-round pick (#19 overall)" clause for players
+    early enough in their careers for it to matter, or "" otherwise.
+
+    This exists because of a confirmed live miss: a second-year WR with
+    first-round draft capital was repeatedly passed over for a much older
+    veteran whose prior-season per-game average was higher. Every fact needed
+    to see the difference was in the database and none of it reached the
+    prompt — _format_metrics_section rendered draft capital only as a
+    *fallback* for players with no stats at all, so the moment a rookie
+    completed a season his pedigree disappeared and he read as an anonymous
+    veteran with mediocre numbers.
+    """
+    if not dp or current_season is None:
+        return ""
+    draft_year = dp.get("draft_year")
+    if draft_year is None:
+        return ""
+
+    experience = current_season - draft_year
+    if experience < 0 or experience > _DRAFT_CAPITAL_EXPERIENCE_LIMIT:
+        return ""
+
+    label = _ORDINALS.get(experience)
+    bits = [label if experience == 0 else f"{label} NFL season"]
+
+    rnd, pick = dp.get("draft_round"), dp.get("draft_pick")
+    if rnd is not None:
+        capital = {1: "1st", 2: "2nd", 3: "3rd"}.get(rnd, f"{rnd}th") + "-round pick"
+        if pick is not None:
+            capital += f" (#{pick} overall)"
+        bits.append(capital)
+    elif draft_year is not None:
+        bits.append(f"{draft_year} draft class")
+
+    return ", ".join(bits)
 
 
 def _format_draft_profile_line(dp: dict) -> str | None:
@@ -968,6 +1051,7 @@ def _format_metrics_section(
     model reached for outside knowledge instead of the prompt.
     """
     draft_profiles = draft_profiles or {}
+    current_season = _infer_current_season(player_metrics, draft_profiles)
     sections: list[str] = []
     for p in top_available:
         m = player_metrics.get(p["id"])
@@ -1005,7 +1089,16 @@ def _format_metrics_section(
                 f"was computed for this player."
             )
         else:
-            sections.append(f"- {p['name']} ({p['position']}) [{m.get('season')} season]: {line}")
+            # Draft capital rides along with the stat line for players still
+            # early in their careers, instead of only standing in for missing
+            # stats. See _experience_context: without this a second-year
+            # first-rounder's numbers are presented as though they came from
+            # an established veteran, which is a materially different claim.
+            context = _experience_context(draft_profiles.get(p["id"]), current_season)
+            bracket = f"{m.get('season')} season"
+            if context:
+                bracket += f" | {context}"
+            sections.append(f"- {p['name']} ({p['position']}) [{bracket}]: {line}")
 
     if not sections:
         return ""
@@ -1397,7 +1490,20 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "Day 1-2 pick in a favorable offense is a legitimate breakout call with zero "
         "NFL snaps.\n\n"
 
-        "RULE 6 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
+        "RULE 6 — YOUNG PLAYERS ARE ASCENDING; TREAT THEIR NUMBERS AS A FLOOR. Some "
+        "stat lines are tagged with the player's NFL season and draft capital, e.g. "
+        "'2nd NFL season, 1st-round pick (#19 overall)'. That tag changes what the "
+        "numbers mean. A first- or second-year player's per-game average was produced "
+        "while he was splitting snaps, learning the offense, and behind incumbents; it "
+        "is a floor he is likely to beat, not a projection. An established veteran's "
+        "average is his true talent and, past his prime, an optimistic one. So do NOT "
+        "compare the two as like-for-like evidence: a modest per-game edge for an older "
+        "player over a high-draft-capital ascending one is weak grounds for preferring "
+        "the veteran, particularly when the younger player also carries the better ADP "
+        "— the market is pricing in growth you can see the reason for right in the "
+        "tag.\n\n"
+
+        "RULE 7 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
         "scheme, or opponent-strength data for any position, so nothing grounds a "
         "claim that one defense or kicker is better than another; ADP order is the "
         "only signal you have for them. Never invent outside knowledge about which "
@@ -1406,7 +1512,7 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "earlier costs you a skill player for a position that will still be freely "
         "available at the end.\n\n"
 
-        "RULE 7 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
+        "RULE 8 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
         "trace to something in the prompt. You have no bye-week data, no depth-chart "
         "narrative beyond what is shown, no 2026 projections, and no injury news past "
         "what appears in Player News & Analysis — so do not reason about bye-week "
@@ -1787,6 +1893,7 @@ def _build_preview_context(top_n: int = 60) -> RecommendationContext:
     """
     from sqlmodel import Session
 
+    from backend.db import draft_profile_repo, metrics_repo
     from backend.db import player_repo as repo
     from backend.db.database import engine
 
@@ -1800,6 +1907,24 @@ def _build_preview_context(top_n: int = 60) -> RecommendationContext:
         ]
         available_counts = repo.count_available_by_position(session)
 
+        # Metrics and draft profiles, exactly as recommendations.py::
+        # _build_context loads them. These were missing entirely, which made
+        # this CLI actively misleading: with player_metrics empty, EVERY
+        # player rendered as "No prior-season metrics on file (likely a
+        # rookie...)" — so the one tool whose whole purpose is showing the
+        # real prompt was the only place that claimed the app had no data on
+        # anyone. Flattened inline rather than importing _metrics_dict from
+        # recommendations.py, which imports this module (circular).
+        ids = [p["id"] for p in top_available]
+        player_metrics = {
+            pid: {c: getattr(m, c) for c in type(m).model_fields}
+            for pid, m in metrics_repo.get_metrics_bulk(session, ids).items()
+        }
+        draft_profiles = {
+            pid: {c: getattr(d, c) for c in type(d).model_fields}
+            for pid, d in draft_profile_repo.get_draft_profiles_bulk(session, ids).items()
+        }
+
     # Slot 1 of a 12-team snake: picking at #1 means waiting until #24, with
     # slots 2-12 then 12-2 in between. Hardcoded here (the real app derives
     # it from DraftStateService) purely so the preview actually exercises the
@@ -1812,6 +1937,8 @@ def _build_preview_context(top_n: int = 60) -> RecommendationContext:
         upcoming_pick_slots=list(range(2, 13)) + list(range(12, 1, -1)),
         top_available=top_available,
         available_counts=available_counts,
+        player_metrics=player_metrics,
+        draft_profiles=draft_profiles,
     )
 
 

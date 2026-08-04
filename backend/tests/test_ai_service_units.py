@@ -15,6 +15,9 @@ from backend.app.services.ai_service import (
     _parse_response,
     _build_prompt,
     _build_system_prompt,
+    _experience_context,
+    _format_metrics_section,
+    _infer_current_season,
     _format_positional_dropoff,
     _format_run_risk,
     _restore_prefill,
@@ -442,3 +445,116 @@ def test_system_prompt_tracks_the_session_scoring_format():
     assert "Half a point" in _build_system_prompt("half_ppr")
     # Unknown formats fall back rather than rendering an empty scoring note.
     assert "SCORING:" in _build_system_prompt("weird_custom")
+
+
+# ---------------------------------------------------------------------------
+# Draft capital + experience
+#
+# Live miss (2026-08-04): a 2nd-year WR with 1st-round capital and the better
+# ADP was repeatedly passed over for a much older veteran whose prior-season
+# per-game average was higher. Every fact needed was in the DB; none of it
+# reached the prompt. Two independent causes, both pinned below.
+# ---------------------------------------------------------------------------
+
+def _metrics(season=2025, ppg=11.5, games=17):
+    return {"season": season, "games_played": games, "fantasy_points_avg": ppg,
+            "targets_per_game": 7.5}
+
+
+def _profile(year=2025, rnd=1, pick=19):
+    return {"draft_year": year, "draft_round": rnd, "draft_pick": pick}
+
+
+def test_current_season_inferred_from_metrics_not_the_clock():
+    # Prior completed season + 1. Deriving from the system clock would age
+    # every player by a year each January without a data refresh.
+    assert _infer_current_season({1: _metrics(season=2025)}, {}) == 2026
+
+
+def test_current_season_inferred_from_newest_draft_class():
+    assert _infer_current_season({}, {1: _profile(year=2026)}) == 2026
+
+
+def test_current_season_takes_the_later_of_the_two_signals():
+    assert _infer_current_season({1: _metrics(season=2024)}, {1: _profile(year=2026)}) == 2026
+
+
+def test_current_season_unknown_rather_than_guessed():
+    # No basis to infer — experience must not be rendered at all.
+    assert _infer_current_season({}, {}) is None
+    assert _experience_context(_profile(), None) == ""
+
+
+def test_experience_context_labels_rookie_and_second_year():
+    assert _experience_context(_profile(year=2026), 2026) == \
+        "rookie, 1st-round pick (#19 overall)"
+    assert _experience_context(_profile(year=2025), 2026) == \
+        "2nd NFL season, 1st-round pick (#19 overall)"
+    assert _experience_context(_profile(year=2024), 2026).startswith("3rd NFL season")
+
+
+def test_experience_context_suppressed_for_established_veterans():
+    # Where a 6-year vet was drafted stops being predictive next to what he
+    # has actually done. Real data has no such profiles yet, so this is the
+    # only place the limit is exercised.
+    assert _experience_context(_profile(year=2020), 2026) == ""
+
+
+def test_experience_context_handles_undrafted_and_partial_rows():
+    assert _experience_context(None, 2026) == ""
+    assert _experience_context({"draft_year": None}, 2026) == ""
+    # Round known, exact pick missing — still worth saying.
+    assert "2nd-round pick" in _experience_context(
+        {"draft_year": 2025, "draft_round": 2, "draft_pick": None}, 2026)
+    assert "overall" not in _experience_context(
+        {"draft_year": 2025, "draft_round": 2, "draft_pick": None}, 2026)
+
+
+def test_draft_capital_now_rides_along_with_the_stat_line():
+    # THE regression: draft capital used to render only as a fallback for
+    # players with NO metrics, so the moment a rookie completed a season his
+    # pedigree vanished and he read as an anonymous veteran.
+    player = [{"id": 1, "name": "Young WR", "position": "WR", "team": "TB",
+               "adp": 35.6, "rank": 37, "sleeper_id": "x"}]
+    out = _format_metrics_section(player, {1: _metrics()}, {1: _profile()})
+    assert "2nd NFL season" in out
+    assert "1st-round pick (#19 overall)" in out
+    assert "11.5 PPR pts/gm" in out  # stats still there, not replaced
+
+
+def test_veteran_with_metrics_gets_no_experience_tag():
+    player = [{"id": 1, "name": "Old WR", "position": "WR", "team": "LAR",
+               "adp": 41.2, "rank": 42, "sleeper_id": "y"}]
+    out = _format_metrics_section(player, {1: _metrics(ppg=15.9, games=14)},
+                                  {1: _profile(year=2014, rnd=2, pick=53)})
+    assert "NFL season" not in out
+    assert "15.9 PPR pts/gm" in out
+
+
+def test_player_without_metrics_still_gets_the_full_draft_profile_fallback():
+    # The pre-existing rookie path must keep working — college production and
+    # all — now that the tag exists alongside it.
+    player = [{"id": 1, "name": "True Rookie", "position": "RB", "team": "DEN",
+               "adp": 90.0, "rank": 88, "sleeper_id": "z"}]
+    out = _format_metrics_section(player, {}, {1: {**_profile(year=2026),
+                                                  "college": "Ohio St.",
+                                                  "receiving_yards": 1011}})
+    assert "No NFL performance data yet" in out
+    assert "Ohio St." in out
+
+
+def test_dead_rookie_flag_column_is_no_longer_read():
+    # is_rookie_or_second_year is written by no ingestion script (0/182 rows).
+    # Even if it were set, experience must come from draft_year alone so the
+    # fact has exactly one source of truth.
+    player = [{"id": 1, "name": "Someone", "position": "WR", "team": "TB",
+               "adp": 50.0, "rank": 50, "sleeper_id": "q"}]
+    m = {**_metrics(), "is_rookie_or_second_year": True}
+    out = _format_metrics_section(player, {1: m}, {})
+    assert "rookie/2nd-year" not in out
+
+
+def test_system_prompt_tells_the_model_what_the_tag_means():
+    sp = _build_system_prompt("ppr")
+    assert "ASCENDING" in sp
+    assert "floor" in sp
