@@ -22,6 +22,10 @@ from backend.app.services.ai_service import (
     _infer_current_season,
     _compute_roster_depth,
     _compute_adp_tiers,
+    _draft_value,
+    _shortlist,
+    _format_shortlist_section,
+    _TEMPERATURE,
     compute_replacement_levels,
     _vor,
     _format_roster_depth_section,
@@ -148,11 +152,14 @@ def test_string_player_id_is_coerced_not_rejected():
     assert result.recommendation.player_id == 1
 
 
-def test_unavailable_alternatives_are_dropped_and_capped_at_three():
-    payload = valid_payload(alt_ids=(2, 99, 3, 4))  # 99 unavailable, 4 alts total
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3, 4))
-    # Capped to first 3 entries, then filtered: [2, 99, 3] -> [2, 3]
-    assert [a.player_id for a in result.alternatives] == [2, 3]
+def test_unavailable_alternatives_are_dropped_and_capped():
+    # Cap is _MAX_ALTERNATIVES; anything past it is discarded before the
+    # availability filter runs, so an unavailable id inside the cap still
+    # costs you a slot. Six offered, five kept, 99 then dropped as invalid.
+    payload = valid_payload(alt_ids=(2, 99, 3, 4, 5, 6))
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3, 4, 5, 6))
+    assert len(payload["alternatives"]) > _MAX_ALTERNATIVES
+    assert [a.player_id for a in result.alternatives] == [2, 3, 4, 5]
 
 
 def test_malformed_alternative_entries_are_skipped():
@@ -1110,3 +1117,105 @@ def test_task_requires_justifying_a_pass_on_a_strictly_better_player():
     prompt = _build_prompt(ctx_with_available(1, 2, 3))
     assert "a better ADP and a higher VOR" in prompt
     assert "take the better player" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Draft value + must-evaluate shortlist
+#
+# Both exist because every live mis-recommendation was an OMISSION, not a bad
+# choice. At pick 17 the model took Pickens (ADP 21.3, a 4.3-pick reach) over
+# Rice (ADP 11.5, a 5.5-pick faller who also led the board on VOR) and never
+# mentioned Rice at all. The value delta was computable and wasn't computed;
+# the top of the board was skippable and got skipped.
+# ---------------------------------------------------------------------------
+
+def test_draft_value_labels_fallers_reaches_and_neither():
+    assert _draft_value(11.5, 17) == "FALLING +6"
+    assert _draft_value(21.3, 17) == "reach -4"
+    assert _draft_value(17.5, 17) == "at ADP"      # inside the noise band
+
+
+def test_draft_value_noise_band_is_symmetric():
+    assert _draft_value(16.0, 17) == "at ADP"
+    assert _draft_value(18.0, 17) == "at ADP"
+
+
+def _vboard():
+    # id 1: best ADP and biggest faller.  id 2: mid.  id 3: highest VOR but a
+    # big reach.  ids 4-8: filler so the shortlist has to actually choose.
+    return [{"id": i, "rank": i, "name": f"P{i}",
+             "position": "WR" if i % 2 else "RB", "team": "X",
+             "adp": [8.0, 18.0, 40.0, 19.0, 20.0, 21.0, 22.0, 23.0][i - 1],
+             "sleeper_id": None}
+            for i in range(1, 9)]
+
+
+_VMETRICS = {1: {"fantasy_points_avg": 18.0}, 2: {"fantasy_points_avg": 15.0},
+             3: {"fantasy_points_avg": 24.0}}
+_VREPL = {"WR": 11.9, "RB": 11.1}
+
+
+def test_shortlist_includes_the_best_adp_on_the_board():
+    ids = [p["id"] for p in _shortlist(_vboard(), 20, _VMETRICS, _VREPL)]
+    assert 1 in ids
+
+
+def test_shortlist_includes_the_highest_vor_even_when_it_is_a_reach():
+    # id 3 is 20 picks early but has the best value over replacement — the
+    # cross-position tension worth surfacing, not hiding.
+    ids = [p["id"] for p in _shortlist(_vboard(), 20, _VMETRICS, _VREPL)]
+    assert 3 in ids
+
+
+def test_shortlist_is_capped_and_deduplicated():
+    sl = _shortlist(_vboard(), 20, _VMETRICS, _VREPL)
+    assert len(sl) <= 5
+    assert len({p["id"] for p in sl}) == len(sl)
+
+
+def test_shortlist_survives_a_board_with_no_metrics_at_all():
+    sl = _shortlist(_vboard(), 20, {}, {})
+    assert sl, "must still shortlist on ADP alone when VOR is unavailable"
+
+
+def test_shortlist_section_names_ids_and_demands_a_verdict():
+    out = _format_shortlist_section(
+        _shortlist(_vboard(), 20, _VMETRICS, _VREPL), 20, _VMETRICS, _VREPL)
+    assert "MUST EVALUATE" in out
+    assert "`considered`" in out
+    assert "id=1" in out
+
+
+def test_board_rows_carry_the_value_delta():
+    ctx = ctx_with_available(1, 2)
+    ctx.top_available[0]["adp"] = 5.0
+    ctx.top_available[1]["adp"] = 40.0
+    ctx.pick_number = ctx.my_next_pick_number = 20
+    prompt = _build_prompt(ctx)
+    assert "FALLING +15" in prompt
+    assert "reach -20" in prompt
+
+
+def test_considered_verdicts_are_parsed():
+    payload = valid_payload()
+    payload["considered"] = ["Rashee Rice — passed, already deep at WR",
+                             "Chase Brown — taken"]
+    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
+    assert len(result.considered) == 2
+    assert "Rashee Rice" in result.considered[0]
+
+
+def test_missing_considered_does_not_reject_the_recommendation():
+    # A bookkeeping omission must never cost a good pick on draft day.
+    result = _parse_response(json.dumps(valid_payload()), ctx_with_available(1, 2, 3))
+    assert result is not None
+    assert result.considered == []
+
+
+def test_prompt_requires_alternatives_to_span_two_positions():
+    prompt = _build_prompt(ctx_with_available(1, 2, 3))
+    assert "at least TWO different positions" in prompt
+
+
+def test_temperature_allows_variation_without_being_random():
+    assert 0.0 < _TEMPERATURE <= 0.5

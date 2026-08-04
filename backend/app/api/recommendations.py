@@ -66,6 +66,9 @@ class RecommendationResponse(BaseModel):
     strategy: str = ""
     # "high" | "medium" | "low". The ADP fallback always reports "low".
     confidence: str = "medium"
+    # One line per must-evaluate player: taken, or passed and why. Surfaces
+    # omission, which is how every live mis-recommendation has manifested.
+    considered: list[str] = []
     # Draft context echoed back for the frontend
     pick_number: int
     is_my_turn: bool
@@ -318,6 +321,7 @@ async def recommend_pick(
         model=result.model,
         strategy=result.strategy,
         confidence=result.confidence,
+        considered=result.considered,
         pick_number=ctx.pick_number,
         is_my_turn=ctx.is_my_turn,
         picks_until_my_turn=ctx.picks_until_my_turn,

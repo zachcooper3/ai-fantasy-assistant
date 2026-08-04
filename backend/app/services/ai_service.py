@@ -37,7 +37,7 @@ _CONFIDENCE_LEVELS = {"high", "medium", "low"}
 # How many alternatives we keep. The prompt states this explicitly *and*
 # _parse_response enforces it — if only the parser knew, the model would spend
 # tokens writing entries that get silently discarded.
-_MAX_ALTERNATIVES = 3
+_MAX_ALTERNATIVES = 5
 
 # Output budget. This has to comfortably fit the whole JSON response: strategy,
 # confidence, the recommendation, _MAX_ALTERNATIVES entries that each carry
@@ -46,15 +46,21 @@ _MAX_ALTERNATIVES = 3
 # strategy/tradeoff pushed real responses past the ceiling, and a truncated
 # response is unparseable JSON — which silently degraded every recommendation
 # to the ADP fallback.
-_MAX_RESPONSE_TOKENS = 2048
+_MAX_RESPONSE_TOKENS = 3072
 
-# This is an analytical task with a single best answer, not a creative one.
-# The default temperature of 1.0 meant two "Get pick" clicks on an unchanged
-# board could return different players with equally confident reasoning,
-# which reads as the tool being unreliable rather than the board being close
-# (that's what `confidence: low` is for). 0 also measurably reduces malformed
-# JSON, which on this path costs a whole recommendation via the ADP fallback.
-_TEMPERATURE = 0.0
+# Low but not zero. The default of 1.0 made two clicks on an unchanged board
+# return different players with equally confident reasoning, which reads as
+# the tool being unreliable rather than the board being close (that's what
+# `confidence: low` is for). 0 fixed that but made the advice feel locked:
+# re-rolling a pick you disagreed with returned the identical answer.
+#
+# 0.3 keeps near-identical behaviour on clear-cut boards while allowing
+# genuine alternatives to surface when the top few are close — which is
+# exactly when a second opinion is worth anything. It has no measurable
+# effect on latency (temperature is free) and, with the assistant prefill
+# forcing the opening brace and a fully specified schema, negligible effect
+# on JSON validity at this level.
+_TEMPERATURE = 0.3
 
 # How many players from top_available are actually rendered in the tiers
 # table / metrics / news sections. ctx.top_available is deliberately deeper
@@ -113,6 +119,11 @@ class RecommendationResult:
     # Defaults to "medium" when absent or unrecognised, so a missing value
     # never reads as false certainty in either direction.
     confidence: str = "medium"
+    # One line per MUST EVALUATE player: taken, or passed and why. Exists to
+    # make omission visible — every live failure so far was a top-of-board
+    # player never mentioned at all rather than rejected on the merits.
+    # Empty for the ADP fallback, which evaluates nothing.
+    considered: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -727,6 +738,106 @@ _ADP_NOISE_RATIO = 0.25
 _SURVIVAL_GONE = "TAKE NOW OR LOSE HIM"
 _SURVIVAL_TOSSUP = "MIGHT LAST"
 _SURVIVAL_SAFE = "WILL LAST"
+
+
+# Draft value: how far a player has fallen past his own ADP by the time
+# you're on the clock. The frontend has always shown this (AIPanel.tsx calls
+# adpValue(adp, pickNumber) to render "+4 vs pick 17 - reach"), but the
+# PROMPT never did — it handed the model a raw ADP and a pick number as two
+# separate facts and left the subtraction to it.
+#
+# That subtraction is what it got wrong live: at pick 17 it took George
+# Pickens (ADP 21.3, a 4.3-pick reach) over Rashee Rice (ADP 11.5, a
+# 5.5-pick faller who also led the board on VOR and every usage metric).
+# Arithmetic over two dozen ADP values is the thing a small fast model is
+# worst at and the thing Python is free at.
+_VALUE_NOISE = 2.0   # within this many picks of ADP is neither value nor reach
+
+
+def _draft_value(adp: float, pick_number: int) -> str:
+    """"FALLING +5.5" / "reach -4.3" / "at ADP" for a player at this pick."""
+    delta = pick_number - adp
+    if delta >= _VALUE_NOISE:
+        return f"FALLING +{delta:.0f}"
+    if delta <= -_VALUE_NOISE:
+        return f"reach {delta:.0f}"
+    return "at ADP"
+
+
+# How many players get flagged as mandatory evaluations. Small on purpose:
+# the point is to stop the top of the board being skipped, not to hand over
+# a slate so long that the requirement becomes busywork.
+_MUST_EVALUATE = 5
+
+
+def _shortlist(
+    board: list[dict],
+    pick_number: int,
+    player_metrics: dict[int, dict],
+    replacement: dict[str, float],
+) -> list[dict]:
+    """
+    The players the model is not allowed to ignore: best ADP, highest VOR,
+    biggest faller. Union of three cheap rankings, deduped, capped.
+
+    This exists because every recommendation failure observed live was an
+    OMISSION rather than a bad choice — Rashee Rice and A.J. Brown were both
+    top-of-board and simply never appeared in the response, not rejected on
+    the merits. Rules about how to choose cannot fix a player never being
+    considered; only a required consideration set can.
+
+    Deliberately three different rankings rather than one composite score. A
+    composite would be a ranking, and ranking the board for the model is
+    exactly the over-constraint to avoid: it should still decide, it just
+    has to look first. Three axes also surface genuinely different players —
+    the best ADP and the best VOR are frequently not the same man, and that
+    disagreement is the interesting part of the pick.
+    """
+    if not board:
+        return []
+
+    by_adp = sorted(board, key=lambda p: p["adp"])[:3]
+    with_vor = [
+        (v, p) for p in board
+        if (v := _vor(p, player_metrics, replacement)) is not None
+    ]
+    by_vor = [p for _, p in sorted(with_vor, key=lambda t: -t[0])[:3]]
+    by_fall = sorted(board, key=lambda p: -(pick_number - p["adp"]))[:2]
+
+    seen: set[int] = set()
+    out: list[dict] = []
+    for p in [*by_adp, *by_vor, *by_fall]:
+        if p["id"] not in seen:
+            seen.add(p["id"])
+            out.append(p)
+    return sorted(out, key=lambda p: p["adp"])[:_MUST_EVALUATE]
+
+
+def _format_shortlist_section(
+    shortlist: list[dict],
+    pick_number: int,
+    player_metrics: dict[int, dict],
+    replacement: dict[str, float],
+) -> str:
+    if not shortlist:
+        return ""
+    lines = [
+        "## MUST EVALUATE — you are required to give a verdict on each of these",
+        "These are the best ADP, the highest VOR, and the biggest fallers on the "
+        "board. You do NOT have to pick one of them, but you must not ignore them: "
+        "return one line for each in the `considered` array saying why you took him "
+        "or why you passed. Silently omitting a player here is the single most common "
+        "way this tool has gone wrong.",
+    ]
+    for p in shortlist:
+        v = _vor(p, player_metrics, replacement)
+        vor_str = f"VOR {v:+.1f}" if v is not None else "VOR --"
+        lines.append(
+            f"  id={p['id']} {p['name']} ({p['position']}, {p['team']}) "
+            f"ADP {p['adp']:g}, {vor_str}, {_draft_value(p['adp'], pick_number)}"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _survival(adp: float, horizon_pick: int | None) -> str | None:
@@ -1675,10 +1786,18 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     horizon = ctx.my_following_pick_number
     picks_between = max(0, horizon - advised_pick - 1) if horizon else 0
 
+    shortlist = _shortlist(
+        ctx.top_available[:_LISTED_PLAYERS], advised_pick,
+        ctx.player_metrics, ctx.replacement_ppg,
+    )
+
     for section in (
         _format_roster_depth_section(
             _compute_roster_depth(ctx.my_roster, lineup), spots_left,
             lineup_has_flex=bool(lineup.get("FLEX")),
+        ),
+        _format_shortlist_section(
+            shortlist, advised_pick, ctx.player_metrics, ctx.replacement_ppg
         ),
         _format_survival_section(
             ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between
@@ -1728,6 +1847,9 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             if ctx.replacement_ppg:
                 v = _vor(p, ctx.player_metrics, ctx.replacement_ppg)
                 row += f" VOR {v:+.1f}" if v is not None else " VOR   --"
+            # Value against the pick you are actually making, computed here
+            # rather than left as a subtraction for the model. See _draft_value.
+            row += f"  {_draft_value(p['adp'], advised_pick)}"
             lines.append(row)
     lines.append("")
 
@@ -1847,6 +1969,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                     "tradeoff": "<1 sentence: what you gain and give up by taking this instead of the main recommendation>",
                 }
             ],
+            "considered": ["<one line per MUST EVALUATE player: 'Name — taken' or 'Name — passed because <specific reason>'. One entry for every id in that section, no exceptions.>"],
             "alerts": ["<scarcity warnings, tier drop-off flags, breakout/value calls, or a note that a listed player will not survive to your next turn>"],
         }, indent=2),
         "",
@@ -1859,7 +1982,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         f"Return exactly {_MAX_ALTERNATIVES} alternatives whenever there are that "
         "many defensible options on the board — fewer only when there genuinely "
         f"aren't (late in the draft, thin position). More than {_MAX_ALTERNATIVES} "
-        "are discarded unread and only cost you output budget. Every "
+        "are discarded unread and only cost you output budget. The alternatives must "
+        "cover at least TWO different positions whenever the board allows: a list of "
+        "five players at one position is not a set of options, it is one option "
+        "restated, and it hides the cross-position calls that decide most picks. "
+        "Every "
         "`player_id`, in both the recommendation and the alternatives, must be "
         "one of the ids listed above: anything else is dropped, and you'll have "
         "spent the tokens for nothing. Keep every `reasoning`, `tradeoff`, and "
@@ -2176,6 +2303,21 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         )
 
     alerts = [str(a) for a in data.get("alerts", []) if a]
+    considered = [str(x) for x in data.get("considered", []) if x]
+
+    # Logged, not enforced. A missing verdict is worth knowing about — it's
+    # the exact failure this section exists to catch — but rejecting an
+    # otherwise-valid recommendation over a missing explanation would trade a
+    # good pick for a bookkeeping complaint on draft day.
+    if not considered:
+        logger.info("Claude returned no `considered` verdicts for the must-evaluate shortlist.")
+
+    positions = {a.position for a in alternatives}
+    if len(alternatives) >= 3 and len(positions) < 2:
+        logger.info(
+            "All %d alternatives are %s — the prompt asks for at least two positions.",
+            len(alternatives), positions.pop() if positions else "?",
+        )
 
     # These are presentational extras — a malformed or missing value degrades
     # to a sane default rather than rejecting an otherwise-good recommendation
@@ -2192,6 +2334,7 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         model=_DEFAULT_MODEL,
         strategy=strategy,
         confidence=confidence,
+        considered=considered,
     )
 
 
