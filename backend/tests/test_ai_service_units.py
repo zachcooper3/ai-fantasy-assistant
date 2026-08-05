@@ -1411,3 +1411,44 @@ def test_shortlist_respects_the_cap():
     metrics = {i: {"fantasy_points_avg": 30.0 - i} for i in range(1, 30)}
     repl = {"WR": 11.9, "RB": 11.1, "QB": 17.5, "TE": 10.6}
     assert len(_shortlist(board, 20, metrics, repl)) <= 6
+
+
+# ---------------------------------------------------------------------------
+# Unavailable players
+#
+# Live failure at a round-13 pick: Ricky Pearsall was recommended while
+# ChromaDB held "Ricky Pearsall is listed as IR (Knee - PCL)" and he sat at
+# position 1 on the board, INSIDE the retrieval window — so the note was in
+# the prompt and got read as a durability concern rather than a
+# disqualification. Separately, retrieval covered only the top 10 of a
+# 25-player board, so fifteen recommendable players had no status data at all
+# and the gap was invisible from inside the prompt.
+# ---------------------------------------------------------------------------
+
+def test_news_retrieval_covers_every_recommendable_player():
+    from backend.app.services.ai_service import _MAX_CONTEXT_PLAYERS, _LISTED_PLAYERS
+    assert _MAX_CONTEXT_PLAYERS >= _LISTED_PLAYERS, (
+        "a player the model can recommend but has no news for is one it can "
+        "recommend while he is on IR"
+    )
+
+
+def test_rule_zero_disqualifies_players_who_cannot_play():
+    sp = _build_system_prompt("ppr")
+    assert "NEVER RECOMMEND A PLAYER WHO CANNOT PLAY" in sp
+    assert "This overrides every other rule" in sp
+    for term in ("IR", "out for the season", "PUP", "suspended"):
+        assert term in sp
+
+
+def test_rule_zero_separates_disqualification_from_ordinary_risk():
+    # The failure was reading "IR" as a risk to weigh. A questionable tag IS
+    # a risk to weigh; being ruled out is not.
+    sp = _build_system_prompt("ppr")
+    assert "Do not soften this into" in sp
+    assert "that IS ordinary durability risk" in sp
+
+
+def test_rule_zero_comes_before_the_value_rules():
+    sp = _build_system_prompt("ppr")
+    assert sp.index("RULE 0") < sp.index("RULE 1 —")

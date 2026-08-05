@@ -1101,7 +1101,21 @@ def _format_run_risk(
 # Only the most relevant candidates get a retrieval lookup — querying Chroma
 # for all 25 listed players would balloon both latency and prompt size for
 # players near the bottom of the list that are unlikely to be picked anyway.
-_MAX_CONTEXT_PLAYERS = 10
+# Retrieval must cover every player the model can actually recommend.
+#
+# This was 10 while the board showed 25, so fifteen recommendable players
+# carried no news and no injury information whatsoever. Confirmed live: at a
+# round-13 pick, only the top 10 of the board had any status data, and the
+# tight end being recommended sat at position 14 with none. Worse, the gap is
+# invisible from inside the prompt — a player with no retrieved chunk and a
+# player with nothing wrong with him render identically.
+#
+# The original cap was a latency guard from when these queries ran serially.
+# They now run in a thread pool (see _retrieve_player_context) and are cached
+# for the process lifetime, so the cost of covering the whole board is one
+# wider fan-out on the first pick of a session rather than 25 sequential
+# round trips per pick.
+_MAX_CONTEXT_PLAYERS = _LISTED_PLAYERS
 _MAX_CHUNKS_PER_PLAYER = 3
 
 # Chroma content is only ever updated by the offline ingestion scripts
@@ -2073,6 +2087,18 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         f"nothing else.\n\n"
 
         f"SCORING: {scoring_note}\n\n"
+
+        "RULE 0 — NEVER RECOMMEND A PLAYER WHO CANNOT PLAY. This overrides every "
+        "other rule here. If the Player News & Analysis section says a player is on "
+        "IR or injured reserve, out for the season, on PUP, suspended, or has already "
+        "been ruled out, he is not a pick — he is a wasted roster spot, whatever his "
+        "ADP, VOR or production says. Those numbers all describe a season he will not "
+        "play. Do not soften this into 'a durability concern' or 'a risk worth taking': "
+        "an unavailable player scores zero. The only exception is the very end of the "
+        "draft when the alternative is a player you would cut anyway, and even then "
+        "say plainly in your reasoning that he is a stash who will not play this "
+        "season. A note about a knee issue, a missed practice or a questionable tag is "
+        "different — that IS ordinary durability risk, and RULE 6 governs it.\n\n"
 
         "RULE 1 — OPPORTUNITY COST DECIDES CLOSE CALLS. A draft pick's real cost is "
         "the best player you won't get back. When two players are close, take the one "
