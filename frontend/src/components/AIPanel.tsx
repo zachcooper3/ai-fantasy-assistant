@@ -15,7 +15,7 @@
  * fallback reports confidence "low" and carries no strategy or trade-offs).
  */
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Lightbulb,
   RefreshCw,
@@ -24,6 +24,8 @@ import {
   History,
   Compass,
   Zap,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 
 import { Confidence, Player, PickSuggestion, Recommendation, Scarcity, Survival } from "@/lib/api";
@@ -51,6 +53,18 @@ const VALUE_STYLES = {
   reach: "text-amber-400",
   even:  "text-slate-400",
 } as const;
+
+/**
+ * Panel width, in px, above which "Also considered" switches from a stacked
+ * list to a 2-column grid.
+ *
+ * This can't be a Tailwind breakpoint (md:, xl:) because those respond to
+ * *viewport* width, and this panel's actual width changes independently of
+ * the viewport when the Big Board is collapsed into its rail — the panel can
+ * go from ~340px to over 700px on the same screen size. Measured directly
+ * with a ResizeObserver instead.
+ */
+const ALT_GRID_MIN_WIDTH = 560;
 
 /**
  * Survival badge. This is the single most decision-relevant fact on the row —
@@ -114,6 +128,11 @@ interface Props {
   onAutoRecommendChange: (on: boolean) => void;
   /** See the isSyncing docs in useDraft: sync-active means no manual picks. */
   isSyncing?: boolean;
+  /** Whether the Big Board is currently collapsed to its rail ("focus mode"). */
+  boardCollapsed?: boolean;
+  /** Toggles the Big Board's collapsed state. Omitted (e.g. on mobile, where
+   *  each section is already full-width) hides the header toggle button. */
+  onToggleBoardCollapse?: () => void;
 }
 
 /** ADP + value/reach delta + team/bye, the numbers you compare picks on. */
@@ -189,8 +208,28 @@ export default function AIPanel({
   autoRecommend,
   onAutoRecommendChange,
   isSyncing = false,
+  boardCollapsed = false,
+  onToggleBoardCollapse,
 }: Props) {
   const [showHistory, setShowHistory] = useState(false);
+
+  // Tracks this panel's actual rendered width so "Also considered" can switch
+  // to a 2-column grid once there's genuinely room for it — see
+  // ALT_GRID_MIN_WIDTH above for why this is measured rather than derived
+  // from a viewport breakpoint.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [isWide, setIsWide] = useState(false);
+
+  useEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      setIsWide(width >= ALT_GRID_MIN_WIDTH);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
 
   // Defence in depth. useDraft already discards responses that arrive after
   // the draft has moved on, and clears the recommendation on every pick — but
@@ -213,7 +252,7 @@ export default function AIPanel({
   const confidence = CONFIDENCE_STYLES[recommendation?.confidence ?? "medium"];
 
   return (
-    <div className="flex flex-col gap-3 h-full overflow-y-auto">
+    <div ref={panelRef} className="flex flex-col gap-3 h-full overflow-y-auto">
 
       {/* Alerts.
           These sit above the recommendation now. They were rendered below the
@@ -244,6 +283,35 @@ export default function AIPanel({
             </h2>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {/* Focus mode. Collapses the Big Board rail so this panel gets its
+                grid column — the same toggle lives on the board itself, but
+                it's not obviously discoverable from here without a mirror. */}
+            {onToggleBoardCollapse && (
+              <button
+                type="button"
+                onClick={onToggleBoardCollapse}
+                title={
+                  boardCollapsed
+                    ? "Show Big Board (b)"
+                    : "Focus mode — collapse Big Board for more room (b)"
+                }
+                aria-label={boardCollapsed ? "Show Big Board" : "Collapse Big Board"}
+                aria-pressed={boardCollapsed}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                  boardCollapsed
+                    ? "bg-emerald-950 border-emerald-800/60 text-emerald-300"
+                    : "bg-slate-800 border-slate-600 text-slate-300"
+                }`}
+              >
+                {boardCollapsed ? (
+                  <PanelLeftOpen size={11} aria-hidden="true" />
+                ) : (
+                  <PanelLeftClose size={11} aria-hidden="true" />
+                )}
+                Focus
+              </button>
+            )}
+
             {/* Auto-recommend toggle. Each automatic fetch is a paid Claude
                 call, so this is a real preference rather than something to
                 decide on the user's behalf. */}
@@ -370,7 +438,12 @@ export default function AIPanel({
                 <p className="text-xs text-slate-400 uppercase font-semibold mb-2">
                   Also considered
                 </p>
-                <div className="space-y-2">
+                {/* Side-by-side once the panel is genuinely wide enough (see
+                    isWide above) — a stacked list wastes the room focus mode
+                    frees up, and on the clock you're comparing these against
+                    each other, which a 2-up grid supports better than a long
+                    scroll. */}
+                <div className={isWide ? "grid grid-cols-2 gap-2 items-start" : "space-y-2"}>
                   {recommendation.alternatives.map((alt) => (
                     <div key={alt.player_id} className="bg-slate-800/60 rounded-xl p-3">
                       <div className="flex items-start justify-between gap-2 mb-1">

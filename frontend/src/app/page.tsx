@@ -2,14 +2,23 @@
 /**
  * Main draft room page.
  *
- * Layout (desktop):  BigBoard | DraftRoom | AIPanel
+ * Layout (desktop):  BigBoard | (drag handle) | DraftRoom | AIPanel
  * Layout (mobile):   Tab-based: Board / Room / AI
+ *
+ * Focus mode: BigBoard's column width is drag-resizable (see
+ * useBoardResize), from a 56px rail up to however much room DraftRoom/AIPanel
+ * can spare, so AIPanel gets whatever the board doesn't need. The rail and
+ * "last expanded width" ends of that range are still reachable in one step
+ * via BigBoard's own header button, the mirrored button on AIPanel, or the
+ * "b" shortcut. Desktop only — on mobile each section is already full-width
+ * via the tab bar.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { LayoutGrid, Users, Lightbulb, RotateCcw } from "lucide-react";
 
 import { useDraft } from "@/hooks/useDraft";
+import { useBoardResize, HANDLE_WIDTH } from "@/hooks/useBoardResize";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
 import SetupModal from "@/components/SetupModal";
 import StatusBar from "@/components/StatusBar";
@@ -56,6 +65,17 @@ export default function DraftPage() {
 
   const [mobileTab, setMobileTab] = useState<MobileTab>("board");
 
+  // Big Board column width — drag-resizable "focus mode". See
+  // useBoardResize for the persistence, clamping, and drag-handle logic.
+  const {
+    gridRef: boardGridRef,
+    boardWidth,
+    collapsed: boardCollapsed,
+    draftRoomWidth,
+    toggleCollapse: toggleBoardCollapse,
+    handle: boardHandleProps,
+  } = useBoardResize();
+
   // "Draft Complete!" overlay dismissal — lets you get back to the board
   // to review picks after the draft. Re-arms whenever the session is no
   // longer complete (i.e. a new draft started), so the next completion
@@ -87,11 +107,14 @@ export default function DraftPage() {
       } else if (e.key === "u") {
         e.preventDefault();
         undoPick();
+      } else if (e.key === "b") {
+        e.preventDefault();
+        toggleBoardCollapse();
       }
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [fetchRecommendation, undoPick]);
+  }, [fetchRecommendation, undoPick, toggleBoardCollapse]);
 
   // Lookup for team/bye, which the recommendation payload doesn't carry — the
   // AI response has only id/name/position/adp. Built once per board refresh
@@ -178,21 +201,53 @@ export default function DraftPage() {
         </div>
       )}
 
-      {/* Desktop 3-column layout.
-          The draft-room column was a fixed 280px, which forced Opponent
-          Tracking's per-slot chips to wrap into an unreadable block in a
-          12-team league. minmax() lets it breathe on wide screens while
-          minmax(0,1fr) keeps the board from being pushed out of the grid. */}
-      <div className="hidden md:grid md:grid-cols-[minmax(0,1fr)_320px_300px] xl:grid-cols-[minmax(0,1fr)_380px_340px] gap-3 p-3 flex-1 min-h-0">
-        <BigBoard
-          players={board?.players ?? []}
-          isMyTurn={session.is_my_turn}
-          recommendedId={recommendedId}
-          onPick={recordPick}
-          isSyncing={isSyncing}
-          sessionKey={session.started_at ?? ""}
-        />
+      {/* Desktop layout: BigBoard | handle | DraftRoom | AIPanel.
+          DraftRoom stays fixed-width (was a flat 280px, which forced
+          Opponent Tracking's per-slot chips to wrap into an unreadable block
+          in a 12-team league — 320/380 lets it breathe). BigBoard and the
+          handle share the first grid track, sized to their own inline
+          widths ("auto"); AIPanel is minmax(0,1fr) and simply gets whatever
+          BigBoard doesn't take, so dragging the handle continuously trades
+          space between them — the same "focus mode" idea as a collapse
+          toggle, just with every width in between reachable too. */}
+      <div
+        ref={boardGridRef}
+        className="hidden md:grid gap-3 p-3 flex-1 min-h-0"
+        style={{ gridTemplateColumns: `auto ${draftRoomWidth}px minmax(0,1fr)` }}
+      >
+        <div
+          className="flex h-full min-h-0 shrink-0"
+          style={{ width: boardWidth + HANDLE_WIDTH }}
+        >
+          <div className="h-full min-h-0 min-w-0 shrink-0" style={{ width: boardWidth }}>
+            <BigBoard
+              players={board?.players ?? []}
+              isMyTurn={session.is_my_turn}
+              recommendedId={recommendedId}
+              onPick={recordPick}
+              isSyncing={isSyncing}
+              sessionKey={session.started_at ?? ""}
+              collapsed={boardCollapsed}
+              onToggleCollapse={toggleBoardCollapse}
+            />
+          </div>
+
+          {/* Drag handle. Grab anywhere in this strip to resize BigBoard
+              continuously; double-click resets to the default width; with
+              keyboard focus, Arrow keys nudge it and Home/End jump to the
+              rail / maximum. touch-none stops the browser's own scroll
+              gesture from fighting the drag on touchscreens. */}
+          <div
+            {...boardHandleProps}
+            className="shrink-0 h-full flex items-center justify-center cursor-col-resize group touch-none focus:outline-none"
+            style={{ width: HANDLE_WIDTH }}
+          >
+            <div className="w-1 h-10 rounded-full bg-slate-700 group-hover:bg-emerald-500 group-focus-visible:bg-emerald-500 transition-colors" />
+          </div>
+        </div>
+
         <DraftRoom session={session} />
+
         <AIPanel
           recommendation={recommendation}
           recHistory={recHistory}
@@ -206,6 +261,8 @@ export default function DraftPage() {
           autoRecommend={autoRecommend}
           onAutoRecommendChange={setAutoRecommend}
           isSyncing={isSyncing}
+          boardCollapsed={boardCollapsed}
+          onToggleBoardCollapse={toggleBoardCollapse}
         />
       </div>
 

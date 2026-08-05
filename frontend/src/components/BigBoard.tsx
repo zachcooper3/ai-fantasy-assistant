@@ -16,6 +16,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *   1–6      position filter
  */
 
+import { ChevronLeft, ChevronRight } from "lucide-react";
+
 import { Player } from "@/lib/api";
 import { matchesQuery } from "@/lib/search";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
@@ -56,6 +58,14 @@ interface Props {
    * reload.
    */
   sessionKey?: string;
+  /**
+   * Collapsed to a thin rail so the AI panel can take the freed grid column
+   * (the "focus mode" toggle). The component stays mounted rather than being
+   * conditionally rendered by the parent, so search/filter/scroll state
+   * survives a collapse-expand round trip.
+   */
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }
 
 export default function BigBoard({
@@ -65,6 +75,8 @@ export default function BigBoard({
   onPick,
   isSyncing = false,
   sessionKey = "",
+  collapsed = false,
+  onToggleCollapse,
 }: Props) {
   const [posFilter, setPosFilter] = useState<PosFilter>("All");
   const [search, setSearch] = useState("");
@@ -149,6 +161,9 @@ export default function BigBoard({
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (hasModifier(e)) return;
+      // Collapsed rail has no search box or rows to select — these shortcuts
+      // would otherwise silently focus/act on hidden controls.
+      if (collapsed) return;
 
       // Escape works even while typing — it's the way out of the search box.
       if (e.key === "Escape") {
@@ -208,7 +223,7 @@ export default function BigBoard({
 
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [visible.length, selectedIndex, search, draftSelected]);
+  }, [visible.length, selectedIndex, search, draftSelected, collapsed]);
 
   // Keep the selected row on screen when arrowing past the fold.
   useEffect(() => {
@@ -223,14 +238,66 @@ export default function BigBoard({
     }
   }, [selectedIndex, visible.length, hasMore]);
 
+  // Collapsed rail — the "focus mode" state. Kept as an early return rather
+  // than a wrapping conditional so the rest of the component (search,
+  // pagination, keyboard effects) reads the same as before; only the header
+  // button and this branch know about collapsing at all.
+  if (collapsed) {
+    return (
+      <div className="flex flex-col items-center h-full bg-slate-900 rounded-xl border border-slate-700 overflow-hidden py-3 gap-3">
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          aria-label="Expand Big Board"
+          title="Expand Big Board (b)"
+          className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+        >
+          <ChevronRight size={16} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          onClick={onToggleCollapse}
+          aria-label="Expand Big Board"
+          className="flex-1 flex items-center justify-center focus:outline-none"
+        >
+          <span
+            className="text-xs font-bold text-slate-400 uppercase tracking-wider"
+            style={{ writingMode: "vertical-rl" }}
+          >
+            Big Board
+          </span>
+        </button>
+        <span
+          className="text-[10px] text-slate-500 tabular-nums pb-1"
+          style={{ writingMode: "vertical-rl" }}
+        >
+          {availableCount}/{totalCount}
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-full bg-slate-900 rounded-xl border border-slate-700 overflow-hidden">
       {/* Header */}
       <div className="px-4 pt-4 pb-2 border-b border-slate-700 shrink-0">
         <div className="flex items-center justify-between mb-3 gap-2">
-          <h2 className="text-sm font-bold text-slate-200 uppercase tracking-wider">
-            Big Board
-          </h2>
+          <div className="flex items-center gap-1.5 min-w-0">
+            {onToggleCollapse && (
+              <button
+                type="button"
+                onClick={onToggleCollapse}
+                aria-label="Collapse Big Board"
+                title="Collapse Big Board (b) — gives the AI panel more room"
+                className="shrink-0 p-1 -ml-1 rounded hover:bg-slate-800 text-slate-400 hover:text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+              >
+                <ChevronLeft size={14} aria-hidden="true" />
+              </button>
+            )}
+            <h2 className="text-sm font-bold text-slate-200 uppercase tracking-wider truncate">
+              Big Board
+            </h2>
+          </div>
           <div className="flex items-center gap-2">
             {/* Explains the missing Draft column — without this the controls
                 just silently vanish, which reads as a bug. */}
