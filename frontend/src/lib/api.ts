@@ -106,7 +106,19 @@ export interface PickSuggestion {
   reasoning: string;
   /** Alternatives only: what this player gains and costs vs. the main pick. */
   tradeoff: string;
+  /**
+   * Whether this player is expected to survive to your next turn, computed
+   * server-side from ADP vs. the horizon pick. Empty on the last pick of a
+   * draft, where there is no next turn to survive to.
+   *
+   * Deliberately a code rather than the prompt's own wording: that wording
+   * has been rewritten once already (it used to read "GONE", which the model
+   * mistook for "unavailable") and the UI must not move with it.
+   */
+  survival: Survival;
 }
+
+export type Survival = "take_now" | "might_last" | "will_last" | "";
 
 export type Confidence = "high" | "medium" | "low";
 

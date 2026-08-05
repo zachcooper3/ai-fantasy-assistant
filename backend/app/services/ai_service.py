@@ -104,6 +104,12 @@ class PickSuggestion:
     # had nowhere to put. Only meaningful on alternatives; empty on the main
     # recommendation. Optional so a response predating this field still parses.
     tradeoff: str = ""
+    # "take_now" | "might_last" | "will_last", or "" when there's no next turn
+    # to survive to. Computed here from ADP and the horizon pick, NOT taken
+    # from the model's output — this is the one figure on screen that must
+    # agree with the prompt exactly, and asking the model to echo it back
+    # would reintroduce the possibility of it saying something else.
+    survival: str = ""
 
 
 @dataclass
@@ -739,6 +745,24 @@ _ADP_NOISE_RATIO = 0.25
 _SURVIVAL_GONE = "TAKE NOW OR LOSE HIM"
 _SURVIVAL_TOSSUP = "MIGHT LAST"
 _SURVIVAL_SAFE = "WILL LAST"
+
+# Stable machine-readable codes for the API, so the UI can style each bucket
+# without string-matching prose that exists to be tuned. The prompt wording
+# above has already been rewritten once (it used to say "GONE", which the
+# model read as unavailable) and will be again; the codes must not move with
+# it.
+_SURVIVAL_CODES = {
+    _SURVIVAL_GONE: "take_now",
+    _SURVIVAL_TOSSUP: "might_last",
+    _SURVIVAL_SAFE: "will_last",
+}
+
+
+def _survival_code(adp: float, horizon_pick: int | None) -> str:
+    """The bucket as an API code, or "" when there is no next turn to survive
+    to — the last pick of a draft has no opportunity cost to express."""
+    label = _survival(adp, horizon_pick)
+    return _SURVIVAL_CODES.get(label, "") if label else ""
 
 
 # Draft value: how far a player has fallen past his own ADP by the time
@@ -2467,6 +2491,7 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
             # Free text is the model's to write; it's the only thing it adds.
             reasoning=str(d.get("reasoning", "")),
             tradeoff=_clean_text(d.get("tradeoff")),
+            survival=_survival_code(canonical["adp"], ctx.my_following_pick_number),
         )
 
     recommendation = _pick(rec)
@@ -2576,6 +2601,7 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
             position=top["position"],
             adp=top["adp"],
             reasoning="Best available player by consensus ADP (AI service unavailable).",
+            survival=_survival_code(top["adp"], ctx.my_following_pick_number),
         ),
         alternatives=[
             PickSuggestion(
@@ -2587,6 +2613,7 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
                 # No comparison is possible without the model — say so rather
                 # than inventing a trade-off the fallback didn't reason about.
                 tradeoff="",
+                survival=_survival_code(p["adp"], ctx.my_following_pick_number),
             )
             for p in ctx.top_available[1:4]
         ],

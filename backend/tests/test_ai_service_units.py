@@ -1452,3 +1452,73 @@ def test_rule_zero_separates_disqualification_from_ordinary_risk():
 def test_rule_zero_comes_before_the_value_rules():
     sp = _build_system_prompt("ppr")
     assert sp.index("RULE 0") < sp.index("RULE 1 —")
+
+
+# ---------------------------------------------------------------------------
+# Survival tag on the response
+#
+# The bucket drives the single biggest decision on a pick and previously
+# existed only inside the prompt, where the user could not see it. Computed
+# server-side rather than echoed by the model: this is the one figure on
+# screen that must agree with the prompt exactly.
+# ---------------------------------------------------------------------------
+
+def _survival_ctx_for(adps, horizon=41):
+    ctx = ctx_with_available(*range(1, len(adps) + 1))
+    for p, adp in zip(ctx.top_available, adps):
+        p["adp"] = adp
+    ctx.pick_number = ctx.my_next_pick_number = 17
+    ctx.my_following_pick_number = horizon
+    return ctx
+
+
+def test_survival_code_is_attached_to_recommendation_and_alternatives():
+    ctx = _survival_ctx_for([11.5, 38.0, 90.0])
+    payload = {
+        "recommendation": {"player_id": 1, "player_name": "P1", "position": "RB",
+                           "adp": 11.5, "reasoning": "x"},
+        "alternatives": [
+            {"player_id": 2, "player_name": "P2", "position": "RB", "adp": 38.0, "reasoning": "x"},
+            {"player_id": 3, "player_name": "P3", "position": "RB", "adp": 90.0, "reasoning": "x"},
+        ],
+        "alerts": [],
+    }
+    r = _parse_response(json.dumps(payload), ctx)
+    assert r.recommendation.survival == "take_now"
+    assert [a.survival for a in r.alternatives] == ["might_last", "will_last"]
+
+
+def test_survival_is_empty_without_a_next_turn():
+    # Last pick of the draft: nothing to survive to, so no badge rather than
+    # a misleading one.
+    ctx = _survival_ctx_for([11.5], horizon=None)
+    payload = {"recommendation": {"player_id": 1, "player_name": "P1",
+                                  "position": "RB", "adp": 11.5, "reasoning": "x"},
+               "alternatives": [], "alerts": []}
+    assert _parse_response(json.dumps(payload), ctx).recommendation.survival == ""
+
+
+def test_survival_is_computed_not_taken_from_the_model():
+    # The model claiming otherwise must not change the badge.
+    ctx = _survival_ctx_for([90.0])
+    payload = {"recommendation": {"player_id": 1, "player_name": "P1", "position": "RB",
+                                  "adp": 90.0, "reasoning": "x", "survival": "take_now"},
+               "alternatives": [], "alerts": []}
+    assert _parse_response(json.dumps(payload), ctx).recommendation.survival == "will_last"
+
+
+def test_fallback_carries_a_survival_tag_too():
+    from backend.app.services.ai_service import _fallback
+    ctx = _survival_ctx_for([11.5, 38.0])
+    result = _fallback(ctx, "test-model")
+    assert result.recommendation.survival == "take_now"
+
+
+def test_survival_codes_are_stable_regardless_of_prompt_wording():
+    # The prompt labels have been rewritten once already ("GONE" read as
+    # unavailable). The API codes must not move with them.
+    from backend.app.services.ai_service import _survival_code
+    assert _survival_code(11.5, 41) == "take_now"
+    assert _survival_code(38.0, 41) == "might_last"
+    assert _survival_code(90.0, 41) == "will_last"
+    assert _survival_code(50.0, None) == ""

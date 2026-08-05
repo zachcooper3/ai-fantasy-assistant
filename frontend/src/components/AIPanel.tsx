@@ -26,7 +26,7 @@ import {
   Zap,
 } from "lucide-react";
 
-import { Confidence, Player, PickSuggestion, Recommendation, Scarcity } from "@/lib/api";
+import { Confidence, Player, PickSuggestion, Recommendation, Scarcity, Survival } from "@/lib/api";
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
 import ConfirmButton from "@/components/ConfirmButton";
@@ -51,6 +51,51 @@ const VALUE_STYLES = {
   reach: "text-amber-400",
   even:  "text-slate-400",
 } as const;
+
+/**
+ * Survival badge. This is the single most decision-relevant fact on the row —
+ * a player who will still be there next turn costs you nothing to skip, and
+ * one who won't is your only chance — so it reads as a badge rather than
+ * another number in the grey meta line.
+ *
+ * Colour runs red-to-slate on urgency, NOT on quality: "will last" is not a
+ * worse player, he is a later one. The label says so in words because colour
+ * alone would imply a ranking.
+ */
+const SURVIVAL_STYLES: Record<
+  Exclude<Survival, "">,
+  { label: string; title: string; className: string }
+> = {
+  take_now: {
+    label: "TAKE NOW",
+    title: "Very unlikely to still be available at your next turn — this is your only chance at him.",
+    className: "bg-red-950 text-red-300 border-red-800/70",
+  },
+  might_last: {
+    label: "MIGHT LAST",
+    title: "Could go either way before your next turn.",
+    className: "bg-amber-950/60 text-amber-300 border-amber-800/60",
+  },
+  will_last: {
+    label: "WILL LAST",
+    title: "Very likely still available at your next turn — not a worse player, just one you can take later.",
+    className: "bg-slate-800 text-slate-400 border-slate-600",
+  },
+};
+
+function SurvivalBadge({ survival }: { survival: Survival }) {
+  if (!survival) return null;              // last pick of the draft
+  const s = SURVIVAL_STYLES[survival];
+  if (!s) return null;                     // unknown code from a newer backend
+  return (
+    <span
+      title={s.title}
+      className={`px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${s.className}`}
+    >
+      {s.label}
+    </span>
+  );
+}
 
 interface Props {
   recommendation: Recommendation | null;
@@ -85,6 +130,9 @@ function PlayerMeta({
 
   return (
     <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-slate-400">
+      {/* First, ahead of ADP: whether you can still have him later decides
+          more picks than any other figure on this row. */}
+      <SurvivalBadge survival={suggestion.survival} />
       <span className="tabular-nums">ADP {suggestion.adp}</span>
       <span className={`font-medium ${VALUE_STYLES[value.label]}`}>
         <span className="tabular-nums">{value.text}</span>

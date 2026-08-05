@@ -55,6 +55,10 @@ class PickSuggestionResponse(BaseModel):
     # main recommendation gains and costs. Empty string when absent (older
     # model output, or the no-AI fallback path).
     tradeoff: str = ""
+    # "take_now" | "might_last" | "will_last", or "" on the last pick of the
+    # draft. Computed server-side from ADP vs the horizon pick — see
+    # PickSuggestion.survival — so the badge always matches the prompt.
+    survival: str = ""
 
 
 class RecommendationResponse(BaseModel):
