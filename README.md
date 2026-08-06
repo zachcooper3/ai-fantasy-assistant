@@ -122,6 +122,44 @@ App runs at `http://localhost:3000`
 
 ## Refreshing Player Data
 
+### Refresh everything (recommended)
+
+One command runs every data source in dependency order:
+
+```bash
+py -m backend.ingestion.refresh              # everything free
+py -m backend.ingestion.refresh --with-ai    # + the two Claude synthesis steps
+```
+
+The split is deliberate. Six of the eight steps hit free public sources and can be
+re-run as often as you like; the two synthesis steps call the Claude API once per
+player and cost real money, so they never run unless you ask for them by name.
+During draft week the free refresh is the one you want daily — ADP and injuries move,
+synthesis output doesn't change much day to day.
+
+Order matters and the steps are not independent — `fetch_adp` truncates and reloads
+the whole `Player` table, so anything run against a stale player table produces
+silently mismatched data rather than an error:
+
+```
+adp → ids → metrics ─┬→ synthesis   [Claude]
+              draft ─┴→ college
+              news  ──→ rookies     [Claude]
+```
+
+`adp` and `ids` are critical: if either fails the run stops, because continuing would
+just write mismatched rows on top of a broken foundation. Everything else is
+best-effort and the run continues without it. Other options:
+
+```bash
+py -m backend.ingestion.refresh --dry-run              # print the plan, run nothing
+py -m backend.ingestion.refresh --only metrics news    # re-run specific steps
+```
+
+The summary at the end prints the exact retry command for anything that failed.
+
+### Refreshing one source at a time
+
 ADP data is fetched automatically from [FantasyFootballCalculator](https://fantasyfootballcalculator.com) on startup if the local CSV is older than 7 days. No manual action needed in most cases.
 
 To force a manual refresh at any time:
@@ -260,6 +298,54 @@ matching those instead of the real Sleeper/RotoWire content).
 
 ---
 
+## Troubleshooting
+
+Three read-only diagnostics. None of them writes to the database.
+
+**A field is empty for every player, or a metric looks wrong**
+
+```bash
+py -m backend.tools.diagnose_ingestion
+```
+
+Loads every nflverse source, prints the real error for any that fail, and — for the
+ones that succeed — checks every column the ingestion actually reads against what is
+present in the data, dumping all columns and a sample row when a lookup misses.
+
+Worth running after any nflverse update. Ingestion failures here are silent by design
+(each source is wrapped so one flaky feed can't take down a draft-day refresh), and a
+missing column is quieter still: an absent field reads as `0.0`, so a share computes
+to 0/0 and stores as `None` — indistinguishable from "this player genuinely has no
+data" at every layer above.
+
+**"Why did it recommend X over Y?"**
+
+```bash
+py -m backend.tools.explain_players "Player One" "Player Two"
+```
+
+Prints DB-wide metric coverage, then per player: the exact line the prompt renders,
+whether draft capital is being shown, an explicit list of what is *not* visible to the
+model, and the retrieved ChromaDB chunks. Most surprising recommendations turn out to
+be a data gap rather than a reasoning failure, and this is the fastest way to tell
+them apart.
+
+**Recommendations feel slow**
+
+```bash
+py -m backend.tools.profile_recommendation            # real API call
+py -m backend.tools.profile_recommendation --no-api   # free, local work only
+py -m backend.tools.profile_recommendation --repeat 3 # shows what caching saves
+```
+
+Times each stage separately — DB context build, ChromaDB retrieval, the Claude call,
+parsing — and reports actual token counts and generation rate. Latency is normally
+dominated by *output* tokens, since generation is sequential while prompt ingestion is
+not; the profiler tells you whether to trim the response shape or look elsewhere,
+rather than guessing.
+
+---
+
 ## Project Structure
 
 ```
@@ -268,7 +354,9 @@ ai-fantasy-assistant/
 │   ├── app/          # FastAPI routes, services, AI layer
 │   ├── db/           # SQLite models and player repo
 │   ├── ingestion/    # CSV → SQLite ingestion, Sleeper ID sync, metrics/rookie/RAG pipeline
-│   └── rag/          # ChromaDB vector store, wired into ai_service.py's recommendation prompt
+│   │                 #   refresh.py runs all of it in dependency order
+│   ├── rag/          # ChromaDB vector store, wired into ai_service.py's recommendation prompt
+│   └── tools/        # read-only diagnostics (see Troubleshooting)
 ├── data/             # gitignored — created by first-time setup, not cloned
 │   ├── raw/          # Source CSVs (fantasypros_adp.csv)
 │   └── fantasy.db    # SQLite database (auto-created)

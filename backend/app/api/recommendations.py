@@ -2,6 +2,8 @@
 Recommendation endpoints.
 
 GET /api/recommend/pick                    — AI pick for the current draft state
+GET /api/recommend/pick/stream             — same, as SSE; the pick arrives well
+                                             before the alternatives finish
 GET /api/recommend/handcuff?player_id=X   — handcuff target for a drafted RB
 GET /api/recommend/scarcity               — positional scarcity analysis
 

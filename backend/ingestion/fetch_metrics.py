@@ -17,15 +17,22 @@ touches) via nflreadpy, which is meaningfully heavier than the single small
 ADP API call. Run it manually on the same cadence you'd want the analytics
 refreshed (weekly during the season is plenty).
 
-A note on verification: this was written without access to nflreadpy's live
-data from the dev sandbox (network-restricted there, same as every other
-external source this session) — it's built from nflreadpy's documented
-functions and well-established nflverse column conventions, but the exact
-column names are resolved defensively (a few plausible candidates tried per
-field, see _first) rather than assumed to be exactly right. Run with
---verbose the first time and check the "resolved columns" log block — if
-anything shows as unresolved, that's the thing to fix, not a sign the whole
-approach is broken.
+A note on column names: these were originally guessed from nflverse
+conventions without access to live data, and several were wrong in ways that
+produced permanently-NULL fields rather than errors — player_stats has no
+team_targets/team_carries at all, snap_counts is keyed by pfr_player_id with
+no gsis_id and uses game_type rather than season_type, and depth_charts was
+reworked upstream to pos_rank on a dt-keyed snapshot feed. All four are now
+resolved against the live 2025 release.
+
+Every field is still looked up through _first() with several candidates, so
+an upstream rename degrades to a NULL rather than a crash. That tolerance is
+also what hid the four bugs above, so after any nflverse update run:
+
+    py -m backend.tools.diagnose_ingestion
+
+which checks every column this module reads against what the data actually
+contains and dumps the real column list when one is missing.
 
 Author: Zach Cooper
 """

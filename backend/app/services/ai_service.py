@@ -880,7 +880,13 @@ def _format_shortlist_section(
     ]
     for p in shortlist:
         v = _vor(p, player_metrics, replacement)
-        vor_str = f"VOR {v:+.1f}" if v is not None else "VOR --"
+        # Same annotation as the board — a player can appear in both, and a
+        # warning that shows in one place and not the other invites reading
+        # the unflagged copy as the more favourable one.
+        if v is None:
+            vor_str = "VOR --"
+        else:
+            vor_str = f"VOR {v:+.1f}" + (" (BELOW replacement)" if v < 0 else "")
         lines.append(
             f"  id={p['id']} {p['name']} ({p['position']}, {p['team']}) "
             f"ADP {p['adp']:g}, {vor_str}, {_draft_value(p['adp'], pick_number)}"
@@ -1133,23 +1139,22 @@ def _format_run_risk(
 # invisible from inside the prompt — a player with no retrieved chunk and a
 # player with nothing wrong with him render identically.
 #
-# The original cap was a latency guard from when these queries ran serially.
-# They now run in a thread pool (see _retrieve_player_context) and are cached
-# for the process lifetime, so the cost of covering the whole board is one
-# wider fan-out on the first pick of a session rather than 25 sequential
-# round trips per pick.
+# The original cap of 10 was a latency guard from when each candidate cost
+# its own similarity search. Retrieval is now a single metadata lookup for
+# the whole board (see _retrieve_player_context), so covering 25 players
+# costs the same ~2 ms as covering 10 and the cap no longer buys anything.
 _MAX_CONTEXT_PLAYERS = _LISTED_PLAYERS
 _MAX_CHUNKS_PER_PLAYER = 3
 
 # Chroma content is only ever updated by the offline ingestion scripts
 # (chunker.py / fetch_synthesis.py), never by anything a live draft session
 # does — so it's safe to cache a player's retrieved chunks for the lifetime
-# of this process. Confirmed live: without this, every single "Get pick"
-# repeated the same ~10-20 embedding round trips for whichever players
-# still happened to be near the top of the board, which barely changes
-# pick to pick, and was a large share of a reported 10+ second latency per
-# recommendation. Unbounded is fine — a season's player pool is a few
-# hundred entries at most, trivial memory for a single draft session.
+# of this process. It matters much less than it did — the lookup it skips is
+# now ~2 ms rather than a per-player embedding — but it still avoids
+# re-fetching a board that barely changes pick to pick, and it caches
+# NEGATIVE results too, so a player with no chunks isn't re-queried on every
+# pick for the rest of the draft. Unbounded is fine: a season's player pool
+# is a few hundred entries, trivial memory for one draft session.
 _retrieval_cache: dict[str, list[str]] = {}
 
 
@@ -1297,13 +1302,13 @@ _METRIC_FIELDS: list[tuple[str, str, str]] = [
 # role vs. earlier in the season) so they're called out in their own
 # trailing clause rather than blended into the raw volume list above.
 #
-# NOTE (2026-07-29): these three, plus is_rookie_or_second_year below, are
-# unpopulated for every player in the DB right now — fetch_metrics.py logs
-# "Could not load snap_counts — snap_pct will be unavailable" during
-# ingestion, so the snap/depth-chart data these depend on never lands.
-# This code is correct and will start rendering automatically once that
-# ingestion gap is fixed; until then, expect this clause to be silent for
-# every player. Worth a separate look — see fetch_metrics.py.
+# These were silent for the whole 2026-07 to 2026-08 stretch: four separate
+# column/ID mismatches in fetch_metrics.py meant snap and depth-chart data
+# never reached the database, and an absent column reads as 0.0 rather than
+# raising, so the fields simply stored as None. All four are fixed and these
+# now populate — see fetch_metrics.py's header. If this clause ever goes
+# quiet again, run `py -m backend.tools.diagnose_ingestion` before assuming
+# the players genuinely have no trend.
 _TREND_FIELDS: list[tuple[str, str, str]] = [
     ("target share trend", "target_share_trend", "{:+.0%}"),
     ("snap % trend", "snap_pct_trend", "{:+.0%}"),
@@ -1880,8 +1885,14 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             f"equal points per game do not mean equal value, because what replaces "
             f"them differs. VOR is backward-looking where ADP is the market's "
             f"forward view — when the two disagree sharply, say so rather than "
-            f"silently trusting one. '--' means no prior-season data (usually a "
-            f"rookie), which is unknown value, NOT replacement-level value."
+            f"silently trusting one. A player marked '(BELOW replacement)' scored "
+            f"LESS last season than the player you can have at that position for "
+            f"nothing later — taking one costs you a roster spot and gains you "
+            f"nothing over waiting, so it needs a reason beyond his ADP. '--' means "
+            f"no prior-season data (usually a rookie), which is unknown value, NOT "
+            f"replacement-level value: an unproven player and a proven-below-"
+            f"replacement player are different cases, and the second is the one the "
+            f"numbers actually argue against."
         )
     tiers = _compute_adp_tiers(ctx.top_available[:_LISTED_PLAYERS])
     for i, tier in enumerate(tiers, start=1):
@@ -1894,7 +1905,19 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             )
             if ctx.replacement_ppg:
                 v = _vor(p, ctx.player_metrics, ctx.replacement_ppg)
-                row += f" VOR {v:+.1f}" if v is not None else " VOR   --"
+                if v is None:
+                    row += " VOR   --"
+                else:
+                    row += f" VOR {v:+.1f}"
+                    # A negative VOR is easy to read as "roughly neutral"
+                    # when it actually means the player produced less than
+                    # the man you can have at this position for nothing
+                    # later. Confirmed live: a back at VOR -0.17, with
+                    # falling target and snap share, was recommended over a
+                    # first-round rookie — the sign was there and did no
+                    # work. Stating it costs four words and invents nothing.
+                    if v < 0:
+                        row += " (BELOW replacement)"
             # Value against the pick you are actually making, computed here
             # rather than left as a subtraction for the model. See _draft_value.
             row += f"  {_draft_value(p['adp'], advised_pick)}"
@@ -2852,11 +2875,12 @@ class AIService:
             return _fallback(ctx, self._model)
 
         # _build_prompt is sync on purpose (it's also used by the CLI
-        # preview in main() below), but it contains the ChromaDB retrieval —
-        # up to _MAX_CONTEXT_PLAYERS embedding+query round trips on a cache
-        # miss. Run it in a worker thread so those blocking calls don't
-        # stall the event loop the same way the sync Anthropic client used
-        # to. Thread safety: it only touches SQLite-free plain dicts, the
+        # preview in main() below) and it performs the ChromaDB lookup, so
+        # it runs in a worker thread rather than on the event loop. That
+        # lookup is now a single metadata `get` costing ~2 ms rather than one
+        # embedding round trip per player, but it is still blocking I/O and
+        # the loop is also serving WebSocket pushes and the Sleeper poll.
+        # Thread safety: it touches only SQLite-free plain dicts, the
         # GIL-safe _retrieval_cache, and Chroma's own client.
         prompt = await asyncio.to_thread(_build_prompt, ctx)
 

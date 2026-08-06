@@ -7,9 +7,11 @@ This exists because ingestion failures here are silent by design. Every
 source in refresh_metrics() is wrapped in its own try/except so one flaky
 feed can't take down a draft-day refresh, which is the right call — but the
 consequence is a warning line in a log nobody reads and a PlayerMetrics
-column that stays NULL forever. Confirmed live: snap_pct, target_share,
-carry_share, depth_chart_rank and all three trend fields are NULL for all
-182 players, and the only evidence was one line during ingestion.
+column that stays NULL forever. This tool exists because exactly that
+happened: snap_pct, target_share, carry_share, depth_chart_rank and all
+three trend fields were NULL for every player for weeks, on four separate
+causes, and the only evidence anywhere was one warning line during
+ingestion. All four were found by a single run of this.
 
 A missing column is even quieter than a failed download. `_num()` returns
 0.0 for an absent field, so a share computed from a column that doesn't
@@ -55,23 +57,38 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
         "receptions":     ("receptions",),
         "air yards":      ("receiving_air_yards", "air_yards"),
         "YAC":            ("receiving_yards_after_catch", "yac"),
-        "TEAM targets":   ("team_targets",),
-        "TEAM carries":   ("team_carries", "team_rushing_attempts"),
+        # Team share denominators are summed from these rows per (team,
+        # week) — nflverse publishes no team_targets/team_carries column.
+        # See _team_week_totals in fetch_metrics.py.
+        "team (for share)": ("team", "recent_team", "team_abbr"),
+        "week (for share)": ("week",),
         "PPR points":     ("fantasy_points_ppr", "ppr_points"),
         "season_type":    ("season_type",),
     },
     "load_snap_counts": {
-        "player id":  ("gsis_id", "player_id", "pfr_player_id"),
-        "snap pct":   ("offense_pct", "offense_snaps_pct", "snap_pct"),
-        "season_type": ("season_type",),
+        # No gsis_id in this dataset — rows are remapped from pfr_player_id
+        # via load_ff_playerids before grouping.
+        "player id":   ("gsis_id", "player_id", "pfr_player_id"),
+        "pfr id":      ("pfr_player_id",),
+        "snap pct":    ("offense_pct", "offense_snaps_pct", "snap_pct"),
+        # This dataset says game_type where the others say season_type.
+        "season type": ("season_type", "game_type"),
     },
     "load_depth_charts": {
         "player id":   ("gsis_id", "player_id"),
-        "depth rank":  ("depth_team", "depth_position", "rank"),
+        "depth rank":  ("pos_rank", "depth_team", "depth_position", "rank"),
+        # Snapshot feed with no week number; ordered by timestamp instead.
+        "ordering":    ("week", "dt", "updated", "timestamp"),
     },
     "load_injuries": {
         "player id":   ("gsis_id", "player_id"),
         "status":      ("report_status", "game_status", "status"),
+    },
+    "load_ff_playerids": {
+        "gsis id":     ("gsis_id",),
+        "sleeper id":  ("sleeper_id",),
+        # Needed to map snap_counts' pfr ids onto everything else.
+        "pfr id":      ("pfr_id", "pfr_player_id", "pfrid"),
     },
     "load_team_stats": {
         "team":        ("team", "recent_team", "team_abbr"),

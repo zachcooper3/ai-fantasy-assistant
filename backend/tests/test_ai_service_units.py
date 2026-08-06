@@ -1,10 +1,21 @@
 """
-ai_service pure units — _compute_roster_gaps (FLEX-surplus logic) and
-_parse_response (Claude output validation).
+Unit tests for the recommendation layer: prompt construction, response
+parsing, the derived signals the prompt is built from (roster depth, ADP
+tiers, value over replacement, opportunity cost), streaming, and the
+fetch_metrics column resolution that feeds all of it.
 
-_compute_roster_gaps has a live regression pinned here: the AI never once
-recommended a QB across a full draft because nothing computed the open-QB
-gap (see the function's docstring in ai_service.py).
+Most of these pin a specific live failure rather than a specification, and
+the comment above each one says which. That is deliberate — nearly every bug
+in this system has been silent, producing a plausible-looking recommendation
+from data that was missing, mislabelled or misread, so a test whose rationale
+isn't recorded tends to be "simplified" back into the bug it prevented.
+
+Examples of what is pinned here: a QB never once recommended across a full
+draft (nothing computed the open-QB gap); a board rendered as one 25-player
+tier, telling the model to ignore every ADP difference on it; survival
+buckets labelled "GONE" that the model read as "unavailable" and recommended
+around; injury history double-counted against a price that already included
+it; and team-share metrics computed from a column nflverse does not publish.
 """
 
 import json
@@ -1790,3 +1801,53 @@ def test_streamed_pick_carries_the_survival_tag():
     ctx.top_available[0]["adp"] = 11.5
     ctx.my_following_pick_number = 41
     assert _pick_from({"player_id": 1}, ctx).survival == "take_now"
+
+
+def test_below_replacement_players_are_flagged_on_the_board():
+    # A negative VOR reads as "roughly neutral" at a glance when it actually
+    # means the player produced LESS than the man available for free later.
+    # Confirmed live: a back at VOR -0.17, with falling target and snap
+    # share, was recommended over a first-round rookie whose VOR was unknown.
+    ctx = ctx_with_available(1, 2)
+    ctx.top_available[0]["adp"] = 62.5
+    ctx.top_available[1]["adp"] = 40.0
+    ctx.replacement_ppg = {"RB": 11.1}
+    ctx.player_metrics = {1: {"fantasy_points_avg": 10.9},   # below
+                          2: {"fantasy_points_avg": 15.0}}   # above
+    prompt = _build_prompt(ctx)
+    # Check the board rows specifically; the must-evaluate shortlist renders
+    # the same players separately and is asserted below.
+    board = prompt.split("## Top Available Players")[1].split("\n## ")[0]
+    below = [l for l in board.splitlines() if "P1 " in l][0]
+    above = [l for l in board.splitlines() if "P2 " in l][0]
+    assert "(BELOW replacement)" in below
+    assert "(BELOW replacement)" not in above
+    # And the shortlist must agree — a warning shown in one place but not
+    # the other invites reading the unflagged copy as the better one.
+    if "## MUST EVALUATE" in prompt:
+        sl = prompt.split("## MUST EVALUATE")[1].split("\n## ")[0]
+        p1 = [l for l in sl.splitlines() if "P1 " in l]
+        if p1:
+            assert "(BELOW replacement)" in p1[0]
+
+
+def test_unknown_vor_is_never_flagged_as_below_replacement():
+    # An unproven rookie and a proven-below-replacement veteran are
+    # different cases; only the second is one the numbers argue against.
+    ctx = ctx_with_available(1)
+    ctx.replacement_ppg = {"RB": 11.1}
+    ctx.player_metrics = {}
+    prompt = _build_prompt(ctx)
+    board = prompt.split("## Top Available Players")[1].split("\n## ")[0]
+    row = [l for l in board.splitlines() if "P1 " in l][0]
+    assert "VOR   --" in row
+    assert "BELOW replacement" not in row
+
+
+def test_board_explains_what_below_replacement_means():
+    ctx = ctx_with_available(1)
+    ctx.replacement_ppg = {"RB": 11.1}
+    ctx.player_metrics = {1: {"fantasy_points_avg": 10.0}}
+    prompt = _build_prompt(ctx)
+    assert "gains you nothing over waiting" in prompt
+    assert "unknown value, NOT replacement-level value" in prompt
