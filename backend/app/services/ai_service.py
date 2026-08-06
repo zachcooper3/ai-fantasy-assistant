@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import anthropic
@@ -38,7 +37,7 @@ _CONFIDENCE_LEVELS = {"high", "medium", "low"}
 # How many alternatives we keep. The prompt states this explicitly *and*
 # _parse_response enforces it — if only the parser knew, the model would spend
 # tokens writing entries that get silently discarded.
-_MAX_ALTERNATIVES = 5
+_MAX_ALTERNATIVES = 4
 
 # Output budget. This has to comfortably fit the whole JSON response: strategy,
 # confidence, the recommendation, _MAX_ALTERNATIVES entries that each carry
@@ -1154,35 +1153,6 @@ _MAX_CHUNKS_PER_PLAYER = 3
 _retrieval_cache: dict[str, list[str]] = {}
 
 
-def _query_player_chunks(vector_query, sleeper_id: str, player_name: str) -> list[str]:
-    """
-    One query per player instead of two — what_happened and what_it_means
-    are pulled together via a chunk_type $in filter rather than as separate
-    round trips, halving the embedding/query cost per candidate. Cached by
-    sleeper_id so repeat lookups across a draft session (very common — the
-    top of the board barely changes pick to pick) are free after the first.
-
-    player_name is still passed as the query text (not left blank) — the
-    `where` filter already narrows results to one player's own chunks, so
-    it mostly only affects tie-breaking when a player has more chunks than
-    _MAX_CHUNKS_PER_PLAYER, but there's no reason to introduce an untested
-    empty-string-embedding edge case when this is already proven to work.
-    """
-    if sleeper_id in _retrieval_cache:
-        return _retrieval_cache[sleeper_id]
-
-    results = vector_query(
-        player_name,
-        n_results=_MAX_CHUNKS_PER_PLAYER,
-        where={"$and": [
-            {"sleeper_id": sleeper_id},
-            {"chunk_type": {"$in": ["what_happened", "what_it_means"]}},
-        ]},
-    )
-    _retrieval_cache[sleeper_id] = results
-    return results
-
-
 def _retrieve_player_context(top_available: list[dict]) -> str:
     """
     Pulls "what happened" (Sleeper injury status + RotoWire news) and "what
@@ -1207,7 +1177,7 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
     waiting on a vector store, same stance as the Claude API fallback above.
     """
     try:
-        from backend.rag.vector_store import query as vector_query
+        from backend.rag.vector_store import fetch_by_metadata
     except Exception as e:
         logger.info(f"Vector store unavailable — building prompt without retrieved context: {e}")
         return ""
@@ -1215,38 +1185,52 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
     candidates = [
         p for p in top_available[:_MAX_CONTEXT_PLAYERS] if p.get("sleeper_id")
     ]
+    wanted = [str(p["sleeper_id"]) for p in candidates
+              if str(p["sleeper_id"]) not in _retrieval_cache]
 
-    # Fan the (network-bound, cache-missing) queries out instead of running
-    # them one after another. Each is an embedding round trip of a few
-    # hundred ms; ten of them serially was a large, entirely avoidable share
-    # of the reported ~10s per recommendation, since they don't depend on
-    # each other in any way. The whole call already runs in a worker thread
-    # (see AIService.recommend), so this nests a small pool inside it rather
-    # than touching the event loop. _retrieval_cache is only ever written
-    # with whole-value dict assignment, which is atomic under the GIL — a
-    # duplicate concurrent query for the same player is wasted work at worst,
-    # never corruption.
-    def _lookup(p: dict) -> tuple[dict, list[str] | None]:
+    # ONE metadata lookup covering every uncached candidate, instead of one
+    # similarity search per player.
+    #
+    # The old shape ran _MAX_CONTEXT_PLAYERS separate `query` calls, each of
+    # which embeds its query text through a local ONNX model. That is real
+    # CPU work, so the thread pool wrapped around it bought far less than it
+    # appeared to, and raising the candidate count from 10 to 25 scaled the
+    # cost linearly — the direct cause of recommendations going from about
+    # ten seconds to forty.
+    #
+    # None of that work was ever needed. The filter already pins results to
+    # a single player's chunks by sleeper_id, so the embedded query text was
+    # only breaking ties between chunks that are all about that player
+    # anyway. `fetch_by_metadata` uses Chroma's `get`, which touches no
+    # model: measured at 2.2 ms for all 25 players against the live store.
+    if wanted:
         try:
-            return p, _query_player_chunks(vector_query, p["sleeper_id"], p["name"])
+            rows = fetch_by_metadata({"$and": [
+                {"sleeper_id": {"$in": wanted}},
+                {"chunk_type": {"$in": ["what_happened", "what_it_means"]}},
+            ]})
         except Exception as e:
-            logger.warning(f"Vector query failed for {p['name']}: {e}")
-            return p, None
+            logger.warning(f"Vector fetch failed — prompt built without retrieved context: {e}")
+            rows = []
 
-    if candidates:
-        with ThreadPoolExecutor(max_workers=min(len(candidates), 8)) as pool:
-            outcomes = list(pool.map(_lookup, candidates))
-    else:
-        outcomes = []
+        grouped: dict[str, list[str]] = {}
+        for meta, doc in rows:
+            sid = str((meta or {}).get("sleeper_id") or "")
+            if sid and doc:
+                grouped.setdefault(sid, []).append(doc)
+        # Cache every player asked for, including the ones with nothing —
+        # a negative result is worth remembering too, and without this an
+        # empty player is re-fetched on every single pick.
+        for sid in wanted:
+            _retrieval_cache[sid] = grouped.get(sid, [])[:_MAX_CHUNKS_PER_PLAYER]
+
+    outcomes = [(p, _retrieval_cache.get(str(p["sleeper_id"]), [])) for p in candidates]
 
     sections: list[str] = []
     hits = 0
     checked = 0
     for p, results in outcomes:
         checked += 1
-        if results is None:
-            continue
-
         if results:
             hits += 1
             lines = "\n".join(f"  {r}" for r in results)
@@ -2402,6 +2386,62 @@ def _clean_text(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _extract_complete_object(text: str, key: str) -> dict | None:
+    """
+    Parses `"<key>": { ... }` out of a partially-received JSON document, or
+    returns None while it's still arriving.
+
+    Streaming exists to show the pick before the rest of the response
+    finishes generating, and the pick is a nested object roughly a fifth of
+    the way into a document that takes twenty seconds to produce. So the
+    stream has to answer "is this one object closed yet" on text that is
+    invalid JSON everywhere else — `json.loads` can't help until the very
+    end, which is the moment streaming is trying to beat.
+
+    Brace-matching rather than a JSON parser, and string-aware: a brace
+    inside a reasoning string ("he's a 'bell-cow' {sic}") would otherwise
+    close the object early and yield a truncated pick. Escapes are honoured
+    so a literal quote in the prose can't drop us out of string context.
+
+    Returns None on anything malformed rather than raising — a
+    half-delivered object is the normal case here, not an error.
+    """
+    marker = f'"{key}"'
+    at = text.find(marker)
+    if at == -1:
+        return None
+    start = text.find("{", at + len(marker))
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def _restore_prefill(raw: str) -> str:
     """
     Puts back the opening brace consumed by the prefilled assistant turn (see
@@ -2417,6 +2457,45 @@ def _restore_prefill(raw: str) -> str:
     whose stub returns a complete object.
     """
     return raw if raw.lstrip().startswith("{") else "{" + raw
+
+
+def _as_player_id(value) -> int | None:
+    """Claude occasionally returns player_id as a JSON string ("3" not 3);
+    rejecting that would throw away a good recommendation over a type quirk."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_from(d: dict, ctx: RecommendationContext) -> PickSuggestion | None:
+    """
+    Builds a PickSuggestion from one of Claude's objects, taking every
+    factual field from the canonical player row and only the free text from
+    the model.
+
+    Module-level so the streaming path validates identically to the batch
+    one. A partially-received response is exactly where a laxer check would
+    be tempting, and exactly where it would be worst: the pick rendered
+    first from a stream is the one the user acts on.
+
+    Returns None for an id that isn't in top_available — unknown or already
+    drafted. Validating player_id while still rendering the model's own
+    player_name once displayed a drafted player under an available id, so
+    the id is the only field trusted, and it's the only one verified.
+    """
+    canonical = {p["id"]: p for p in ctx.top_available}.get(_as_player_id(d.get("player_id")))
+    if canonical is None:
+        return None
+    return PickSuggestion(
+        player_id=canonical["id"],
+        player_name=canonical["name"],
+        position=canonical["position"],
+        adp=canonical["adp"],
+        reasoning=str(d.get("reasoning", "")),
+        tradeoff=_clean_text(d.get("tradeoff")),
+        survival=_survival_code(canonical["adp"], ctx.my_following_pick_number),
+    )
 
 
 def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResult | None:
@@ -2479,20 +2558,7 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
     by_id = {p["id"]: p for p in ctx.top_available}
 
     def _pick(d: dict) -> PickSuggestion | None:
-        canonical = by_id.get(_as_id(d.get("player_id")))
-        if canonical is None:
-            # Unknown or already-drafted id — not in top_available.
-            return None
-        return PickSuggestion(
-            player_id=canonical["id"],
-            player_name=canonical["name"],
-            position=canonical["position"],
-            adp=canonical["adp"],
-            # Free text is the model's to write; it's the only thing it adds.
-            reasoning=str(d.get("reasoning", "")),
-            tradeoff=_clean_text(d.get("tradeoff")),
-            survival=_survival_code(canonical["adp"], ctx.my_following_pick_number),
-        )
+        return _pick_from(d, ctx)
 
     recommendation = _pick(rec)
     if recommendation is None:
@@ -2706,6 +2772,76 @@ class AIService:
     @property
     def model_name(self) -> str:
         return self._model
+
+    async def recommend_stream(self, ctx: RecommendationContext):
+        """
+        Same recommendation as recommend(), yielded in two stages:
+
+            ("pick",     PickSuggestion)      as soon as it has been written
+            ("complete", RecommendationResult) when the whole response lands
+
+        Total time is unchanged — this does not make the model faster. What
+        changes is when the answer becomes visible. Measured on a live
+        board: 1,664 output tokens at ~75 tok/sec is ~22 seconds, and
+        generation is sequential, so nothing appears until it finishes. The
+        recommendation object is about a fifth of the way in, so the pick
+        itself exists after roughly four seconds and then sits there while
+        alternatives, verdicts and alerts are still being written.
+
+        Consumers should render the pick on the first event and fill in the
+        rest on the second. Both are the same underlying response; the first
+        is not a guess or a cheaper model.
+
+        Falls back exactly like recommend(): any failure yields a single
+        ("complete", <ADP fallback>) rather than raising, because a draft
+        clock does not care why the API is unhappy.
+        """
+        if self._client is None:
+            yield "complete", _fallback(ctx, self._model)
+            return
+
+        prompt = await asyncio.to_thread(_build_prompt, ctx)
+        buffer = ""
+        sent_pick = False
+
+        try:
+            async with self._client.messages.stream(
+                model=self._model,
+                max_tokens=_MAX_RESPONSE_TOKENS,
+                temperature=_TEMPERATURE,
+                system=_build_system_prompt(ctx.scoring_format),
+                messages=[
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "{"},
+                ],
+            ) as stream:
+                async for chunk in stream.text_stream:
+                    buffer += chunk
+                    if sent_pick:
+                        continue
+                    # Cheap guard: don't attempt a scan until the object it
+                    # would look for has plausibly closed.
+                    if "alternatives" not in buffer and buffer.count("}") < 1:
+                        continue
+                    rec = _extract_complete_object(_restore_prefill(buffer), "recommendation")
+                    if rec:
+                        pick = _pick_from(rec, ctx)
+                        if pick is not None:
+                            sent_pick = True
+                            yield "pick", pick
+
+            result = _parse_response(_restore_prefill(buffer), ctx)
+            if result is None:
+                logger.warning("Falling back to ADP — could not parse streamed response.")
+                result = _fallback(ctx, self._model)
+            yield "complete", result
+
+        except anthropic.APIError as e:
+            logger.error("Anthropic API error during stream: %s", e)
+            yield "complete", _fallback(ctx, self._model)
+        except Exception:
+            logger.exception("Unexpected error during streamed recommendation.")
+            yield "complete", _fallback(ctx, self._model)
 
     async def recommend(self, ctx: RecommendationContext) -> RecommendationResult:
         """

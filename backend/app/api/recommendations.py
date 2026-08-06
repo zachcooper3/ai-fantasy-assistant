@@ -8,7 +8,11 @@ GET /api/recommend/scarcity               — positional scarcity analysis
 Author: Zach Cooper
 """
 
+import json
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -25,6 +29,8 @@ from backend.app.services.ai_service import (
     compute_replacement_levels,
 )
 from backend.app.services.draft_state import DraftStateService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/recommend", tags=["recommendations"])
 
@@ -329,6 +335,81 @@ async def recommend_pick(
         pick_number=ctx.pick_number,
         is_my_turn=ctx.is_my_turn,
         picks_until_my_turn=ctx.picks_until_my_turn,
+    )
+
+
+@router.get("/pick/stream")
+async def recommend_pick_stream(
+    svc: DraftStateService = Depends(get_draft_service),
+    ai: AIService = Depends(get_ai_service),
+    db: Session = Depends(get_session),
+):
+    """
+    Same recommendation as GET /pick, delivered as Server-Sent Events so the
+    pick can be shown before the rest of the response finishes generating.
+
+    Two event types:
+        event: pick      — the recommendation alone, ~4s in
+        event: complete  — the full payload, identical to GET /pick
+
+    Total time is the same. Generation is sequential and output-bound (about
+    1,660 tokens at ~75 tok/sec), so the batch endpoint shows nothing for
+    twenty seconds while the answer has in fact existed since second four.
+    This changes only when it becomes visible.
+
+    GET /pick is deliberately kept: it is simpler to call, and a client that
+    does not need progressive rendering should not have to parse an event
+    stream to get a pick.
+    """
+    if not svc.is_active:
+        raise HTTPException(status_code=400, detail="No active draft session.")
+    if svc.draft_complete:
+        raise HTTPException(status_code=400, detail="Draft is complete.")
+
+    ctx = _build_context(svc, db)
+    if not ctx.top_available:
+        raise HTTPException(status_code=404, detail="No available players left to recommend.")
+
+    def _event(name: str, payload: dict) -> str:
+        return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+    async def _generate():
+        try:
+            async for kind, value in ai.recommend_stream(ctx):
+                if kind == "pick":
+                    yield _event("pick", {
+                        "recommendation": PickSuggestionResponse(**value.__dict__).model_dump(),
+                        "pick_number": ctx.pick_number,
+                    })
+                else:
+                    yield _event("complete", RecommendationResponse(
+                        recommendation=PickSuggestionResponse(**value.recommendation.__dict__),
+                        alternatives=[PickSuggestionResponse(**a.__dict__) for a in value.alternatives],
+                        alerts=value.alerts,
+                        model=value.model,
+                        strategy=value.strategy,
+                        confidence=value.confidence,
+                        considered=value.considered,
+                        pick_number=ctx.pick_number,
+                        is_my_turn=ctx.is_my_turn,
+                        picks_until_my_turn=ctx.picks_until_my_turn,
+                    ).model_dump())
+        except Exception:
+            # The stream has already begun, so an HTTP error status is no
+            # longer available — the client would see a truncated stream and
+            # no reason. Send the failure as a normal event instead.
+            logger.exception("Streamed recommendation failed after the response started.")
+            yield _event("error", {"detail": "Recommendation failed — try again."})
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Without this, nginx-style proxies buffer the whole stream and
+            # deliver it at once, which silently undoes the entire feature.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

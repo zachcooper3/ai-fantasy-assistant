@@ -24,6 +24,7 @@ from backend.app.services.ai_service import (
     _compute_roster_depth,
     _compute_adp_tiers,
     _draft_value,
+    _extract_complete_object,
     _find_dominating_player,
     _dominance_alert,
     _mentions_player,
@@ -163,7 +164,9 @@ def test_unavailable_alternatives_are_dropped_and_capped():
     payload = valid_payload(alt_ids=(2, 99, 3, 4, 5, 6))
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3, 4, 5, 6))
     assert len(payload["alternatives"]) > _MAX_ALTERNATIVES
-    assert [a.player_id for a in result.alternatives] == [2, 3, 4, 5]
+    # Cap applies first, then the availability filter: the first
+    # _MAX_ALTERNATIVES entries are [2, 99, 3, 4], and 99 is then dropped.
+    assert [a.player_id for a in result.alternatives] == [2, 3, 4]
 
 
 def test_malformed_alternative_entries_are_skipped():
@@ -1522,3 +1525,268 @@ def test_survival_codes_are_stable_regardless_of_prompt_wording():
     assert _survival_code(38.0, 41) == "might_last"
     assert _survival_code(90.0, 41) == "will_last"
     assert _survival_code(50.0, None) == ""
+
+
+# ---------------------------------------------------------------------------
+# fetch_metrics column resolution
+#
+# Live diagnostic against the 2025 nflverse release: player_stats has 145
+# columns and neither `team_targets` nor `team_carries`. The share
+# calculations read exactly those names, and _num() returns 0.0 for an absent
+# field, so target_share / carry_share / target_share_trend were None for all
+# 182 players — with nothing anywhere to distinguish "could not compute" from
+# "this player has no role".
+# ---------------------------------------------------------------------------
+
+def _stat_row(team="KC", week=1, targets=0.0, carries=0.0, **extra):
+    row = {"team": team, "week": week, "targets": targets, "carries": carries,
+           "receiving_yards": 0.0, "receptions": 0.0, "rushing_yards": 0.0,
+           "receiving_air_yards": 0.0, "receiving_yards_after_catch": 0.0}
+    row.update(extra)
+    return row
+
+
+def test_team_totals_are_summed_from_the_player_rows():
+    from backend.ingestion.fetch_metrics import _team_week_totals
+    rows = [_stat_row(targets=10, carries=2), _stat_row(targets=30, carries=20)]
+    assert _team_week_totals(rows)[("KC", 1)] == {"targets": 40.0, "carries": 22.0}
+
+
+def test_target_and_carry_share_are_computed_again():
+    from backend.ingestion.fetch_metrics import _team_week_totals, _compute_opportunity_efficiency
+    rows = [_stat_row(targets=10, carries=2), _stat_row(targets=30, carries=20)]
+    out = _compute_opportunity_efficiency([rows[0]], _team_week_totals(rows))
+    assert out["target_share"] == pytest.approx(0.25)
+    assert out["carry_share"] == pytest.approx(2 / 22)
+
+
+def test_shares_are_none_without_team_totals_rather_than_zero():
+    # The pre-fix behaviour, kept explicit: absent denominators must yield
+    # None ("unknown"), never 0.0 ("no role").
+    from backend.ingestion.fetch_metrics import _compute_opportunity_efficiency
+    out = _compute_opportunity_efficiency([_stat_row(targets=10)])
+    assert out["target_share"] is None and out["carry_share"] is None
+
+
+def test_share_denominator_covers_only_the_weeks_he_played():
+    # Summing the full season instead would divide a partial-season target
+    # count by a full-season denominator and understate every injured player.
+    from backend.ingestion.fetch_metrics import _team_week_totals, _compute_opportunity_efficiency
+    rows = [_stat_row(week=1, targets=10), _stat_row(week=1, targets=30),
+            _stat_row(week=2, targets=40)]          # week 2: he did not play
+    out = _compute_opportunity_efficiency([rows[0]], _team_week_totals(rows))
+    assert out["target_share"] == pytest.approx(0.25)   # 10/40, not 10/80
+
+
+def test_snap_counts_postseason_is_filtered_via_game_type():
+    # snap_counts has no `season_type` column — it uses `game_type`. Rows
+    # missing the field are kept, so before the alias every postseason snap
+    # was silently summed into snap_pct.
+    from backend.ingestion.fetch_metrics import _filter_regular_season
+    rows = [{"game_type": "REG"}, {"game_type": "POST"}, {"game_type": "REG"}]
+    assert len(_filter_regular_season(rows)) == 2
+
+
+def test_season_type_still_wins_where_it_exists():
+    from backend.ingestion.fetch_metrics import _filter_regular_season
+    rows = [{"season_type": "REG"}, {"season_type": "POST"}]
+    assert len(_filter_regular_season(rows)) == 1
+    # And a row with neither field is still kept — "can't tell" must not
+    # silently discard otherwise-valid data.
+    assert len(_filter_regular_season([{"week": 1}])) == 1
+
+
+def test_depth_chart_rank_reads_the_current_nflverse_column():
+    # nflverse reworked depth_charts: 12 columns, none of them depth_team,
+    # depth_position or rank. The rank now lives in `pos_rank`.
+    from backend.ingestion.fetch_metrics import _compute_forward_looking
+    rows = [{"gsis_id": "x", "dt": "2025-09-01T00:00:00Z", "pos_rank": 3},
+            {"gsis_id": "x", "dt": "2025-12-01T00:00:00Z", "pos_rank": 1}]
+    out = _compute_forward_looking([], [], rows)
+    assert out["depth_chart_trend"] == -2      # negative = moving up
+
+
+def test_depth_charts_are_ordered_by_timestamp_not_a_week_column():
+    # depth_charts is a snapshot feed keyed by `dt`, with no week number.
+    # Sorting by "week" put every row at 0.0, making first-vs-last arbitrary.
+    from backend.ingestion.fetch_metrics import _order_key
+    rows = [{"dt": "2025-12-01T00:00:00Z"}, {"dt": "2025-09-01T00:00:00Z"}]
+    assert [r["dt"] for r in sorted(rows, key=_order_key)] == [
+        "2025-09-01T00:00:00Z", "2025-12-01T00:00:00Z"]
+
+
+def test_order_key_still_prefers_a_real_week_number():
+    from backend.ingestion.fetch_metrics import _order_key
+    rows = [{"week": 12}, {"week": 2}]
+    assert [r["week"] for r in sorted(rows, key=_order_key)] == [2, 12]
+    # Rows with neither field sort last rather than raising.
+    assert _order_key({}) > _order_key({"week": 99})
+
+
+def test_pfr_crosswalk_maps_snap_rows_onto_gsis_ids():
+    # THE snap_pct bug: load_snap_counts carries pfr_player_id and no
+    # gsis_id, so rows grouped under PFR keys while the per-player lookup
+    # asked for gsis ids. Nothing matched, for anyone, silently.
+    snap_rows = [{"pfr_player_id": "PfrA", "offense_pct": 0.9, "game_type": "REG"}]
+    pfr_map = {"PfrA": "00-0011111"}
+    for row in snap_rows:
+        gsis = pfr_map.get(str(row.get("pfr_player_id") or ""))
+        if gsis:
+            row["gsis_id"] = gsis
+    from backend.ingestion.fetch_metrics import _group_by_player
+    grouped = _group_by_player(snap_rows, ("gsis_id", "player_id", "pfr_player_id"))
+    assert "00-0011111" in grouped, "snap rows must group under the gsis id"
+    assert "PfrA" not in grouped
+
+
+def test_depth_chart_rank_and_trend_read_the_same_columns():
+    # depth_chart_trend got `pos_rank` added but the rank assignment in
+    # refresh_metrics did not, so the trend populated for all 182 players
+    # while the rank itself stayed NULL. Any future rename has to land in
+    # both places, so pin them together.
+    import inspect
+    from backend.ingestion import fetch_metrics
+    src = inspect.getsource(fetch_metrics)
+    assert src.count('"pos_rank", "depth_team", "depth_position", "rank"') == 3, (
+        "rank candidates must be identical in _compute_forward_looking "
+        "(first + last) and in refresh_metrics' latest-rank lookup"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Retrieval performance shape
+#
+# Recommendations went from ~10s to ~40s when _MAX_CONTEXT_PLAYERS rose from
+# 10 to 25, because each candidate triggered a `query` — a similarity search
+# that embeds its query text through a local ONNX model. The filter already
+# pinned results to one player by sleeper_id, so the embedding was only ever
+# breaking ties among that player's own chunks. Replaced with a single `get`
+# (pure metadata lookup, no model): 2.2 ms for all 25 against the live store.
+# ---------------------------------------------------------------------------
+
+def test_retrieval_makes_one_bulk_call_not_one_per_player(monkeypatch):
+    from backend.app.services import ai_service as S
+    S._retrieval_cache.clear()
+    calls = []
+
+    def fake_fetch(where):
+        calls.append(where)
+        return [({"sleeper_id": "1"}, "news about P1")]
+
+    import types
+    fake = types.ModuleType("backend.rag.vector_store")
+    fake.fetch_by_metadata = fake_fetch
+    monkeypatch.setitem(__import__("sys").modules, "backend.rag.vector_store", fake)
+
+    board = [{"id": i, "name": f"P{i}", "position": "WR", "sleeper_id": str(i)}
+             for i in range(1, 11)]
+    out = S._retrieve_player_context(board)
+    assert len(calls) == 1, "ten players must cost one lookup, not ten"
+    assert "news about P1" in out
+    # Players with nothing still get an explicit line, never silence.
+    assert "No retrieved data" in out
+
+
+def test_retrieval_caches_negative_results_too(monkeypatch):
+    # Without caching the empties, a player with no chunks is re-fetched on
+    # every single pick for the whole draft.
+    from backend.app.services import ai_service as S
+    S._retrieval_cache.clear()
+    calls = []
+
+    def fake_fetch(where):
+        calls.append(where)
+        return []
+
+    import types, sys
+    fake = types.ModuleType("backend.rag.vector_store")
+    fake.fetch_by_metadata = fake_fetch
+    monkeypatch.setitem(sys.modules, "backend.rag.vector_store", fake)
+
+    board = [{"id": 1, "name": "P1", "position": "WR", "sleeper_id": "1"}]
+    S._retrieve_player_context(board)
+    S._retrieve_player_context(board)
+    assert len(calls) == 1, "the second pass must be served from cache"
+
+
+def test_retrieval_survives_a_vector_store_failure(monkeypatch):
+    # Draft day must not stall on the vector store.
+    from backend.app.services import ai_service as S
+    S._retrieval_cache.clear()
+
+    def boom(where):
+        raise RuntimeError("chroma is down")
+
+    import types, sys
+    fake = types.ModuleType("backend.rag.vector_store")
+    fake.fetch_by_metadata = boom
+    monkeypatch.setitem(sys.modules, "backend.rag.vector_store", fake)
+
+    board = [{"id": 1, "name": "P1", "position": "WR", "sleeper_id": "1"}]
+    out = S._retrieve_player_context(board)   # must not raise
+    assert "No retrieved data" in out
+
+
+# ---------------------------------------------------------------------------
+# Streaming
+#
+# Generation is sequential and output-bound: 1,664 tokens at ~75 tok/sec is
+# ~22s, and the batch endpoint shows nothing for all of it — even though the
+# recommendation object is written about a fifth of the way in. Streaming
+# renders the pick at ~4s. To do that the stream must decide "is this one
+# object closed yet" on text that is invalid JSON everywhere else.
+# ---------------------------------------------------------------------------
+
+def test_extracts_the_pick_before_the_rest_arrives():
+    partial = ('{"strategy": "go RB", "confidence": "high", '
+               '"recommendation": {"player_id": 7, "reasoning": "volume"}, '
+               '"alternatives": [{"player_id')          # cut mid-token
+    got = _extract_complete_object(partial, "recommendation")
+    assert got == {"player_id": 7, "reasoning": "volume"}
+
+
+def test_returns_none_while_the_object_is_still_arriving():
+    for partial in ('{"recommendation": {"player_id": 7, "reason',
+                    '{"recommendation": {',
+                    '{"strategy": "x"',
+                    ''):
+        assert _extract_complete_object(partial, "recommendation") is None
+
+
+def test_a_brace_inside_prose_does_not_close_the_object_early():
+    # Without string-awareness this returns a truncated pick — and the
+    # streamed pick is the one the user acts on.
+    partial = ('{"recommendation": {"player_id": 7, '
+               '"reasoning": "a bell-cow {sic} back"}, "alternatives": []}')
+    got = _extract_complete_object(partial, "recommendation")
+    assert got["reasoning"] == "a bell-cow {sic} back"
+    assert got["player_id"] == 7
+
+
+def test_escaped_quotes_do_not_break_string_tracking():
+    partial = ('{"recommendation": {"player_id": 7, '
+               '"reasoning": "they call him \\"the truth\\""}, "x": 1}')
+    got = _extract_complete_object(partial, "recommendation")
+    assert got["player_id"] == 7
+
+
+def test_missing_key_is_not_an_error():
+    assert _extract_complete_object('{"alternatives": []}', "recommendation") is None
+
+
+def test_streamed_pick_is_validated_like_a_batch_one():
+    # A partially-received response is exactly where a laxer check would be
+    # tempting and exactly where it would be worst.
+    from backend.app.services.ai_service import _pick_from
+    ctx = ctx_with_available(1, 2)
+    assert _pick_from({"player_id": 99, "reasoning": "x"}, ctx) is None
+    good = _pick_from({"player_id": 1, "reasoning": "x"}, ctx)
+    assert good is not None and good.player_name == "P1"   # canonical, not model-supplied
+
+
+def test_streamed_pick_carries_the_survival_tag():
+    from backend.app.services.ai_service import _pick_from
+    ctx = ctx_with_available(1)
+    ctx.top_available[0]["adp"] = 11.5
+    ctx.my_following_pick_number = 41
+    assert _pick_from({"player_id": 1}, ctx).survival == "take_now"

@@ -131,9 +131,23 @@ export interface Recommendation {
   strategy: string;
   /** How clear-cut the call is. The no-AI ADP fallback always reports "low". */
   confidence: Confidence;
+  /**
+   * One line per must-evaluate player: taken, or passed and why. Exists to
+   * make omission visible — every live mis-recommendation so far has been a
+   * top-of-board player never mentioned at all, rather than one rejected on
+   * the merits. Empty on the ADP fallback, which evaluates nothing.
+   */
+  considered: string[];
   pick_number: number;
   is_my_turn: boolean;
   picks_until_my_turn: number;
+  /**
+   * True while only the pick has arrived and the alternatives, verdicts and
+   * alerts are still generating. Set client-side by the streaming path, never
+   * sent by the server — it describes how much of the response we have, not
+   * anything about the recommendation itself.
+   */
+  isPartial?: boolean;
 }
 
 export interface ScarcityAlert {
@@ -264,6 +278,65 @@ export const api = {
 
   // Recommendations
   getRecommendation: () => get<Recommendation>("/api/recommend/pick"),
+
+  /**
+   * Streams the recommendation, calling `onPick` as soon as the pick itself
+   * has been generated and resolving with the full response.
+   *
+   * Generation is sequential and output-bound — about 1,660 tokens at ~75
+   * tok/sec — so the plain endpoint shows nothing for twenty seconds even
+   * though the pick was written after roughly four. This does not make the
+   * model faster; it stops hiding the answer until the alternatives,
+   * verdicts and alerts have finished.
+   *
+   * Uses fetch + a ReadableStream rather than EventSource: EventSource
+   * cannot send the Authorization header this API requires, and silently
+   * reconnects on completion, which would re-run a paid Claude call every
+   * time the stream closed.
+   */
+  streamRecommendation: async (
+    onPick: (pick: PickSuggestion, pickNumber: number) => void,
+  ): Promise<Recommendation> => {
+    const res = await fetch(`${BASE}/api/recommend/pick/stream`, {
+      headers: API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {},
+    });
+    if (!res.ok || !res.body) {
+      throw new Error(`Recommendation stream failed (${res.status})`);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let complete: Recommendation | null = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by a blank line. Keep any trailing partial
+      // frame in the buffer for the next read.
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const event = /^event: (.+)$/m.exec(frame)?.[1];
+        const data = /^data: (.+)$/m.exec(frame)?.[1];
+        if (!event || !data) continue;
+        const payload = JSON.parse(data);
+        if (event === "pick") {
+          onPick(payload.recommendation as PickSuggestion, payload.pick_number);
+        } else if (event === "complete") {
+          complete = payload as Recommendation;
+        } else if (event === "error") {
+          throw new Error(payload.detail ?? "Recommendation failed");
+        }
+      }
+    }
+
+    if (!complete) throw new Error("Recommendation stream ended without a result");
+    return complete;
+  },
 
   getScarcity: () => get<ScarcityAnalysis>("/api/recommend/scarcity"),
 

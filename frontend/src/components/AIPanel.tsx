@@ -431,6 +431,17 @@ export default function AIPanel({
               </div>
             </div>
 
+            {/* While streaming, the pick arrives ~16s before the rest. Say so
+                explicitly: an empty "Also considered" would otherwise read as
+                "the model had no alternatives", which is a different and
+                much stronger claim than "they haven't finished generating". */}
+            {recommendation.isPartial && (
+              <p className="flex items-center gap-2 text-xs text-slate-400">
+                <RefreshCw size={12} className="animate-spin" aria-hidden="true" />
+                Weighing alternatives…
+              </p>
+            )}
+
             {/* Alternatives — peers of the recommendation, with the trade-off
                 against it spelled out. */}
             {recommendation.alternatives.length > 0 && (

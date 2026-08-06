@@ -145,7 +145,11 @@ def _filter_regular_season(rows: list[dict]) -> list[dict]:
     """
     filtered = []
     for row in rows:
-        season_type = _first(row, "season_type")
+        # snap_counts has no `season_type` column — it uses `game_type`
+        # (confirmed live: 16 columns, game_type present, season_type not).
+        # Rows lacking the field entirely are kept, so before this alias every
+        # postseason snap was silently summed into snap_pct.
+        season_type = _first(row, "season_type", "game_type")
         if season_type is None or str(season_type).strip().upper() == "REG":
             filtered.append(row)
     return filtered
@@ -169,6 +173,61 @@ def _load_dicts(loader_name: str, *args, **kwargs) -> list[dict]:
     fn = getattr(nfl, loader_name)
     df = fn(*args, **kwargs)
     return df.to_dicts()
+
+
+def _load_pfr_crosswalk() -> dict[str, str]:
+    """
+    Returns {pfr_id: gsis_id} from load_ff_playerids.
+
+    Needed because load_snap_counts is keyed by `pfr_player_id` and carries
+    no gsis_id at all (confirmed live: 16 columns, pfr_player_id present,
+    gsis_id absent). Everything else in this module is keyed by gsis_id, so
+    without a translation step the snap rows group under PFR ids and the
+    per-player lookup — which asks for a gsis_id — matches nobody. That is
+    why snap_pct and snap_pct_trend were NULL for all 182 players even
+    though the download succeeded: the data arrived and was then silently
+    filed under keys nothing ever asks for.
+
+    Column name is resolved defensively; ff_playerids is a many-platform
+    crosswalk and the PFR field has been spelled a few ways.
+    """
+    rows = _load_dicts("load_ff_playerids")
+    crosswalk: dict[str, str] = {}
+    for row in rows:
+        pfr_id = _first(row, "pfr_id", "pfr_player_id", "pfrid")
+        gsis_id = _first(row, "gsis_id")
+        if pfr_id and gsis_id:
+            crosswalk[str(pfr_id)] = str(gsis_id)
+    if not crosswalk:
+        logger.warning(
+            "No pfr_id -> gsis_id mappings found in load_ff_playerids — snap "
+            "counts cannot be matched to players and snap_pct will stay NULL. "
+            "Check the PFR column name in that dataset."
+        )
+    else:
+        logger.info(f"PFR crosswalk: {len(crosswalk):,} pfr_id -> gsis_id mappings")
+    return crosswalk
+
+
+def _order_key(row: dict) -> tuple:
+    """
+    Sort key for a player's weekly rows, tolerant of datasets that have no
+    week number.
+
+    load_depth_charts is a snapshot feed keyed by `dt` (an ISO-8601
+    timestamp), not a weekly table — so sorting it by "week" put every row
+    at 0.0 and made "first vs last" an arbitrary pick, which is what
+    depth_chart_trend was measuring. ISO-8601 sorts correctly as a string,
+    so no parsing is needed.
+    """
+    week = _first(row, "week")
+    if week is not None:
+        try:
+            return (0, float(week))
+        except (TypeError, ValueError):
+            pass
+    dt = _first(row, "dt", "updated", "timestamp")
+    return (1, str(dt)) if dt is not None else (2, "")
 
 
 def _load_id_crosswalk() -> dict[str, str]:
@@ -221,10 +280,73 @@ def _fantasy_points_ppr(row: dict) -> float:
 _MIN_AIR_YARDS_FOR_RACR = 50.0
 
 
-def _compute_opportunity_efficiency(weeks: list[dict]) -> dict:
+def _team_week_totals(stats_rows: list[dict]) -> dict[tuple[str, int], dict[str, float]]:
+    """
+    {(team, week): {"targets": n, "carries": n}} summed over every player.
+
+    nflverse's player_stats has NO team-level columns — confirmed against the
+    live 2025 release, 145 columns and neither `team_targets` nor
+    `team_carries` among them. The share calculations below read exactly
+    those names, and `_num()` returns 0.0 for an absent field, so
+    `sum(team_targets)` was 0 for every player and `target_share` /
+    `carry_share` / `target_share_trend` stored as None for all 182 players
+    in the database. Nothing surfaced: a share that cannot be computed and a
+    player who genuinely has no role look identical downstream.
+
+    Derived by summing the player rows rather than pulling load_team_stats,
+    for two reasons. It is exact by construction — a team's targets ARE the
+    sum of its players' targets, so shares total to 1.0 — whereas team_stats
+    reports pass ATTEMPTS, which differ from targets by throwaways, spikes
+    and sacks. And it needs no second source, so a share never silently
+    depends on a feed that might fail independently of the one it divides.
+    """
+    totals: dict[tuple[str, int], dict[str, float]] = defaultdict(
+        lambda: {"targets": 0.0, "carries": 0.0}
+    )
+    for row in stats_rows:
+        team = _first(row, "team", "recent_team", "team_abbr")
+        week = _first(row, "week")
+        if team is None or week is None:
+            continue
+        try:
+            key = (str(team), int(week))
+        except (TypeError, ValueError):
+            continue
+        totals[key]["targets"] += _num(row, "targets")
+        totals[key]["carries"] += _num(row, "carries", "rushing_attempts")
+    return dict(totals)
+
+
+def _team_totals_for(
+    weeks: list[dict],
+    team_totals: dict[tuple[str, int], dict[str, float]],
+    field: str,
+) -> float:
+    """This player's team's total for `field`, over exactly the weeks he
+    played. Summing the whole season instead would divide his partial-season
+    targets by a full-season denominator and understate every injured
+    player's share."""
+    out = 0.0
+    for w in weeks:
+        team = _first(w, "team", "recent_team", "team_abbr")
+        week = _first(w, "week")
+        if team is None or week is None:
+            continue
+        try:
+            out += team_totals.get((str(team), int(week)), {}).get(field, 0.0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _compute_opportunity_efficiency(
+    weeks: list[dict],
+    team_totals: dict[tuple[str, int], dict[str, float]] | None = None,
+) -> dict:
     games = len(weeks)
     if games == 0:
         return {}
+    team_totals = team_totals or {}
 
     targets = [_num(w, "targets") for w in weeks]
     carries = [_num(w, "carries", "rushing_attempts") for w in weeks]
@@ -233,8 +355,8 @@ def _compute_opportunity_efficiency(weeks: list[dict]) -> dict:
     receptions = [_num(w, "receptions") for w in weeks]
     air_yards = [_num(w, "receiving_air_yards", "air_yards") for w in weeks]
     yac = [_num(w, "receiving_yards_after_catch", "yac") for w in weeks]
-    team_targets = [_num(w, "team_targets") for w in weeks]
-    team_carries = [_num(w, "team_carries", "team_rushing_attempts") for w in weeks]
+    sum_team_targets = _team_totals_for(weeks, team_totals, "targets")
+    sum_team_carries = _team_totals_for(weeks, team_totals, "carries")
 
     sum_targets, sum_carries = sum(targets), sum(carries)
     sum_air_yards = sum(air_yards)
@@ -266,8 +388,8 @@ def _compute_opportunity_efficiency(weeks: list[dict]) -> dict:
             else None
         ),
         "catch_rate": (sum(receptions) / sum_targets) if sum_targets else None,
-        "target_share": (sum_targets / sum(team_targets)) if sum(team_targets) else None,
-        "carry_share": (sum_carries / sum(team_carries)) if sum(team_carries) else None,
+        "target_share": (sum_targets / sum_team_targets) if sum_team_targets else None,
+        "carry_share": (sum_carries / sum_team_carries) if sum_team_carries else None,
     }
 
 
@@ -301,6 +423,7 @@ def _compute_forward_looking(
     weeks: list[dict],
     snap_weeks: list[dict],
     depth_chart_weeks: list[dict],
+    team_totals: dict[tuple[str, int], dict[str, float]] | None = None,
 ) -> dict:
     """
     Trend = last TREND_WINDOW_WEEKS minus season average, for target share
@@ -311,6 +434,7 @@ def _compute_forward_looking(
     player_stats — snap % lives in a separate nflverse dataset, it's not a
     column on the weekly stats rows passed in as `weeks`.
     """
+    team_totals = team_totals or {}
     result: dict[str, Optional[float]] = {
         "target_share_trend": None,
         "snap_pct_trend": None,
@@ -321,10 +445,12 @@ def _compute_forward_looking(
     if len(weeks_sorted) >= 2:
         recent = weeks_sorted[-TREND_WINDOW_WEEKS:]
 
+        # Same absent-column problem as target_share above: player_stats has
+        # no team_targets, so this read 0 and the trend was always None.
         season_targets = sum(_num(w, "targets") for w in weeks_sorted)
-        season_team_targets = sum(_num(w, "team_targets") for w in weeks_sorted)
+        season_team_targets = _team_totals_for(weeks_sorted, team_totals, "targets")
         recent_targets = sum(_num(w, "targets") for w in recent)
-        recent_team_targets = sum(_num(w, "team_targets") for w in recent)
+        recent_team_targets = _team_totals_for(recent, team_totals, "targets")
 
         season_share = (season_targets / season_team_targets) if season_team_targets else None
         recent_share = (recent_targets / recent_team_targets) if recent_team_targets else None
@@ -339,10 +465,10 @@ def _compute_forward_looking(
         if season_snaps and recent_snaps:
             result["snap_pct_trend"] = (sum(recent_snaps) / len(recent_snaps)) - (sum(season_snaps) / len(season_snaps))
 
-    dc_sorted = sorted(depth_chart_weeks, key=lambda w: _num(w, "week"))
+    dc_sorted = sorted(depth_chart_weeks, key=_order_key)
     if len(dc_sorted) >= 2:
-        first_rank = _first(dc_sorted[0], "depth_team", "depth_position", "rank")
-        last_rank = _first(dc_sorted[-1], "depth_team", "depth_position", "rank")
+        first_rank = _first(dc_sorted[0], "pos_rank", "depth_team", "depth_position", "rank")
+        last_rank = _first(dc_sorted[-1], "pos_rank", "depth_team", "depth_position", "rank")
         try:
             if first_rank is not None and last_rank is not None:
                 result["depth_chart_trend"] = int(last_rank) - int(first_rank)
@@ -410,18 +536,41 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
     depth_by_player: dict[str, list[dict]] = {}
     redzone_by_player: dict[str, float] = {}
     team_pass_rate: dict[str, float] = {}
+    team_totals: dict[tuple[str, int], dict[str, float]] = {}
 
     try:
         stats_rows = _load_dicts("load_player_stats", seasons=season, summary_level="week")
         stats_rows = _filter_regular_season(stats_rows)
         stats_by_player = _group_by_player(stats_rows, ("player_id", "gsis_id"))
-        logger.info(f"player_stats: {len(stats_rows):,} regular-season rows, {len(stats_by_player):,} players")
+        # Team-level denominators for target_share / carry_share, summed from
+        # the same rows — player_stats ships no team columns. See
+        # _team_week_totals for why this is derived rather than pulled.
+        team_totals = _team_week_totals(stats_rows)
+        logger.info(
+            f"player_stats: {len(stats_rows):,} regular-season rows, "
+            f"{len(stats_by_player):,} players, {len(team_totals):,} team-weeks"
+        )
     except Exception as e:
         logger.warning(f"Could not load player_stats — opportunity/efficiency/consistency metrics will be skipped: {e}")
 
     try:
         snap_rows = _load_dicts("load_snap_counts", seasons=season)
         snap_rows = _filter_regular_season(snap_rows)
+        # snap_counts carries only pfr_player_id. Stamp a gsis_id onto each
+        # row first so it groups under the same key everything else uses —
+        # see _load_pfr_crosswalk for why this was silently dropping all of it.
+        if snap_rows and _first(snap_rows[0], "gsis_id") is None:
+            pfr_map = _load_pfr_crosswalk()
+            matched = 0
+            for row in snap_rows:
+                gsis = pfr_map.get(str(_first(row, "pfr_player_id") or ""))
+                if gsis:
+                    row["gsis_id"] = gsis
+                    matched += 1
+            logger.info(
+                f"snap_counts: mapped {matched:,}/{len(snap_rows):,} rows "
+                f"from pfr_player_id to gsis_id"
+            )
         snaps_by_player = _group_by_player(snap_rows, ("gsis_id", "player_id", "pfr_player_id"))
     except Exception as e:
         logger.warning(f"Could not load snap_counts — snap_pct will be unavailable: {e}")
@@ -488,9 +637,9 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                 "through_week": through_week,
                 "games_played": len(weeks),
             }
-            fields.update(_compute_opportunity_efficiency(weeks))
+            fields.update(_compute_opportunity_efficiency(weeks, team_totals))
             fields.update(_compute_consistency_risk(weeks, injuries_by_player.get(gsis_id, [])))
-            fields.update(_compute_forward_looking(weeks, snap_weeks, depth_weeks))
+            fields.update(_compute_forward_looking(weeks, snap_weeks, depth_weeks, team_totals))
 
             if snap_weeks:
                 pcts = [_num(w, "offense_pct", "snap_pct") for w in snap_weeks]
@@ -503,10 +652,15 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                 fields["team_pass_rate"] = team_pass_rate[player.team]
 
             if depth_weeks:
-                # Sort by week rather than trusting input order — nflverse
-                # doesn't guarantee row order within a player's group.
-                latest = max(depth_weeks, key=lambda w: _num(w, "week"))
-                latest_rank = _first(latest, "depth_team", "depth_position", "rank")
+                # Sort by timestamp rather than trusting input order —
+                # nflverse doesn't guarantee row order within a player's
+                # group. Candidate list must match the one in
+                # _compute_forward_looking: `pos_rank` first, since that is
+                # what current nflverse depth charts actually use. Missing it
+                # here while the trend had it is why depth_chart_rank stayed
+                # NULL for all 182 players on the first corrected run.
+                latest = max(depth_weeks, key=_order_key)
+                latest_rank = _first(latest, "pos_rank", "depth_team", "depth_position", "rank")
                 try:
                     fields["depth_chart_rank"] = int(latest_rank) if latest_rank is not None else None
                 except (TypeError, ValueError):
