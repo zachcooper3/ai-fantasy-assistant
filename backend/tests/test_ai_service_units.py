@@ -2083,3 +2083,56 @@ def test_board_says_why_a_late_player_is_listed():
     ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR")   # no TE
     prompt = _build_prompt(ctx)
     assert "best available player at every position you still need to start" in prompt
+
+
+def test_a_failed_lookup_is_not_cached_as_absence(monkeypatch):
+    # The cache lives for the process. Writing "no news" after a failed
+    # fetch would mean one transient Chroma error at the first pick silently
+    # disables news and injury retrieval for the whole draft — and RULE 0
+    # reads IR status out of that retrieval, so a player on injured reserve
+    # would look exactly like a healthy one for fifteen rounds.
+    from backend.app.services import ai_service as S
+    S._retrieval_cache.clear()
+    calls = {"n": 0}
+
+    def flaky(where):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("chroma is briefly unavailable")
+        return [({"sleeper_id": "1"}, "real news")]
+
+    import types, sys
+    fake = types.ModuleType("backend.rag.vector_store")
+    fake.fetch_by_metadata = flaky
+    monkeypatch.setitem(sys.modules, "backend.rag.vector_store", fake)
+
+    board = [{"id": 1, "name": "P1", "position": "WR", "sleeper_id": "1"}]
+    first = S._retrieve_player_context(board)
+    assert "No retrieved data" in first          # degrades, does not raise
+    assert "1" not in S._retrieval_cache, "a failure must not be remembered"
+
+    second = S._retrieve_player_context(board)   # must try again
+    assert calls["n"] == 2
+    assert "real news" in second
+
+
+def test_a_genuine_empty_result_is_still_cached(monkeypatch):
+    # The optimisation this guard protects: a player who really has no
+    # chunks should not be re-fetched on every pick.
+    from backend.app.services import ai_service as S
+    S._retrieval_cache.clear()
+    calls = {"n": 0}
+
+    def empty(where):
+        calls["n"] += 1
+        return []
+
+    import types, sys
+    fake = types.ModuleType("backend.rag.vector_store")
+    fake.fetch_by_metadata = empty
+    monkeypatch.setitem(sys.modules, "backend.rag.vector_store", fake)
+
+    board = [{"id": 1, "name": "P1", "position": "WR", "sleeper_id": "1"}]
+    S._retrieve_player_context(board)
+    S._retrieve_player_context(board)
+    assert calls["n"] == 1, "an empty result is a fact worth remembering"

@@ -1375,18 +1375,30 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
             ]})
         except Exception as e:
             logger.warning(f"Vector fetch failed — prompt built without retrieved context: {e}")
-            rows = []
+            # None, not [] — "the lookup failed" and "this player has no
+            # chunks" must not be confused, because only one of them is
+            # safe to remember. See the caching guard below.
+            rows = None
 
-        grouped: dict[str, list[str]] = {}
-        for meta, doc in rows:
-            sid = str((meta or {}).get("sleeper_id") or "")
-            if sid and doc:
-                grouped.setdefault(sid, []).append(doc)
-        # Cache every player asked for, including the ones with nothing —
-        # a negative result is worth remembering too, and without this an
-        # empty player is re-fetched on every single pick.
-        for sid in wanted:
-            _retrieval_cache[sid] = grouped.get(sid, [])[:_MAX_CHUNKS_PER_PLAYER]
+        if rows is not None:
+            grouped: dict[str, list[str]] = {}
+            for meta, doc in rows:
+                sid = str((meta or {}).get("sleeper_id") or "")
+                if sid and doc:
+                    grouped.setdefault(sid, []).append(doc)
+            # Cache every player asked for, including the ones with nothing:
+            # a genuine negative is worth remembering, and without it an
+            # empty player is re-fetched on every pick for the whole draft.
+            #
+            # But ONLY on a successful lookup. Caching after a failure would
+            # write "no news" for all 25 candidates and, since the cache
+            # lives for the process, never retry — one transient Chroma
+            # error at the first pick would silently disable news and injury
+            # retrieval for an entire draft. RULE 0 reads IR status out of
+            # that retrieval, so the cost of the shortcut is a player on
+            # injured reserve looking exactly like a healthy one.
+            for sid in wanted:
+                _retrieval_cache[sid] = grouped.get(sid, [])[:_MAX_CHUNKS_PER_PLAYER]
 
     outcomes = [(p, _retrieval_cache.get(str(p["sleeper_id"]), [])) for p in candidates]
 
