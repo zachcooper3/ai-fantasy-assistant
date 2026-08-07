@@ -251,6 +251,15 @@ class RecommendationContext:
 _STANDARD_STARTING_LINEUP = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1}
 _FLEX_ELIGIBLE_POSITIONS = {"RB", "WR", "TE"}
 
+# How many players to show at a position you still have to start. Two — the
+# cheapest and the single best — turned out to be too thin: at a mandatory
+# TE slot with six tight ends in the entire pool, it surfaced the cheapest
+# (VOR -2.94) and the best (-0.06) while hiding the second-best (-0.68)
+# entirely. You cannot choose from a slate you were never shown, and at a
+# slot that must be filled the whole realistic choice set is a handful of
+# players costing a handful of lines.
+_NEEDED_POSITION_DEPTH = 5
+
 
 def _gaps_from_counts(
     have: dict[str, int],
@@ -955,6 +964,7 @@ def _shortlist(
     pick_number: int,
     player_metrics: dict[int, dict],
     replacement: dict[str, float],
+    gaps: dict[str, int] | None = None,
 ) -> list[dict]:
     """
     The players the model is not allowed to ignore: best ADP, highest VOR,
@@ -994,11 +1004,28 @@ def _shortlist(
 
     # Best available at each position, so the shortlist can never collapse
     # onto one position and hide the choice that matters most.
+    #
+    # At a position still missing from the starting lineup, BOTH the
+    # cheapest and the most productive are forced in — mirroring
+    # _board_for_prompt, which had already put both on the board. Without
+    # this the two disagreed: the better tight end was visible but carried
+    # no required verdict, and the model recommended the cheaper one while
+    # asserting he was "the only TE on the board". A player who must be
+    # accounted for cannot be waved away as absent.
+    needed = set(gaps or {})
     per_position: list[dict] = []
     for pos in ("QB", "RB", "WR", "TE"):
         at_pos = [p for p in board if p["position"] == pos]
-        if at_pos:
-            per_position.append(min(at_pos, key=lambda p: p["adp"]))
+        if not at_pos:
+            continue
+        per_position.append(min(at_pos, key=lambda p: p["adp"]))
+        if pos in needed:
+            scored_pos = [
+                (v, p) for p in at_pos
+                if (v := _vor(p, player_metrics, replacement)) is not None
+            ]
+            if scored_pos:
+                per_position.append(max(scored_pos, key=lambda t: t[0])[1])
 
     # Priority order is load-bearing, because the cap truncates. Position
     # representatives go first: quarterbacks and tight ends have late ADP by
@@ -1052,6 +1079,23 @@ def _format_shortlist_section(
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def survivor_adp_floor(horizon_pick: int) -> float:
+    """
+    The lowest ADP that can still avoid reading as GONE at `horizon_pick`.
+
+    Inverts _survival's noise band. That band is max(floor, adp * ratio),
+    so the boundary is horizon - floor for cheap players and
+    horizon / (1 + ratio) for expensive ones; the smaller of the two is
+    taken so the answer is never above the true first survivor — a caller
+    fetching from here may pull a player or two more than it needs, which
+    is harmless, where pulling one too few would silently hide him.
+    """
+    return min(
+        horizon_pick - _ADP_NOISE_FLOOR,
+        horizon_pick / (1.0 + _ADP_NOISE_RATIO),
+    )
 
 
 def _survival(adp: float, horizon_pick: int | None) -> str | None:
@@ -1912,12 +1956,15 @@ def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[
         if not at_pos:
             continue
 
-        # Cheapest — what the market says you can get away with waiting for.
-        _add(next((p for p in at_pos if p["id"] not in present), None))
+        # The cheapest few, in ADP order — the realistic slate, not just the
+        # single cheapest.
+        for p in at_pos[:_NEEDED_POSITION_DEPTH]:
+            _add(p)
 
-        # Most productive — what last season says is actually best. Skipped
-        # when nobody at the position has a VOR, rather than falling back to
-        # ADP and silently adding the same player twice.
+        # And the most productive, which is regularly outside that window:
+        # the best tight end available sat sixth by ADP. Skipped when nobody
+        # at the position has a VOR rather than falling back to ADP and
+        # re-adding someone already listed.
         scored = [
             (v, p) for p in at_pos
             if (v := _vor(p, ctx.player_metrics, ctx.replacement_ppg)) is not None
@@ -2076,7 +2123,9 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # Everything below shows THIS list, not a raw ADP slice — see
     # _board_for_prompt for why the two differ late in a draft.
     board = _board_for_prompt(ctx, skill_gaps)
-    shortlist = _shortlist(board, advised_pick, ctx.player_metrics, ctx.replacement_ppg)
+    shortlist = _shortlist(
+        board, advised_pick, ctx.player_metrics, ctx.replacement_ppg, skill_gaps
+    )
 
     for section in (
         _format_roster_changes(board, ctx.roster_changes),

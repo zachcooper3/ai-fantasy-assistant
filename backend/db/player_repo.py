@@ -7,7 +7,7 @@ Author: Zach Cooper
 import re
 
 from sqlmodel import Session, select
-from backend.db.models import Player
+from backend.db.models import Player, PlayerMetrics
 
 
 # --- Name normalization — same idea as sync_sleeper_ids.py's normalizer,
@@ -67,6 +67,67 @@ def get_top_available(
     if position:
         query = query.where(Player.position == position.upper())
     return session.exec(query.order_by(Player.adp).limit(n)).all()
+
+
+def get_available_from_adp(
+    session: Session,
+    min_adp: float,
+    n: int = 3,
+    position: str | None = None,
+) -> list[Player]:
+    """
+    The N cheapest available players whose ADP is at or past `min_adp`.
+
+    Exists for the cost-of-waiting math, which needs the best player at a
+    position who will PLAUSIBLY STILL BE THERE at your next turn. That
+    player is by definition past the current run of the board, so a slate
+    built from the cheapest few at the position never contains him — and
+    without him the prompt reports "every RB will be gone", which is both
+    false and unactionable.
+    """
+    query = select(Player).where(Player.is_available == True, Player.adp >= min_adp)
+    if position:
+        query = query.where(Player.position == position.upper())
+    return session.exec(query.order_by(Player.adp).limit(n)).all()
+
+
+def get_best_available_by_ppg(
+    session: Session,
+    n: int = 3,
+    position: str | None = None,
+) -> list[Player]:
+    """
+    The N available players at a position with the highest prior-season PPR
+    points per game.
+
+    ADP orders a board by what other people believe; this orders it by what
+    actually happened. They disagree constantly, and the disagreement is
+    the entire edge — within a position, ranking by points per game is
+    ranking by value over replacement, since replacement level is a
+    constant per position.
+
+    Needed because the cheapest few at a position do not contain the best
+    one often enough to rely on. Verified on a live board: the highest-VOR
+    running back available was the TENTH cheapest at his position, so no
+    slate built from ADP alone would ever have shown him.
+
+    Players with no PlayerMetrics row are excluded — not a judgement, just
+    the join. They reach the pool through the ADP queries instead, which is
+    the only signal that exists for them.
+    """
+    query = (
+        select(Player)
+        .join(PlayerMetrics, PlayerMetrics.player_id == Player.id)  # type: ignore[arg-type]
+        .where(
+            Player.is_available == True,
+            PlayerMetrics.fantasy_points_avg.is_not(None),  # type: ignore[union-attr]
+        )
+    )
+    if position:
+        query = query.where(Player.position == position.upper())
+    return session.exec(
+        query.order_by(PlayerMetrics.fantasy_points_avg.desc()).limit(n)  # type: ignore[union-attr]
+    ).all()
 
 
 def get_player_by_id(session: Session, player_id: int) -> Player | None:

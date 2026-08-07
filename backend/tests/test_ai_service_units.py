@@ -2136,3 +2136,280 @@ def test_a_genuine_empty_result_is_still_cached(monkeypatch):
     S._retrieve_player_context(board)
     S._retrieve_player_context(board)
     assert calls["n"] == 1, "an empty result is a fact worth remembering"
+
+
+def test_a_needed_position_forces_verdicts_on_both_the_cheap_and_the_good():
+    # _board_for_prompt already put both on the board, but the shortlist's
+    # per-position axis took only the cheapest — so the better tight end was
+    # visible while carrying no required verdict. Live consequence: the model
+    # recommended the cheaper one (VOR -2.94, 11% target share, his team had
+    # just ADDED 21% of a team's targets) and justified it by asserting he
+    # was "the only TE on the board", while naming the other TE two sentences
+    # later. A player who must be accounted for cannot be waved away.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 21)]
+    board += [{"id": 50, "rank": 50, "name": "Cheap TE", "position": "TE",
+               "team": "PIT", "adp": 152.0, "sleeper_id": None},
+              {"id": 51, "rank": 51, "name": "Good TE", "position": "TE",
+               "team": "HOU", "adp": 158.1, "sleeper_id": None}]
+    metrics = {50: {"fantasy_points_avg": 7.6}, 51: {"fantasy_points_avg": 10.5}}
+    repl = {"TE": 10.5, "WR": 11.5}
+
+    names = {p["name"] for p in _shortlist(board, 128, metrics, repl, {"TE": 1})}
+    assert "Cheap TE" in names and "Good TE" in names
+
+
+def test_a_filled_position_only_contributes_its_best_by_adp():
+    # The second entry is reserved for positions you must still fill; adding
+    # it everywhere would crowd the cap and dilute the requirement.
+    #
+    # The receivers carry strong metrics on purpose, so they win the GLOBAL
+    # best-VOR slots. Otherwise "Good TE" enters through that axis instead of
+    # the per-position one and the test proves nothing about either.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 21)]
+    board += [{"id": 50, "rank": 50, "name": "Cheap TE", "position": "TE",
+               "team": "PIT", "adp": 152.0, "sleeper_id": None},
+              {"id": 51, "rank": 51, "name": "Good TE", "position": "TE",
+               "team": "HOU", "adp": 158.1, "sleeper_id": None}]
+    metrics = {i: {"fantasy_points_avg": 25.0} for i in range(1, 21)}
+    metrics.update({50: {"fantasy_points_avg": 7.6}, 51: {"fantasy_points_avg": 10.5}})
+    repl = {"TE": 10.5, "WR": 11.5}
+
+    # TE not needed -> only the cheapest TE is forced in.
+    filled = {p["name"] for p in _shortlist(board, 128, metrics, repl, {})}
+    assert "Cheap TE" in filled and "Good TE" not in filled
+    # TE needed -> both, which is the whole point of the change.
+    needed = {p["name"] for p in _shortlist(board, 128, metrics, repl, {"TE": 1})}
+    assert "Cheap TE" in needed and "Good TE" in needed
+
+
+def test_shortlist_and_board_agree_on_which_players_exist():
+    # The two functions disagreeing is what let the model call a player
+    # absent while he was on the board. Every shortlisted player must come
+    # from the board it was built from.
+    board = [{"id": i, "rank": i, "name": f"P{i}",
+              "position": ["QB", "RB", "WR", "TE"][i % 4], "team": "X",
+              "adp": float(i), "sleeper_id": None} for i in range(1, 30)]
+    metrics = {i: {"fantasy_points_avg": 30.0 - i} for i in range(1, 30)}
+    repl = {"QB": 17.5, "RB": 11.1, "WR": 11.9, "TE": 10.6}
+    ids = {p["id"] for p in board}
+    assert all(p["id"] in ids for p in _shortlist(board, 20, metrics, repl, {"TE": 1}))
+
+
+def test_a_needed_position_shows_a_realistic_slate_not_two_names():
+    # Two entries — cheapest and best — proved too thin at a mandatory slot:
+    # it surfaced the cheapest TE (VOR -2.94) and the best (-0.06) while
+    # hiding the second-best (-0.68) entirely. You cannot choose from a
+    # slate you were never shown.
+    from backend.app.services.ai_service import _board_for_prompt, _NEEDED_POSITION_DEPTH
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 26)]
+    tes = [{"id": 50 + i, "rank": 50 + i, "name": f"TE{i}", "position": "TE",
+            "team": "X", "adp": 150.0 + i * 3, "sleeper_id": None} for i in range(6)]
+    ctx = ctx_with_available(1)
+    ctx.top_available = board + tes
+    ctx.player_metrics = {}
+    ctx.replacement_ppg = {}
+    shown = [p["name"] for p in _board_for_prompt(ctx, {"TE": 1}) if p["position"] == "TE"]
+    assert len(shown) == _NEEDED_POSITION_DEPTH
+
+
+def test_the_best_at_a_needed_position_appears_even_when_outside_that_window():
+    # The best available is regularly past the cheapest few — the best tight
+    # end on the live board sat sixth by ADP.
+    from backend.app.services.ai_service import _board_for_prompt
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 26)]
+    tes = [{"id": 50 + i, "rank": 50 + i, "name": f"TE{i}", "position": "TE",
+            "team": "X", "adp": 150.0 + i * 3, "sleeper_id": None} for i in range(8)]
+    ctx = ctx_with_available(1)
+    ctx.top_available = board + tes
+    # TE7 is the last by ADP and the best by production.
+    ctx.player_metrics = {57: {"fantasy_points_avg": 14.0}}
+    ctx.replacement_ppg = {"TE": 10.5}
+    shown = {p["name"] for p in _board_for_prompt(ctx, {"TE": 1}) if p["position"] == "TE"}
+    assert "TE7" in shown
+
+
+# ---------------------------------------------------------------------------
+# _load_board — the player pool the prompt is built from
+#
+# The failure this replaced a flat ADP window over: at a mandatory TE slot,
+# a 60-player window ending at ADP 160.5 excluded the second-best available
+# tight end at 163.3. A window that excludes the player you need is
+# indistinguishable, from inside the prompt, from that player not existing,
+# and widening it only moves the pick at which the same thing happens again.
+# ---------------------------------------------------------------------------
+
+class _FakePlayer:
+    def __init__(self, pid, name, position, adp, ppg=None):
+        self.id = pid
+        self.rank = pid
+        self.name = name
+        self.position = position
+        self.team = "X"
+        self.adp = adp
+        self.ppg = ppg
+        self.sleeper_id = None
+
+
+def _fake_pool(monkeypatch, players):
+    """Stands in for the three player_repo queries over a fixed pool."""
+    from backend.app.api import recommendations
+
+    def _at(position):
+        return [p for p in players if position is None or p.position == position]
+
+    def _top(db, n=10, position=None):
+        return sorted(_at(position), key=lambda p: p.adp)[:n]
+
+    def _from_adp(db, min_adp, n=3, position=None):
+        rows = [p for p in _at(position) if p.adp >= min_adp]
+        return sorted(rows, key=lambda p: p.adp)[:n]
+
+    def _by_ppg(db, n=3, position=None):
+        rows = [p for p in _at(position) if p.ppg is not None]
+        return sorted(rows, key=lambda p: -p.ppg)[:n]
+
+    monkeypatch.setattr(recommendations.repo, "get_top_available", _top)
+    monkeypatch.setattr(recommendations.repo, "get_available_from_adp", _from_adp)
+    monkeypatch.setattr(recommendations.repo, "get_best_available_by_ppg", _by_ppg)
+
+
+def _deep_pool():
+    # 40 receivers own the whole cheap end of the board; the tight ends sit
+    # behind all of them, which is what a real board looks like by round 10.
+    wrs = [_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 41)]
+    tes = [_FakePlayer(100 + i, f"TE{i}", "TE", 150.0 + i * 3) for i in range(6)]
+    rbs = [_FakePlayer(200 + i, f"RB{i}", "RB", 140.0 + i * 4) for i in range(6)]
+    qbs = [_FakePlayer(300 + i, f"QB{i}", "QB", 145.0 + i * 5) for i in range(6)]
+    return wrs + tes + rbs + qbs
+
+
+def test_every_position_is_covered_however_deep_it_sits(monkeypatch):
+    from backend.app.api.recommendations import _load_board, _CONTEXT_POSITIONS
+    _fake_pool(monkeypatch, _deep_pool())
+    board = _load_board(None, top_n=30, per_position=6)
+    for pos in _CONTEXT_POSITIONS:
+        # >= rather than ==: the overall window contributes at whatever
+        # positions sit cheap, on top of the guaranteed slate.
+        assert len([p for p in board if p["position"] == pos]) >= 6, pos
+
+
+def test_coverage_does_not_depend_on_the_overall_window(monkeypatch):
+    # The point of querying by position: even a window too small to reach
+    # past the receivers still returns a full slate at every position.
+    from backend.app.api.recommendations import _load_board
+    _fake_pool(monkeypatch, _deep_pool())
+    board = _load_board(None, top_n=5, per_position=6)
+    assert len([p for p in board if p["position"] == "TE"]) == 6
+    assert {p["name"] for p in board if p["position"] == "TE"} == {
+        f"TE{i}" for i in range(6)
+    }
+
+
+def test_the_cheapest_players_overall_are_still_there(monkeypatch):
+    # Positional slates are the requirement; the overall window is what the
+    # requirement gets weighed against. Losing it would leave the prompt
+    # unable to see that a receiver 60 picks cheaper exists.
+    from backend.app.api.recommendations import _load_board
+    _fake_pool(monkeypatch, _deep_pool())
+    board = _load_board(None, top_n=30, per_position=6)
+    names = {p["name"] for p in board}
+    assert {f"WR{i}" for i in range(1, 31)} <= names
+
+
+def test_board_is_sorted_by_adp(monkeypatch):
+    # _board_for_prompt slices [:_LISTED_PLAYERS] and the dominance guard
+    # slices top_available the same way; both mean "the cheapest N".
+    from backend.app.api.recommendations import _load_board
+    _fake_pool(monkeypatch, _deep_pool())
+    board = _load_board(None, top_n=30, per_position=6)
+    adps = [p["adp"] for p in board]
+    assert adps == sorted(adps)
+
+
+def test_a_player_in_both_queries_appears_once(monkeypatch):
+    # The cheap receivers come back from both the WR slate and the overall
+    # window; a duplicate would be billed twice and listed twice.
+    from backend.app.api.recommendations import _load_board
+    _fake_pool(monkeypatch, _deep_pool())
+    board = _load_board(None, top_n=30, per_position=6)
+    ids = [p["id"] for p in board]
+    assert len(ids) == len(set(ids))
+
+
+def test_late_round_positions_get_no_slate(monkeypatch):
+    # DST and K are deferred to the final rounds by rule, so a guaranteed
+    # slate of them is context nobody reads and tokens nobody needs.
+    from backend.app.api.recommendations import _CONTEXT_POSITIONS
+    assert "DST" not in _CONTEXT_POSITIONS and "K" not in _CONTEXT_POSITIONS
+
+
+def test_the_union_is_smaller_than_the_window_it_replaced(monkeypatch):
+    # Cost matters: every row here is billed through two bulk lookups and
+    # some of them through the prompt itself.
+    from backend.app.api.recommendations import _load_board
+    _fake_pool(monkeypatch, _deep_pool())
+    assert len(_load_board(None, top_n=30, per_position=6)) < 100
+
+
+def test_the_survivor_at_a_position_is_loaded_however_far_out_he_sits(monkeypatch):
+    # Cost of waiting compares the best player now against the best one
+    # likely to still be there next turn. That second player is past the
+    # run of the board by definition, so a slate of the cheapest few never
+    # holds him — and without him the prompt says "every RB will be gone",
+    # which is false and tells you nothing about whether to wait.
+    from backend.app.api.recommendations import _load_board
+    from backend.app.services.ai_service import _format_positional_dropoff
+    pool = ([_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 41)]
+            + [_FakePlayer(200 + i, f"RB{i}", "RB", 95.0 + i * 2) for i in range(20)])
+    _fake_pool(monkeypatch, pool)
+    horizon = 130
+    board = _load_board(None, top_n=30, per_position=6, horizon_pick=horizon)
+    text = _format_positional_dropoff(board, horizon)
+    assert "projects to be gone" not in text
+    assert "Cost of waiting" in text
+
+
+def test_without_a_horizon_no_survivors_are_fetched(monkeypatch):
+    # The last pick of a draft has no next turn. Asking "who survives to
+    # never" would just bill for rows nothing reads.
+    from backend.app.api.recommendations import _load_board
+    pool = [_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 41)]
+    _fake_pool(monkeypatch, pool)
+    board = _load_board(None, top_n=10, per_position=6, horizon_pick=None)
+    assert max(p["adp"] for p in board) <= 100.0
+
+
+def test_the_best_scorer_at_a_position_is_loaded_however_expensive_his_adp(monkeypatch):
+    # The live miss this exists for: the highest-VOR back available was the
+    # tenth cheapest at his position. Ranking by points per game within a
+    # position IS ranking by VOR — replacement level is a constant there.
+    from backend.app.api.recommendations import _load_board
+    rbs = [_FakePlayer(200 + i, f"RB{i}", "RB", 110.0 + i * 5, ppg=8.0 - i * 0.1)
+           for i in range(12)]
+    rbs[9].ppg = 14.0                      # tenth cheapest, best by a mile
+    _fake_pool(monkeypatch, rbs)
+    board = _load_board(None, top_n=5, per_position=6, horizon_pick=None)
+    assert rbs[9].name in {p["name"] for p in board}
+
+
+def test_production_axis_survives_a_position_with_no_metrics(monkeypatch):
+    # Rookies and anyone the metrics job hasn't reached have no ppg at all.
+    # That's a join returning nothing, not a failure.
+    from backend.app.api.recommendations import _load_board
+    pool = [_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 10)]
+    _fake_pool(monkeypatch, pool)
+    assert len(_load_board(None, top_n=30, per_position=6, horizon_pick=50)) == 9
+
+
+def test_an_empty_position_is_simply_absent(monkeypatch):
+    # Late in a draft a position can be picked clean. That is a smaller
+    # board, not an error.
+    from backend.app.api.recommendations import _load_board
+    pool = [_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 6)]
+    _fake_pool(monkeypatch, pool)
+    board = _load_board(None, top_n=30, per_position=6)
+    assert {p["position"] for p in board} == {"WR"}

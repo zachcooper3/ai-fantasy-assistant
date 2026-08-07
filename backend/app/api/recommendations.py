@@ -29,6 +29,7 @@ from backend.app.services.ai_service import (
     RecommendationContext,
     compute_position_scarcity,
     compute_replacement_levels,
+    survivor_adp_floor,
     _ROSTER_CHANGE_MIN_SHARE,
     _ROSTER_CHANGE_POSITIONS,
 )
@@ -254,26 +255,60 @@ def _compute_roster_changes(db: Session) -> dict[str, dict[str, list[dict]]]:
     return changes
 
 
-def _build_context(
-    svc: DraftStateService,
+# Positions worth loading a guaranteed slate for. DST and K are excluded:
+# both are deferred to the final rounds by the recommendation rules, and
+# neither has usage data that a depth chart of options would inform.
+_CONTEXT_POSITIONS = ("QB", "RB", "WR", "TE")
+
+# How many players past the waiting horizon to pull at each position. One
+# would answer "who survives"; three also shows what the tier behind him
+# looks like, which is the difference between "wait, it's fine" and "wait,
+# and this is what you'll be choosing from".
+_HORIZON_DEPTH = 3
+
+# How many of the highest-scoring available players to pull at each
+# position, regardless of where their ADP sits.
+_PRODUCTION_DEPTH = 3
+
+
+def _load_board(
     db: Session,
-    top_n: int = 60,
-) -> RecommendationContext:
+    top_n: int,
+    per_position: int,
+    horizon_pick: int | None = None,
+) -> list[dict]:
     """
-    Builds the full RecommendationContext from live draft state and DB.
+    The player pool the prompt is built from, as a UNION of three queries:
 
-    top_n is deliberately deeper than the board the prompt actually displays
-    (ai_service._LISTED_PLAYERS, 25). The extra players are never rendered;
-    they exist so the "cost of waiting" math can find replacement level at
-    each position. On a 25-player global ADP slice, the next available TE or
-    QB is frequently past the cut — which is exactly the situation where
-    waiting is most expensive and the model could least see it. The cost is
-    two bulk keyed lookups over 60 ids instead of 25.
+      1. the cheapest `per_position` available at each position — the slate
+         you would actually be choosing from if you filled that slot now;
+      2. the cheapest `_HORIZON_DEPTH` at each position who can still be
+         there at `horizon_pick` — what filling it later would cost you;
+      3. the `_PRODUCTION_DEPTH` best at each position by prior-season PPR
+         points per game, wherever their ADP sits;
+      4. the cheapest `top_n` overall — the alternatives to weigh all of
+         the above against.
+
+    Query 2 is not optional padding. Cost-of-waiting compares the best
+    player at a position against the best one likely to survive to your
+    next turn, and that survivor is by construction past the current run of
+    the board. Verified against a live board: without it, at a horizon 26
+    picks out, every one of the six cheapest backs and receivers read as
+    GONE and the prompt reported "every RB currently on this board projects
+    to be gone" — a false statement that also removes the only number the
+    model has for whether waiting is affordable.
+
+    Query 3 is what keeps this from being an ADP window in disguise. On a
+    live board the best available back by VOR sat tenth-cheapest at his
+    position; a slate of the six cheapest could not reach him, and the old
+    flat window only did by the accident of being 100 rows deep. Ordering
+    by points per game inside a position is ordering by VOR, because
+    replacement level is a per-position constant.
+
+    Sorted by ADP on the way out, which every consumer assumes.
     """
-
-    # Top available players as plain dicts
-    top_available = [
-        {
+    def _row(p) -> dict:
+        return {
             "id": p.id,
             "rank": p.rank,
             "name": p.name,
@@ -282,8 +317,100 @@ def _build_context(
             "adp": p.adp,
             "sleeper_id": p.sleeper_id,
         }
-        for p in repo.get_top_available(db, n=top_n)
-    ]
+
+    by_id: dict[int, dict] = {}
+    # Positional slates first — these are the ones that must be present.
+    for position in _CONTEXT_POSITIONS:
+        for p in repo.get_top_available(db, n=per_position, position=position):
+            by_id[p.id] = _row(p)
+    # Then, past the horizon: who is still there if you wait, per position.
+    if horizon_pick is not None:
+        min_adp = survivor_adp_floor(horizon_pick)
+        for position in _CONTEXT_POSITIONS:
+            for p in repo.get_available_from_adp(
+                db, min_adp=min_adp, n=_HORIZON_DEPTH, position=position
+            ):
+                by_id[p.id] = _row(p)
+    # And the best at each position by what they actually scored — the
+    # players ADP disagrees with, which is where the edge is.
+    for position in _CONTEXT_POSITIONS:
+        for p in repo.get_best_available_by_ppg(
+            db, n=_PRODUCTION_DEPTH, position=position
+        ):
+            by_id[p.id] = _row(p)
+    # Then the cheapest overall, as the alternatives to weigh them against.
+    for p in repo.get_top_available(db, n=top_n):
+        by_id[p.id] = _row(p)
+
+    return sorted(by_id.values(), key=lambda p: p["adp"])
+
+
+def _build_context(
+    svc: DraftStateService,
+    db: Session,
+    top_n: int = 30,
+    per_position: int = 6,
+) -> RecommendationContext:
+    """
+    Builds the full RecommendationContext from live draft state and DB.
+
+    The player pool is loaded by _load_board as a union of positional
+    queries rather than one deep ADP slice — see there for what each query
+    is for.
+
+    Position first, because that is the requirement. A flat ADP window only
+    covers a position by luck, and late in a draft the luck runs out — at a
+    mandatory TE slot, a 60-player window ending at ADP 160.5 excluded the
+    second-best available tight end at 163.3, and a window that excludes
+    the player you need is indistinguishable, from inside the prompt, from
+    that player not existing. Widening the window to 100 fixed that
+    instance while leaving the same failure available at any position, in
+    any draft, whenever the board runs deep enough.
+
+    Cheaper, too: 43 rows against a flat 100 on the two boards this was
+    checked against, and the bulk metric and draft-profile lookups are
+    keyed off exactly that list. The prompt itself is unchanged in size —
+    it displays the cheapest _LISTED_PLAYERS either way — so this buys
+    correctness by construction rather than tokens. Verified by rebuilding
+    the whole prompt both ways at a full board and mid-draft: byte for byte
+    identical, and strictly better at long horizons, where the flat window
+    was too shallow to find anyone who survives to the next turn.
+    """
+
+    # Look-ahead: the turn AFTER the one being advised on, plus every team
+    # that picks in between. This is the opportunity-cost horizon the
+    # recommendation prompt reasons against — see
+    # RecommendationContext.my_following_pick_number for why it can't just
+    # be my_next_pick_number (that property returns the *current* pick when
+    # it's already my turn).
+    #
+    # Computed here rather than in ai_service so the snake math stays in
+    # DraftStateService alone; any future variant (third-round reversal and
+    # friends) changes slot_for_pick and this follows automatically.
+    total_picks = svc.config.league_size * svc.config.total_rounds
+    advised_pick = svc.my_next_pick_number
+    my_following_pick_number = None
+    upcoming_pick_slots: list[int] = []
+    if advised_pick is not None:
+        for p in range(advised_pick + 1, total_picks + 1):
+            if svc.slot_for_pick(p) == svc.config.my_draft_position:
+                my_following_pick_number = p
+                break
+            upcoming_pick_slots.append(svc.slot_for_pick(p))
+        if my_following_pick_number is None:
+            # Advising on my final pick of the draft — nothing to defer to,
+            # so drop the partial list rather than implying a next turn.
+            upcoming_pick_slots = []
+
+    # Computed before the board is loaded because the board depends on it:
+    # _load_board pulls a few players past this pick at each position so
+    # the cost of waiting has something to be measured against.
+    top_available = _load_board(
+        db,
+        top_n=top_n,
+        per_position=per_position,
+        horizon_pick=my_following_pick_number,
+    )
 
     # Analytics for the same players, keyed by Player.id — see
     # ai_service.py's RecommendationContext.player_metrics docstring and
@@ -362,31 +489,6 @@ def _build_context(
             "TE": cfg.te_slots,
         },
     )
-
-    # Look-ahead: the turn AFTER the one being advised on, plus every team
-    # that picks in between. This is the opportunity-cost horizon the
-    # recommendation prompt reasons against — see
-    # RecommendationContext.my_following_pick_number for why it can't just
-    # be my_next_pick_number (that property returns the *current* pick when
-    # it's already my turn).
-    #
-    # Computed here rather than in ai_service so the snake math stays in
-    # DraftStateService alone; any future variant (third-round reversal and
-    # friends) changes slot_for_pick and this follows automatically.
-    total_picks = svc.config.league_size * svc.config.total_rounds
-    advised_pick = svc.my_next_pick_number
-    my_following_pick_number = None
-    upcoming_pick_slots: list[int] = []
-    if advised_pick is not None:
-        for p in range(advised_pick + 1, total_picks + 1):
-            if svc.slot_for_pick(p) == svc.config.my_draft_position:
-                my_following_pick_number = p
-                break
-            upcoming_pick_slots.append(svc.slot_for_pick(p))
-        if my_following_pick_number is None:
-            # Advising on my final pick of the draft — nothing to defer to,
-            # so drop the partial list rather than implying a next turn.
-            upcoming_pick_slots = []
 
     return RecommendationContext(
         pick_number=svc.current_pick_number,
