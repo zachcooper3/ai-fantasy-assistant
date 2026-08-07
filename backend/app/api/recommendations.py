@@ -29,6 +29,8 @@ from backend.app.services.ai_service import (
     RecommendationContext,
     compute_position_scarcity,
     compute_replacement_levels,
+    _ROSTER_CHANGE_MIN_SHARE,
+    _ROSTER_CHANGE_POSITIONS,
 )
 from backend.app.services.draft_state import DraftStateService
 
@@ -138,6 +140,118 @@ def _metrics_dict(m) -> dict:
         "depth_chart_trend": m.depth_chart_trend,
         "is_rookie_or_second_year": m.is_rookie_or_second_year,
     }
+
+
+# Team abbreviations differ between the two sources this compares:
+# PlayerMetrics.team comes from nflverse, Player.team from the ADP feed.
+# They agree on 31 of 32 clubs and disagree on the Rams — nflverse says LA,
+# FantasyFootballCalculator says LAR — which made every Rams player look
+# like he had moved from "LA" to "LAR". Confirmed live: Kyren Williams was
+# reported as having left LA with 56% of its carries, alongside three other
+# Rams, in a list otherwise full of genuine moves.
+#
+# Mapped toward the ADP feed's convention, because that is what Player.team
+# holds and what the board displays — a change keyed "LA" would never match
+# a board row reading "LAR". The extra aliases are historical or
+# alternative codes that nflverse and other feeds have used; none appear in
+# today's data, and they cost nothing to tolerate.
+_TEAM_ALIASES = {
+    "LA": "LAR", "STL": "LAR",          # Rams
+    "SD": "LAC",                         # Chargers
+    "OAK": "LV", "LVR": "LV",            # Raiders
+    "WSH": "WAS",                        # Commanders
+    "JAC": "JAX", "ARZ": "ARI",
+    "BLT": "BAL", "CLV": "CLE", "HST": "HOU",
+}
+
+
+def _normalise_team(code: str | None) -> str | None:
+    """Team code in the ADP feed's convention, or None."""
+    if not code:
+        return None
+    code = code.strip().upper()
+    return _TEAM_ALIASES.get(code, code)
+
+
+def _compute_roster_changes(db: Session) -> dict[str, dict[str, list[dict]]]:
+    """
+    Who moved between last season and now, per team, with the share of that
+    team's 2025 volume they carried.
+
+    Built by comparing PlayerMetrics.team (where the numbers were earned)
+    against Player.team (where he is now). Both are already in the database;
+    nothing here needs a new source.
+
+    Runs over the WHOLE player pool, not the visible board — the departure
+    that matters to a player is a teammate's, and that teammate may be
+    hundreds of picks away or already drafted. Restricting to the board
+    would miss exactly the case this exists for.
+
+    Returns {} when PlayerMetrics.team is empty, which is what a database
+    that hasn't re-run fetch_metrics since the column was added will look
+    like. The prompt section is then omitted rather than rendering a
+    confident "nobody moved".
+    """
+    rows = db.exec(
+        select(
+            Player.name, Player.position, Player.team,
+            PlayerMetrics.team, PlayerMetrics.target_share, PlayerMetrics.carry_share,
+        ).join(PlayerMetrics, PlayerMetrics.player_id == Player.id)
+    ).all()
+
+    changes: dict[str, dict[str, list[dict]]] = {}
+    for name, position, now_team_raw, then_team_raw, tgt_share, carry_share in rows:
+        if position not in _ROSTER_CHANGE_POSITIONS:
+            continue
+        now_team = _normalise_team(now_team_raw)
+        then_team = _normalise_team(then_team_raw)
+        if not now_team or not then_team or now_team == then_team:
+            continue
+
+        # Describe the move in whichever currency the player actually dealt
+        # in. A back who took a third of the carries and a receiver who took
+        # a quarter of the targets both moved something worth naming, but
+        # they are not the same quantity and shouldn't be summed.
+        share, currency = max(
+            ((tgt_share or 0.0), "targets"),
+            ((carry_share or 0.0), "carries"),
+        )
+        if share < _ROSTER_CHANGE_MIN_SHARE:
+            continue
+        # `share` and `currency` are kept alongside the rendered label so
+        # callers can do arithmetic: sorting on the formatted string puts
+        # "8% of targets" above "25%", and the per-player annotation needs
+        # to net departures against arrivals in the same currency.
+        entry = {"name": name, "share": share, "currency": currency,
+                 "share_label": f"{share:.0%} of {currency}"}
+
+        changes.setdefault(then_team, {"departed": [], "arrived": []})
+        changes[then_team]["departed"].append(entry)
+        changes.setdefault(now_team, {"departed": [], "arrived": []})
+        changes[now_team]["arrived"].append({**entry, "from_team": then_team})
+
+    # A club that appears on only one side of the diff is the signature of an
+    # abbreviation mismatch, not of thirty players changing teams at once —
+    # it means every player at that club looks like he moved. Logged rather
+    # than corrected, because the fix is a new entry in _TEAM_ALIASES and
+    # guessing it automatically would be how the next silent wrong answer
+    # gets in.
+    left_only = {t for t, v in changes.items() if v["departed"] and not v["arrived"]}
+    suspicious = {t for t in left_only if len(changes[t]["departed"]) >= 4}
+    if suspicious:
+        logger.warning(
+            "Roster changes: %s lost 4+ players and gained none. Usually an "
+            "unmapped team abbreviation between nflverse and the ADP feed — "
+            "check _TEAM_ALIASES before believing it.",
+            ", ".join(sorted(suspicious)),
+        )
+
+    # Biggest mover first — the 25% departure is the one that changes a
+    # recommendation, and it shouldn't be third in a list of five.
+    for team in changes.values():
+        for direction in ("departed", "arrived"):
+            team[direction].sort(key=lambda p: p["share"], reverse=True)
+    return changes
 
 
 def _build_context(
@@ -294,6 +408,7 @@ def _build_context(
         my_following_pick_number=my_following_pick_number,
         upcoming_pick_slots=upcoming_pick_slots,
         replacement_ppg=replacement_ppg,
+        roster_changes=_compute_roster_changes(db),
     )
 
 

@@ -1851,3 +1851,118 @@ def test_board_explains_what_below_replacement_means():
     prompt = _build_prompt(ctx)
     assert "gains you nothing over waiting" in prompt
     assert "unknown value, NOT replacement-level value" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Roster changes
+#
+# The only forward-looking evidence in the prompt apart from ADP. Diagnosed
+# from a live disagreement: FantasyPros favoured Josh Downs over Deebo Samuel
+# 96/4 while every production figure here favoured Deebo. Downs's 18% target
+# share was earned alongside Michael Pittman Jr., who took 25% of
+# Indianapolis's targets and is now on Pittsburgh — so his own share
+# understates the opportunity in front of him, and last season's numbers
+# cannot say so.
+# ---------------------------------------------------------------------------
+
+def _rc_board():
+    return [{"id": 1, "rank": 1, "name": "Josh Downs", "position": "WR",
+             "team": "IND", "adp": 91.9, "sleeper_id": None}]
+
+
+def test_departures_are_reported_for_a_board_team():
+    from backend.app.services.ai_service import _format_roster_changes
+    out = _format_roster_changes(_rc_board(), {
+        "IND": {"departed": [{"name": "Michael Pittman Jr.",
+                              "share_label": "25% of targets"}], "arrived": []}})
+    assert "IND: LOST Michael Pittman Jr. (25% of targets)" in out
+
+
+def test_arrivals_are_reported_as_new_competition():
+    from backend.app.services.ai_service import _format_roster_changes
+    out = _format_roster_changes(_rc_board(), {
+        "IND": {"departed": [], "arrived": [{"name": "Someone", "from_team": "NYJ",
+                                             "share_label": "20% of targets"}]}})
+    assert "GAINED Someone (20% of targets with NYJ)" in out
+
+
+def test_only_teams_on_the_board_are_shown():
+    # Several board players usually share a team, and a team nobody is
+    # choosing between is prompt weight for nothing.
+    from backend.app.services.ai_service import _format_roster_changes
+    out = _format_roster_changes(_rc_board(), {
+        "IND": {"departed": [{"name": "A", "share_label": "25% of targets"}], "arrived": []},
+        "KC":  {"departed": [{"name": "B", "share_label": "30% of targets"}], "arrived": []}})
+    assert "IND:" in out and "KC:" not in out
+
+
+def test_section_is_omitted_when_nothing_moved():
+    from backend.app.services.ai_service import _format_roster_changes
+    assert _format_roster_changes(_rc_board(), {}) == ""
+    assert _format_roster_changes(_rc_board(),
+                                  {"IND": {"departed": [], "arrived": []}}) == ""
+
+
+def test_section_states_both_of_its_limits():
+    # It's a volume argument, not a talent one, and the ADP pool can't see
+    # retirements or cuts. Overstating either would be worse than silence.
+    from backend.app.services.ai_service import _format_roster_changes
+    out = _format_roster_changes(_rc_board(), {
+        "IND": {"departed": [{"name": "A", "share_label": "25% of targets"}], "arrived": []}})
+    assert "does not automatically go to whoever remains" in out
+    assert "a floor, not a complete accounting" in out
+
+
+def test_section_tells_the_model_when_to_reach_for_it():
+    from backend.app.services.ai_service import _format_roster_changes
+    out = _format_roster_changes(_rc_board(), {
+        "IND": {"departed": [{"name": "A", "share_label": "25% of targets"}], "arrived": []}})
+    assert "when the market ranks a player above what his numbers justify" in out
+
+
+def test_movers_are_ordered_by_share_not_by_label_text():
+    # Sorting the formatted string puts "8% of targets" above "25%".
+    entries = [{"name": "small", "share": 0.08, "share_label": "8% of targets"},
+               {"name": "big", "share": 0.25, "share_label": "25% of targets"}]
+    entries.sort(key=lambda p: p["share"], reverse=True)
+    assert [e["name"] for e in entries] == ["big", "small"]
+    by_label = sorted(entries, key=lambda p: p["share_label"], reverse=True)
+    assert [e["name"] for e in by_label] == ["small", "big"], "the bug this guards"
+
+
+# ---------------------------------------------------------------------------
+# Team abbreviation normalisation
+#
+# PlayerMetrics.team comes from nflverse, Player.team from the ADP feed.
+# They agree on 31 of 32 clubs and disagree on the Rams — nflverse "LA" vs
+# the feed's "LAR" — so every Rams player was reported as having changed
+# teams. Caught live: "LA: LOST Kyren Williams (56% of carries)".
+# ---------------------------------------------------------------------------
+
+def test_rams_are_not_reported_as_having_traded_their_whole_roster():
+    from backend.app.api.recommendations import _normalise_team
+    assert _normalise_team("LA") == _normalise_team("LAR") == "LAR"
+
+
+def test_historical_codes_normalise_too():
+    from backend.app.api.recommendations import _normalise_team
+    for old, new in (("STL", "LAR"), ("SD", "LAC"), ("OAK", "LV"),
+                     ("WSH", "WAS"), ("JAC", "JAX"), ("ARZ", "ARI")):
+        assert _normalise_team(old) == new
+
+
+def test_unknown_and_empty_codes_pass_through_unchanged():
+    # A club we have no alias for must survive intact — silently rewriting
+    # it would be a worse failure than leaving it alone.
+    from backend.app.api.recommendations import _normalise_team
+    assert _normalise_team("KC") == "KC"
+    assert _normalise_team(" kc ") == "KC"
+    assert _normalise_team(None) is None
+    assert _normalise_team("") is None
+
+
+def test_genuine_moves_still_register():
+    # The normalisation must not swallow real transfers along with the
+    # spurious ones — IND -> PIT is the case the whole feature exists for.
+    from backend.app.api.recommendations import _normalise_team
+    assert _normalise_team("IND") != _normalise_team("PIT")

@@ -212,6 +212,13 @@ class RecommendationContext:
     # Empty when I pick again immediately or when the caller predates this.
     upcoming_pick_slots: list[int] = field(default_factory=list)
 
+    # {team: {"departed": [...], "arrived": [...]}} — who moved between last
+    # season and now, with the share of that team's 2025 volume they
+    # represent. The only forward-looking evidence in the prompt apart from
+    # ADP; see _format_roster_changes. Empty means the section is omitted,
+    # which is also what happens on a database predating PlayerMetrics.team.
+    roster_changes: dict[str, dict[str, list[dict]]] = field(default_factory=dict)
+
     # {position: ppg of the last startable player league-wide}, from
     # compute_replacement_levels over the whole player pool — not just the
     # available slice, since replacement level is a property of the position
@@ -699,6 +706,151 @@ def _vor(player: dict, player_metrics: dict[int, dict], replacement: dict[str, f
 
 
 # ---------------------------------------------------------------------------
+# Roster changes — the only genuinely forward-looking signal in the prompt
+#
+# Everything else the app knows about a player describes a season that has
+# already finished. ADP is the one exception, and it arrives as a single
+# number with no explanation.
+#
+# Diagnosed from a live disagreement: FantasyPros' consensus favoured Josh
+# Downs over Deebo Samuel 96/4, while every production figure here favoured
+# Deebo — 25% target share against 18%, 72% snaps against 59%, 11.8 ppg
+# against 8.7. The app had no way to see why. Downs's 18% was earned in 2025
+# alongside Michael Pittman Jr., who took 25% of Indianapolis's targets and
+# is now on Pittsburgh. His share understates the opportunity in front of
+# him, and last season's numbers cannot say so.
+#
+# This is a VOLUME argument, not a talent one. Vacated targets do not
+# automatically flow to whoever remains, and the prompt says so — the point
+# is to put the change in front of the model, not to project the outcome.
+# ---------------------------------------------------------------------------
+
+# Below this share of a team's 2025 volume, a departure or arrival isn't
+# worth a line. A fifth receiver moving on frees up nothing anyone drafts.
+_ROSTER_CHANGE_MIN_SHARE = 0.05
+
+# Positions whose comings and goings change the opportunity available to
+# other players. A quarterback change matters enormously in reality, but
+# not through the share arithmetic this section does.
+_ROSTER_CHANGE_POSITIONS = ("RB", "WR", "TE")
+
+
+# Which volume a position competes for. A receiver cares about vacated
+# targets and a back about vacated carries; netting the two together would
+# describe nobody's situation.
+_POSITION_CURRENCY = {"WR": "targets", "TE": "targets", "RB": "carries"}
+
+# Below this net change, the annotation is noise on an already-long row.
+_TEAM_OPPORTUNITY_MIN = 0.08
+
+
+def _team_opportunity(
+    player: dict,
+    roster_changes: dict[str, dict[str, list[dict]]],
+) -> str:
+    """
+    A short tag for a player's row: how much of the volume he competes for
+    has left his team, or arrived to compete with him.
+
+    This exists because the team-level section alone did not work. Confirmed
+    live: Josh Downs sat first on the board carrying "(BELOW replacement)" —
+    a backward-looking verdict, stated with certainty, attached directly to
+    his name — while the fact that Indianapolis had lost 21% of its targets
+    sat fifty lines earlier under a team heading, reachable only by joining
+    on the team code. The evidence against him was on his row; the evidence
+    for him was not, and he went unrecommended.
+
+    Netted in the player's own currency, and only departures/arrivals at
+    positions that actually compete with him: a running back leaving does
+    nothing for a receiver's target share.
+    """
+    team = player.get("team")
+    currency = _POSITION_CURRENCY.get(player.get("position", ""))
+    if not team or not currency:
+        return ""
+    change = roster_changes.get(team)
+    if not change:
+        return ""
+
+    out = sum(p["share"] for p in change.get("departed", [])
+              if p.get("currency") == currency)
+    inc = sum(p["share"] for p in change.get("arrived", [])
+              if p.get("currency") == currency)
+    net = out - inc
+    if abs(net) < _TEAM_OPPORTUNITY_MIN:
+        return ""
+
+    short = "tgt" if currency == "targets" else "car"
+    if net > 0:
+        return f"[{net:.0%} of team {short} VACATED]"
+    return f"[{abs(net):.0%} of team {short} NEW COMPETITION]"
+
+
+def _format_roster_changes(
+    board: list[dict],
+    roster_changes: dict[str, dict[str, list[dict]]],
+) -> str:
+    """
+    Per-team departures and arrivals since last season, for the teams
+    represented on the visible board.
+
+    Keyed by team rather than repeated per player: several board players
+    usually share a team, and the same three lines under each of them would
+    be pure duplication. Every board row already shows its team, so the
+    model can connect them.
+
+    Only counts players this app knows about — the ADP pool is a few hundred
+    fantasy-relevant names, so a retirement or a cut leaves no trace here.
+    Departures are therefore a floor, never a complete accounting, and the
+    rendered text says so rather than implying the list is exhaustive.
+    """
+    if not roster_changes:
+        return ""
+
+    teams = sorted({p["team"] for p in board if p.get("team")})
+    lines: list[str] = []
+    for team in teams:
+        change = roster_changes.get(team)
+        if not change:
+            continue
+        left = change.get("departed", [])
+        joined = change.get("arrived", [])
+        if not left and not joined:
+            continue
+
+        parts: list[str] = []
+        if left:
+            parts.append("LOST " + ", ".join(
+                f"{p['name']} ({p['share_label']})" for p in left))
+        if joined:
+            parts.append("GAINED " + ", ".join(
+                f"{p['name']} ({p['share_label']} with {p['from_team']})" for p in joined))
+        lines.append(f"- {team}: " + " | ".join(parts))
+
+    if not lines:
+        return ""
+
+    return "\n".join([
+        "## Roster Changes Since Last Season",
+        "Shares are of that team's 2025 totals, so they describe how much "
+        "opportunity moved, not how good the player is. A team that LOST volume "
+        "has work available for whoever stayed — meaning an incumbent's own "
+        "2025 share understates what is in front of him now. A team that GAINED "
+        "someone has new competition, so an incumbent's share overstates it. "
+        "This is the only forward-looking evidence here apart from ADP, and it "
+        "is the usual reason ADP disagrees with last season's production: when "
+        "the market ranks a player above what his numbers justify, vacated "
+        "volume is the first thing to check.",
+        "Two limits. Vacated work does not automatically go to whoever remains "
+        "— treat it as opportunity, not as a projection. And only players in "
+        "this app's pool are visible, so retirements and cuts leave no trace: "
+        "these lists are a floor, not a complete accounting.",
+        *lines,
+        "",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Opportunity cost — which players actually survive to my next turn
 #
 # This is the single question a snake draft turns on, and nothing in this
@@ -867,6 +1019,7 @@ def _format_shortlist_section(
     pick_number: int,
     player_metrics: dict[int, dict],
     replacement: dict[str, float],
+    roster_changes: dict[str, dict[str, list[dict]]] | None = None,
 ) -> str:
     if not shortlist:
         return ""
@@ -887,9 +1040,11 @@ def _format_shortlist_section(
             vor_str = "VOR --"
         else:
             vor_str = f"VOR {v:+.1f}" + (" (BELOW replacement)" if v < 0 else "")
+        opp = _team_opportunity(p, roster_changes or {})
         lines.append(
             f"  id={p['id']} {p['name']} ({p['position']}, {p['team']}) "
             f"ADP {p['adp']:g}, {vor_str}, {_draft_value(p['adp'], pick_number)}"
+            + (f", {opp}" if opp else "")
         )
     lines.append("")
     return "\n".join(lines)
@@ -1845,12 +2000,14 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     )
 
     for section in (
+        _format_roster_changes(ctx.top_available[:_LISTED_PLAYERS], ctx.roster_changes),
         _format_roster_depth_section(
             _compute_roster_depth(ctx.my_roster, lineup), spots_left,
             lineup_has_flex=bool(lineup.get("FLEX")),
         ),
         _format_shortlist_section(
-            shortlist, advised_pick, ctx.player_metrics, ctx.replacement_ppg
+            shortlist, advised_pick, ctx.player_metrics, ctx.replacement_ppg,
+            ctx.roster_changes,
         ),
         _format_survival_section(
             ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between
@@ -1892,7 +2049,14 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             f"no prior-season data (usually a rookie), which is unknown value, NOT "
             f"replacement-level value: an unproven player and a proven-below-"
             f"replacement player are different cases, and the second is the one the "
-            f"numbers actually argue against."
+            f"numbers actually argue against.\n"
+            f"A row ending '[N% of team tgt VACATED]' means players taking that "
+            f"share of his team's volume have LEFT since these numbers were "
+            f"recorded — so his own share understates what is in front of him, and "
+            f"a below-replacement VOR may describe a role he no longer has. "
+            f"'NEW COMPETITION' is the reverse. VOR looks backward; this looks "
+            f"forward, and when they conflict that IS the disagreement worth "
+            f"resolving rather than a reason to ignore either."
         )
     tiers = _compute_adp_tiers(ctx.top_available[:_LISTED_PLAYERS])
     for i, tier in enumerate(tiers, start=1):
@@ -1921,6 +2085,12 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             # Value against the pick you are actually making, computed here
             # rather than left as a subtraction for the model. See _draft_value.
             row += f"  {_draft_value(p['adp'], advised_pick)}"
+            # Forward-looking counterweight, on the same row as the
+            # backward-looking VOR verdict. See _team_opportunity: with this
+            # fifty lines away under a team heading, it lost every time.
+            opp = _team_opportunity(p, ctx.roster_changes)
+            if opp:
+                row += f"  {opp}"
             lines.append(row)
     lines.append("")
 
@@ -2568,18 +2738,9 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
         logger.warning("Claude recommended unavailable player id=%s", rec.get("player_id"))
         return None
 
-    # Canonical player rows, keyed by id. Every *factual* field on a suggestion
-    # is taken from here rather than from Claude's JSON.
-    #
-    # This matters: validating player_id against the available list while still
-    # rendering the model's own player_name/position/adp meant an available id
-    # paired with a drafted player's name displayed that drafted player. The id
-    # is the only field we verify, so the id is the only field we trust — the
-    # model contributes judgement (reasoning, tradeoff), not data. It also
-    # closes the prompt-injection path where RotoWire/Sleeper text reaching the
-    # prompt could influence a rendered player name.
-    by_id = {p["id"]: p for p in ctx.top_available}
-
+    # Every *factual* field on a suggestion comes from the canonical player
+    # row, never from Claude's JSON — see _pick_from, which both this and the
+    # streaming path go through.
     def _pick(d: dict) -> PickSuggestion | None:
         return _pick_from(d, ctx)
 
