@@ -777,13 +777,17 @@ def _team_opportunity(
     inc = sum(p["share"] for p in change.get("arrived", [])
               if p.get("currency") == currency)
     net = out - inc
+    # Rendered even at zero. A figure that appears only when it is large
+    # reads as an occasional annotation; one that is always present reads as
+    # a metric, and this needs to carry the same weight as the ADP and VOR
+    # sitting beside it. "OPP +0%" is also real information — it says the
+    # situation has NOT changed, which is exactly what distinguishes a
+    # player whose numbers still describe his role from one whose don't.
     if abs(net) < _TEAM_OPPORTUNITY_MIN:
-        return ""
+        net = 0.0
 
     short = "tgt" if currency == "targets" else "car"
-    if net > 0:
-        return f"[{net:.0%} of team {short} VACATED]"
-    return f"[{abs(net):.0%} of team {short} NEW COMPETITION]"
+    return f"OPP {net:+.0%} {short}"
 
 
 def _format_roster_changes(
@@ -1849,6 +1853,69 @@ def _format_metrics_section(
 # Prompt builder
 # ---------------------------------------------------------------------------
 
+def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[dict]:
+    """
+    The players actually shown: the top _LISTED_PLAYERS by ADP, plus the best
+    available player at every position still missing from the starting
+    lineup.
+
+    A global ADP cut does not guarantee positional coverage, and late in a
+    draft it stops providing it entirely. Confirmed live at pick 128: the
+    user's only unfilled starting slot was TE, five picks remained, and the
+    board held FIFTEEN receivers and ZERO tight ends — the best available TE
+    sat at overall position 37. The model was being asked to fill a slot from
+    a list containing nothing that could fill it, so it could only recommend
+    another receiver for a roster already two deep beyond requirement.
+
+    Nothing in the prompt could express that failure either: a position
+    absent from the board is indistinguishable from a position with no good
+    options left. The fix belongs here rather than in a larger
+    _LISTED_PLAYERS, which would pay for coverage on every position at every
+    pick when what is needed is one or two players at one position,
+    occasionally.
+
+    Pulled in on TWO axes, cheapest-by-ADP and best-by-VOR, because one is
+    not enough when they disagree — and at a needed position they often do.
+    Confirmed live: filling the TE slot by ADP alone surfaced Pat Freiermuth
+    (ADP 152, VOR -2.94, 11% target share, and his team had just added 21%
+    of a team's targets) while leaving Brenton Strange invisible eleven
+    picks later (VOR -0.68, 16% target share, 75% snaps, no new
+    competition). The better player was off the board because he was
+    slightly more expensive.
+    """
+    board = list(ctx.top_available[:_LISTED_PLAYERS])
+    present = {p["id"] for p in board}
+
+    def _add(player: dict | None) -> None:
+        if player is not None and player["id"] not in present:
+            board.append(player)
+            present.add(player["id"])
+
+    for pos in gaps:
+        # FLEX is filled by an RB/WR/TE, all of which are covered by their
+        # own entries — there is no "best available FLEX" to look up.
+        if pos == "FLEX" or pos in _LATE_ROUND_POSITIONS:
+            continue
+        at_pos = [p for p in ctx.top_available if p["position"] == pos]
+        if not at_pos:
+            continue
+
+        # Cheapest — what the market says you can get away with waiting for.
+        _add(next((p for p in at_pos if p["id"] not in present), None))
+
+        # Most productive — what last season says is actually best. Skipped
+        # when nobody at the position has a VOR, rather than falling back to
+        # ADP and silently adding the same player twice.
+        scored = [
+            (v, p) for p in at_pos
+            if (v := _vor(p, ctx.player_metrics, ctx.replacement_ppg)) is not None
+        ]
+        if scored:
+            _add(max(scored, key=lambda t: t[0])[1])
+
+    return sorted(board, key=lambda p: p["adp"])
+
+
 def _build_prompt(ctx: RecommendationContext) -> str:
     lines: list[str] = []
 
@@ -1994,13 +2061,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     horizon = ctx.my_following_pick_number
     picks_between = max(0, horizon - advised_pick - 1) if horizon else 0
 
-    shortlist = _shortlist(
-        ctx.top_available[:_LISTED_PLAYERS], advised_pick,
-        ctx.player_metrics, ctx.replacement_ppg,
-    )
+    # Everything below shows THIS list, not a raw ADP slice — see
+    # _board_for_prompt for why the two differ late in a draft.
+    board = _board_for_prompt(ctx, skill_gaps)
+    shortlist = _shortlist(board, advised_pick, ctx.player_metrics, ctx.replacement_ppg)
 
     for section in (
-        _format_roster_changes(ctx.top_available[:_LISTED_PLAYERS], ctx.roster_changes),
+        _format_roster_changes(board, ctx.roster_changes),
         _format_roster_depth_section(
             _compute_roster_depth(ctx.my_roster, lineup), spots_left,
             lineup_has_flex=bool(lineup.get("FLEX")),
@@ -2009,9 +2076,7 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             shortlist, advised_pick, ctx.player_metrics, ctx.replacement_ppg,
             ctx.roster_changes,
         ),
-        _format_survival_section(
-            ctx.top_available[:_LISTED_PLAYERS], horizon, picks_between
-        ),
+        _format_survival_section(board, horizon, picks_between),
         _format_positional_dropoff(ctx.top_available, horizon, ctx.player_metrics),
     ):
         if section:
@@ -2022,6 +2087,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # docstring for why: a precise ordinal table invites treating every
     # ADP decimal as meaningful, when a few-point gap is often just noise.
     lines.append("## Top Available Players (grouped into ADP tiers)")
+    if len(board) > _LISTED_PLAYERS:
+        lines.append(
+            "This list is the top players by ADP PLUS the best available player at "
+            "every position you still need to start — those may sit well past the "
+            "ADP cut and would otherwise be invisible here, leaving you unable to "
+            "fill a required slot from this board at all."
+        )
     lines.append(
         "Tier boundaries fall at the largest ADP gaps on this particular board, so "
         "they adapt to how tightly packed it is. Within a tier, a fraction of an ADP "
@@ -2050,15 +2122,26 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             f"replacement-level value: an unproven player and a proven-below-"
             f"replacement player are different cases, and the second is the one the "
             f"numbers actually argue against.\n"
-            f"A row ending '[N% of team tgt VACATED]' means players taking that "
-            f"share of his team's volume have LEFT since these numbers were "
-            f"recorded — so his own share understates what is in front of him, and "
-            f"a below-replacement VOR may describe a role he no longer has. "
-            f"'NEW COMPETITION' is the reverse. VOR looks backward; this looks "
-            f"forward, and when they conflict that IS the disagreement worth "
-            f"resolving rather than a reason to ignore either."
+            f"OPP is the third figure and carries the same weight as the other "
+            f"two. It is the net share of his team's volume — targets for a "
+            f"receiver or tight end, carries for a back — that has CHANGED HANDS "
+            f"since these numbers were recorded. 'OPP +21% tgt' means players "
+            f"taking 21% of that team's targets have left, so his own share "
+            f"understates what is in front of him and a below-replacement VOR may "
+            f"describe a role he no longer has. 'OPP -43% tgt' means that much new "
+            f"competition arrived, so his share overstates it. 'OPP +0%' means the "
+            f"situation is unchanged and last season's numbers still describe it — "
+            f"which is real information, not an absent signal. '--' means the "
+            f"position has no single volume to compete for (QB, DST).\n"
+            f"The three are not ranked. ADP is what the market expects, VOR is what "
+            f"he produced, OPP is what has changed around him — and each is blind "
+            f"to what the others see. Do not resolve a conflict by defaulting to "
+            f"VOR because it is the most precise-looking number; a precise "
+            f"measurement of a role that no longer exists is not evidence about "
+            f"this season. When they disagree, say which one you are trusting and "
+            f"why, in `reasoning`."
         )
-    tiers = _compute_adp_tiers(ctx.top_available[:_LISTED_PLAYERS])
+    tiers = _compute_adp_tiers(board)
     for i, tier in enumerate(tiers, start=1):
         adp_lo, adp_hi = tier[0]["adp"], tier[-1]["adp"]
         lines.append(f"\nTier {i} (ADP {adp_lo:g}-{adp_hi:g}):")
@@ -2088,9 +2171,8 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             # Forward-looking counterweight, on the same row as the
             # backward-looking VOR verdict. See _team_opportunity: with this
             # fifty lines away under a team heading, it lost every time.
-            opp = _team_opportunity(p, ctx.roster_changes)
-            if opp:
-                row += f"  {opp}"
+            # Third column, always present — see _team_opportunity.
+            row += "  " + (_team_opportunity(p, ctx.roster_changes) or "OPP    --")
             lines.append(row)
     lines.append("")
 
@@ -2138,13 +2220,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # can see replacement level), and rendering a metrics line for a player the
     # model was never shown is pure prompt bloat.
     metrics_section = _format_metrics_section(
-        ctx.top_available[:_LISTED_PLAYERS], ctx.player_metrics, ctx.draft_profiles
+        board, ctx.player_metrics, ctx.draft_profiles
     )
     if metrics_section:
         lines.append(metrics_section)
 
     # Retrieved player news/analysis (best-effort; omitted if unavailable)
-    retrieved = _retrieve_player_context(ctx.top_available)
+    retrieved = _retrieve_player_context(board)
     if retrieved:
         lines.append(retrieved)
 
@@ -2176,11 +2258,11 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "Player News. Call out any candidate whose underlying opportunity looks "
         "stronger than their tier implies as a potential breakout. Never break a tie on "
         "name recognition or last season's box score alone. Before you commit, check "
-        "your pick against the board: if another available player has BOTH a better ADP "
-        "and a higher VOR than the one you chose, you need a specific, stated reason "
-        "for passing on him — and 'durability' does not qualify on its own, because ADP "
+        "your pick against the board: if another available player beats the one you "
+        "chose on ADP, VOR and OPP together, you need a specific, stated reason for "
+        "passing on him — and 'durability' does not qualify on its own, because ADP "
         "already accounts for it (RULE 6). If you cannot name that reason, take the "
-        "better player.",
+        "better player. Where they split, say which signal decided it.",
         "5. CHECK LEGALITY LAST. Confirm the pick doesn't leave you unable to field a "
         "legal starting lineup — that only overrides steps 2-4 when the roster shape "
         "section shows an URGENT line. Filling every base slot is not a finished "
@@ -2339,19 +2421,33 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "way to lose a draft you were winning. Never describe a position as secure "
         "merely because its base requirement is met.\n\n"
 
-        "RULE 4 — COMPARE POSITIONS BY VOR, NOT BY RAW POINTS. Equal points per game "
-        "at different positions are not equal value, because what replaces each player "
-        "differs: in this data a 15.2 ppg back is +4.1 over the back who'd replace him "
-        "while a 14.7 ppg receiver is only +2.8 over his. The VOR column on the board "
-        "is the one figure that puts every position on a single scale — use it whenever "
-        "you are choosing ACROSS positions, and note that an ADP-sorted board naturally "
-        "surfaces more receivers than backs, which is a property of the list and not a "
-        "judgement about them. Two limits on it: VOR is computed from last season and "
-        "ADP is the market's forward view, so when they disagree sharply say so instead "
-        "of silently picking one; and VOR only measures a player's value AS A STARTER. "
-        "Once a position's starting slots are full, the next player there rides your "
-        "bench and is worth a fraction of his VOR — insurance, not points — so a high "
-        "VOR never justifies stacking a fourth player at a position that starts one.\n\n"
+        "RULE 4 — THREE SIGNALS, NONE OF THEM SENIOR. Every board row carries "
+        "ADP, VOR and OPP, and they answer different questions: what the market "
+        "expects, what he produced, and what has changed around him. Each is blind "
+        "to what the others see, so none of them outranks the rest.\n"
+        "VOR exists because equal points per game at different positions are not "
+        "equal value — what replaces each player differs. In this data a 15.2 ppg "
+        "back is +4.1 over the back who would replace him while a 14.7 ppg receiver "
+        "is only +2.8 over his, so use VOR whenever you compare ACROSS positions. "
+        "Note also that an ADP-sorted board surfaces more receivers than backs, "
+        "which is a property of the list and not a judgement about them.\n"
+        "The failure mode to avoid is treating VOR as the tiebreaker because it is "
+        "the most precise-looking figure. It is a measurement of LAST season. When "
+        "OPP shows the volume around a player has moved, VOR is measuring a role "
+        "that may no longer exist — and a precise measurement of the wrong thing is "
+        "not better evidence than an imprecise measurement of the right one. A "
+        "below-replacement VOR beside a large positive OPP is the single most "
+        "common shape of an underpriced player, and a healthy VOR beside a large "
+        "negative OPP is the most common shape of a trap.\n"
+        "Two further limits on VOR: it only measures a player's value AS A STARTER, "
+        "so once a position's starting slots are full the next player there is "
+        "insurance and worth a fraction of it — a high VOR never justifies a fourth "
+        "player at a position that starts one. And near the replacement line it "
+        "exaggerates: -0.1 against -3.2 looks decisive but is three points per "
+        "game, so do not treat small VOR gaps between marginal players as settling "
+        "anything on their own.\n"
+        "When the three disagree, name in `reasoning` which you are trusting and "
+        "why. Do not silently average them.\n\n"
 
         "RULE 5 — ADP IS A PRIOR, NOT A RANKING. The board is grouped into ADP tiers. "
         "Within a tier, ADP differences are noise and must not decide anything; break "

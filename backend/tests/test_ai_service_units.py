@@ -55,6 +55,7 @@ from backend.app.services.ai_service import (
     _SURVIVAL_SAFE,
     _SURVIVAL_TOSSUP,
     _MAX_ALTERNATIVES,
+    _LISTED_PLAYERS,
 )
 
 
@@ -913,10 +914,12 @@ def test_system_prompt_guards_against_stacking_on_high_vor():
     # six tight ends, because VOR measures starter value and says nothing
     # about a position you can only start one of.
     sp = _build_system_prompt("ppr")
-    assert "COMPARE POSITIONS BY VOR" in sp
-    assert "stacking a fourth player at a position that starts one" in sp
-    # And the honest caveat about where the number comes from.
-    assert "computed from last season" in sp
+    assert "THREE SIGNALS, NONE OF THEM SENIOR" in sp
+    assert "a fourth player at a position that starts one" in sp
+    # VOR must not be presented as the senior signal just because it is the
+    # most precise-looking number.
+    assert "measurement of LAST season" in sp
+    assert "not better evidence than an imprecise measurement of the right one" in sp
 
 
 # ---------------------------------------------------------------------------
@@ -1133,7 +1136,7 @@ def test_rule6_names_the_better_adp_and_vor_override():
 
 def test_task_requires_justifying_a_pass_on_a_strictly_better_player():
     prompt = _build_prompt(ctx_with_available(1, 2, 3))
-    assert "a better ADP and a higher VOR" in prompt
+    assert "beats the one you chose on ADP, VOR and OPP together" in prompt
     assert "take the better player" in prompt
 
 
@@ -1966,3 +1969,117 @@ def test_genuine_moves_still_register():
     # spurious ones — IND -> PIT is the case the whole feature exists for.
     from backend.app.api.recommendations import _normalise_team
     assert _normalise_team("IND") != _normalise_team("PIT")
+
+
+def test_opportunity_is_a_column_not_an_occasional_tag():
+    # A figure that appears only when large reads as an annotation; one that
+    # is always present reads as a metric. OPP has to carry the same weight
+    # as the ADP and VOR beside it, so it renders on every row — including
+    # at zero, which says the situation has NOT changed and is real
+    # information rather than an absent signal.
+    ctx = ctx_with_available(1, 2)
+    ctx.top_available[0].update(position="WR", team="IND")
+    ctx.top_available[1].update(position="QB", team="KC")
+    ctx.roster_changes = {"IND": {"departed": [
+        {"name": "X", "share": 0.21, "currency": "targets",
+         "share_label": "21% of targets"}], "arrived": []}}
+    board = _build_prompt(ctx).split("## Top Available Players")[1].split("\n## ")[0]
+    rows = [l for l in board.splitlines() if "ADP" in l and l.strip().startswith(("1 ", "2 "))
+            or ("P1 " in l or "P2 " in l)]
+    assert any("OPP +21% tgt" in l for l in rows)
+    # A quarterback has no single volume to compete for.
+    assert any("OPP    --" in l for l in rows)
+
+
+def test_unchanged_situation_renders_as_zero_not_blank():
+    ctx = ctx_with_available(1)
+    ctx.top_available[0].update(position="WR", team="KC")
+    ctx.roster_changes = {"KC": {"departed": [], "arrived": []}}
+    prompt = _build_prompt(ctx)
+    assert "OPP +0% tgt" in prompt
+
+
+def test_legend_refuses_to_rank_the_three_signals():
+    ctx = ctx_with_available(1)
+    ctx.replacement_ppg = {"RB": 11.1}
+    ctx.player_metrics = {1: {"fantasy_points_avg": 10.0}}
+    prompt = _build_prompt(ctx)
+    assert "The three are not ranked" in prompt
+    assert "a precise measurement of a role that no longer exists" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Board positional coverage
+#
+# A global ADP cut does not guarantee the board contains a player at a
+# position you still have to start, and late in a draft it reliably doesn't.
+# Confirmed live at pick 128: the only unfilled starting slot was TE, five
+# picks remained, and the top 25 held fifteen receivers and ZERO tight ends —
+# the best available TE sat at overall position 37. The model could only
+# recommend another receiver for a roster already two deep beyond
+# requirement, and nothing in the prompt could express why.
+# ---------------------------------------------------------------------------
+
+def _coverage_ctx():
+    # 25 receivers ahead of every tight end, mirroring the live board.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 26)]
+    board += [{"id": 50, "rank": 50, "name": "Cheap TE", "position": "TE", "team": "PIT",
+               "adp": 152.0, "sleeper_id": None},
+              {"id": 51, "rank": 51, "name": "Good TE", "position": "TE", "team": "JAX",
+               "adp": 163.3, "sleeper_id": None}]
+    ctx = ctx_with_available(1)
+    ctx.top_available = board
+    ctx.player_metrics = {50: {"fantasy_points_avg": 7.6},    # cheaper, worse
+                          51: {"fantasy_points_avg": 9.8}}    # dearer, better
+    ctx.replacement_ppg = {"TE": 10.5, "WR": 11.5}
+    return ctx
+
+
+def test_a_needed_position_absent_from_the_board_gets_pulled_in():
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    plain = {p["position"] for p in ctx.top_available[:_LISTED_PLAYERS]}
+    assert "TE" not in plain, "fixture must reproduce the live shape"
+    covered = _board_for_prompt(ctx, {"TE": 1})
+    assert "TE" in {p["position"] for p in covered}
+
+
+def test_both_the_cheapest_and_the_best_are_pulled_in():
+    # One axis is not enough when they disagree, and at a needed position
+    # they often do: filling the slot by ADP alone surfaced a tight end with
+    # a worse VOR, a smaller target share and new competition on his team,
+    # while the better player sat eleven picks later and stayed invisible.
+    from backend.app.services.ai_service import _board_for_prompt
+    names = {p["name"] for p in _board_for_prompt(_coverage_ctx(), {"TE": 1})}
+    assert "Cheap TE" in names      # best ADP
+    assert "Good TE" in names       # best VOR
+
+
+def test_positions_already_filled_are_not_pulled_in():
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    assert len(_board_for_prompt(ctx, {})) == _LISTED_PLAYERS
+
+
+def test_flex_and_late_round_slots_are_not_looked_up():
+    # There is no "best available FLEX" — it's filled by an RB/WR/TE, each
+    # covered by its own entry. DST/K are handled by the deferral rules.
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    assert len(_board_for_prompt(ctx, {"FLEX": 1, "DST": 1, "K": 1})) == _LISTED_PLAYERS
+
+
+def test_no_duplicates_when_the_same_player_wins_both_axes():
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    ctx.top_available = [p for p in ctx.top_available if p["id"] != 51]
+    out = _board_for_prompt(ctx, {"TE": 1})
+    assert len(out) == len({p["id"] for p in out}) == _LISTED_PLAYERS + 1
+
+
+def test_board_says_why_a_late_player_is_listed():
+    ctx = _coverage_ctx()
+    ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR")   # no TE
+    prompt = _build_prompt(ctx)
+    assert "best available player at every position you still need to start" in prompt
