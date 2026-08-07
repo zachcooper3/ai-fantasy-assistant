@@ -119,7 +119,7 @@ async def sync_sleeper_ids() -> tuple[int, int]:
 
     create_db_and_tables()
 
-    matched = unmatched = 0
+    matched = unmatched = injured = 0
     unmatched_names: list[str] = []
 
     with Session(engine) as session:
@@ -150,6 +150,17 @@ async def sync_sleeper_ids() -> tuple[int, int]:
 
             if sid:
                 player.sleeper_id = sid
+                # Injury designation, captured from the same Sleeper payload
+                # already downloaded for the ID match. Stored structured
+                # rather than left as prose in a ChromaDB chunk: a player on
+                # IR is a hard exclusion, not a risk to weigh, and a note
+                # buried in retrieved text has already been read past once.
+                # "" (healthy) is normalised to None so absence means
+                # "nothing wrong" rather than "unknown".
+                raw_status = (sleeper_players.get(sid, {}).get("injury_status") or "").strip()
+                player.injury_status = raw_status or None
+                if raw_status:
+                    injured += 1
                 session.add(player)
                 matched += 1
             else:
@@ -158,7 +169,8 @@ async def sync_sleeper_ids() -> tuple[int, int]:
 
         session.commit()
 
-    logger.info(f"\nResults: {matched} matched, {unmatched} unmatched")
+    logger.info(f"\nResults: {matched} matched, {unmatched} unmatched, "
+                f"{injured} carrying an injury designation")
     if unmatched_names:
         logger.info("Unmatched players:")
         for name in unmatched_names[:20]:

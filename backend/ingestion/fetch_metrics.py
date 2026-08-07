@@ -643,6 +643,13 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                 "season": season,
                 "through_week": through_week,
                 "games_played": len(weeks),
+                # The team he earned these numbers with, taken from his LAST
+                # week of the season so a mid-season trade records where he
+                # finished. Compared against Player.team to detect who has
+                # moved — see _format_roster_changes in ai_service.py.
+                "team": _first(
+                    max(weeks, key=_order_key), "team", "recent_team", "team_abbr"
+                ),
             }
             fields.update(_compute_opportunity_efficiency(weeks, team_totals))
             fields.update(_compute_consistency_risk(weeks, injuries_by_player.get(gsis_id, [])))
