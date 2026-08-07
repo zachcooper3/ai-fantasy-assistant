@@ -3,10 +3,14 @@ SQLite engine and session setup for the fantasy football draft assistant.
 Author: Zach Cooper
 """
 
+import logging
 import os
 from pathlib import Path
 
 from sqlmodel import SQLModel, Session, create_engine
+
+# Repo root — backend/db/database.py is two levels below it.
+logger = logging.getLogger(__name__)
 
 # Repo root — backend/db/database.py is two levels below it.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -30,8 +34,22 @@ engine = create_engine(
 
 
 def create_db_and_tables() -> None:
-    """Creates all SQLModel tables. Safe to call on every startup (no-op if already exists)."""
+    """
+    Creates all SQLModel tables, then applies any additive column
+    migrations. Safe to call on every startup.
+
+    Order matters: create_all first so a brand-new database gets complete
+    tables and the migrations find nothing to do, then run_migrations to
+    catch databases created before a field was added. create_all alone
+    never alters an existing table, which is how a model change can leave
+    a live database missing a column it now assumes.
+    """
     SQLModel.metadata.create_all(engine)
+    from backend.db.migrations import run_migrations
+
+    applied = run_migrations(engine)
+    if applied:
+        logger.info("Applied column migrations: %s", ", ".join(applied))
 
 
 def get_session():

@@ -39,6 +39,13 @@ class Player(SQLModel, table=True):
 
     # --- Draft state ---
     is_available: bool = Field(default=True, index=True) # False once the player is drafted
+    # Sleeper's designation: "IR", "Out", "PUP", "Suspended", "Questionable",
+    # "Doubtful", or None when healthy. Populated by sync_sleeper_ids.py.
+    # Structured rather than left as prose in a retrieved chunk, because a
+    # player who cannot play is a hard exclusion, not a risk to weigh — and
+    # confirmed live, an IR player was recommended with that note sitting
+    # unread in the prompt.
+    injury_status: Optional[str] = Field(default=None, index=True)
 
     # --- Metadata ---
     # Timezone-aware, matching every other model here — the old naive
@@ -151,6 +158,12 @@ class PlayerMetrics(SQLModel, table=True):
     sleeper_id: Optional[str] = Field(default=None, index=True)
 
     season: int = Field(index=True)
+    # The team these numbers were earned with — NOT necessarily the player's
+    # current team. Comparing the two is what lets the app see that a
+    # teammate who took 25% of the targets has left, so the incumbent's own
+    # share understates the opportunity in front of him. See
+    # _format_roster_changes in ai_service.py.
+    team: Optional[str] = Field(default=None, index=True)
     through_week: int          # last week of data included in this snapshot
     games_played: int          # games in the window — a small-sample guard
 
