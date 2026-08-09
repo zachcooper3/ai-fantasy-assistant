@@ -490,17 +490,20 @@ export function useDraft(): DraftHook {
     if (!session?.is_active) return;
     setIsLoadingRec(true);
     try {
-      // Streamed so the pick appears at ~4s instead of ~20s. The partial
-      // result is rendered with empty alternatives/alerts and replaced by
-      // the full payload when it lands — see api.streamRecommendation.
+      // Streamed so the pick appears well before the rest. The partial
+      // result is rendered with empty best_available/needs/depth/alerts and
+      // replaced by the full payload when it lands — see
+      // api.streamRecommendation.
       const rec = await api.streamRecommendation((pick, pickNumber) => {
         // Same staleness rule as the full response below: a pick computed
         // against a board that has since moved on must not be shown, and
         // prefetching makes that routine rather than rare.
         if (pickNumber !== currentPickRef.current) return;
         setRecommendation({
-          recommendation: pick,
-          alternatives: [],
+          main: pick,
+          best_available: [],
+          needs: [],
+          depth: [],
           alerts: [],
           model: "",
           strategy: "",

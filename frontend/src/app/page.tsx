@@ -130,7 +130,7 @@ export default function DraftPage() {
     return <SetupModal onStart={startSession} />;
   }
 
-  const recommendedId = recommendation?.recommendation?.player_id;
+  const recommendedId = recommendation?.main?.player_id;
   const scarcity = board?.scarcity ?? null;
 
   return (

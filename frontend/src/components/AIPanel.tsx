@@ -2,17 +2,22 @@
 /**
  * AIPanel — AI recommendation + positional scarcity alerts.
  *
- * Shows the Claude-generated pick recommendation with its reasoning, the
- * alternatives it weighed (each with the trade-off against the main pick),
- * scarcity alerts, and recent past recommendations.
+ * Renders three sections instead of one pick plus a footnote list of
+ * alternatives: Main (the model's synthesized pick, with real reasoning),
+ * Best Available (up to 2, cheapest by ADP regardless of need), and either
+ * Needs (up to 2, fills your highest-priority open starting slot) or, once
+ * every starting slot is filled, Depth (0-1, a QB/TE stash pick). Only Main
+ * is model-generated — the rest are computed server-side from the same
+ * board data, so they're never asked of Claude at all. See the backend's
+ * RecommendationResult docstring.
  *
- * Alternatives are rendered as peers of the main recommendation rather than a
- * truncated footnote list: on the clock you are choosing between them, not
- * reading a ranked answer, and the previous one-line clamp cut the model's
- * justification off after roughly six words.
+ * Sections are allowed to overlap: the main pick is routinely also the best
+ * value on the board, or the neediest-position fill. Rather than hiding
+ * that, a card that qualifies for more than one section shows a badge for
+ * each — see PickSuggestion.tags and TAG_LABELS below.
  *
  * Falls back gracefully when no API key is configured (the backend's ADP
- * fallback reports confidence "low" and carries no strategy or trade-offs).
+ * fallback reports confidence "low" and carries no strategy).
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -26,9 +31,12 @@ import {
   Zap,
   PanelLeftClose,
   PanelLeftOpen,
+  TrendingUp,
+  Target,
+  Layers,
 } from "lucide-react";
 
-import { Confidence, Player, PickSuggestion, Recommendation, Scarcity, Survival } from "@/lib/api";
+import { Confidence, Player, PickSuggestion, Recommendation, Scarcity, SectionTag, Survival } from "@/lib/api";
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
 import ConfirmButton from "@/components/ConfirmButton";
@@ -55,8 +63,8 @@ const VALUE_STYLES = {
 } as const;
 
 /**
- * Panel width, in px, above which "Also considered" switches from a stacked
- * list to a 2-column grid.
+ * Panel width, in px, above which a 2-entry section (Best Available, Needs)
+ * switches from a stacked list to a 2-column grid.
  *
  * This can't be a Tailwind breakpoint (md:, xl:) because those respond to
  * *viewport* width, and this panel's actual width changes independently of
@@ -64,7 +72,45 @@ const VALUE_STYLES = {
  * go from ~340px to over 700px on the same screen size. Measured directly
  * with a ResizeObserver instead.
  */
-const ALT_GRID_MIN_WIDTH = 560;
+const SECTION_GRID_MIN_WIDTH = 560;
+
+/** Label + icon for each PickSuggestion.tags entry, used as a small badge on
+ * a card that qualifies for a section other than the one it's rendered
+ * under — see the module docstring on why overlap is shown, not hidden. */
+const TAG_META: Record<SectionTag, { label: string; icon: typeof TrendingUp }> = {
+  main: { label: "Main Pick", icon: Lightbulb },
+  best_available: { label: "Best Value", icon: TrendingUp },
+  needs: { label: "Fills Need", icon: Target },
+  depth: { label: "Depth Stash", icon: Layers },
+};
+
+/** Tags to badge on a card, excluding the section it's already shown under —
+ * that one is implied by which section the card appears in. */
+function otherTags(tags: SectionTag[], currentSection: SectionTag): SectionTag[] {
+  return tags.filter((t) => t !== currentSection);
+}
+
+function TagBadges({ tags, currentSection }: { tags: SectionTag[]; currentSection: SectionTag }) {
+  const shown = otherTags(tags, currentSection);
+  if (shown.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1 mt-1.5">
+      {shown.map((tag) => {
+        const meta = TAG_META[tag];
+        const Icon = meta.icon;
+        return (
+          <span
+            key={tag}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-slate-600 bg-slate-800 text-[10px] font-medium text-slate-300"
+          >
+            <Icon size={9} aria-hidden="true" />
+            {meta.label}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 /**
  * Survival badge. This is the single most decision-relevant fact on the row —
@@ -195,6 +241,67 @@ function DraftButton({
   );
 }
 
+/**
+ * One player row, shared by the Main card and every Best Available/Needs/
+ * Depth card — the only real differences between them are size (`variant`)
+ * and which section's own tag gets excluded from the overlap badges (see
+ * TagBadges above).
+ */
+function SuggestionCard({
+  suggestion,
+  section,
+  pickNumber,
+  player,
+  canDraft,
+  onDraft,
+  variant = "subtle",
+}: {
+  suggestion: PickSuggestion;
+  section: SectionTag;
+  pickNumber: number;
+  player?: Player;
+  canDraft: boolean;
+  onDraft: () => void;
+  variant?: "primary" | "subtle";
+}) {
+  const isPrimary = variant === "primary";
+  return (
+    <div className={isPrimary ? "bg-slate-800 rounded-xl p-4" : "bg-slate-800/60 rounded-xl p-3"}>
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div className="min-w-0">
+          <span className={isPrimary ? "text-lg font-bold text-white break-words" : "text-slate-100 text-sm font-semibold break-words"}>
+            {suggestion.player_name}
+          </span>
+          <span
+            className={`${isPrimary ? "ml-2 text-sm" : "ml-1.5 text-xs"} font-semibold ${
+              POS_COLORS[suggestion.position] ?? "text-slate-300"
+            }`}
+          >
+            {suggestion.position}
+          </span>
+        </div>
+        {canDraft && (
+          <DraftButton
+            playerName={suggestion.player_name}
+            onConfirm={onDraft}
+            variant={variant}
+          />
+        )}
+      </div>
+
+      <PlayerMeta suggestion={suggestion} pickNumber={pickNumber} player={player} />
+
+      {suggestion.reasoning && (
+        <p className={isPrimary ? "text-slate-300 text-sm leading-relaxed mt-2" : "text-xs text-slate-300 leading-relaxed mt-1.5"}>
+          {suggestion.reasoning}
+        </p>
+      )}
+
+      <TagBadges tags={suggestion.tags} currentSection={section} />
+    </div>
+  );
+}
+
 export default function AIPanel({
   recommendation,
   recHistory,
@@ -213,10 +320,10 @@ export default function AIPanel({
 }: Props) {
   const [showHistory, setShowHistory] = useState(false);
 
-  // Tracks this panel's actual rendered width so "Also considered" can switch
-  // to a 2-column grid once there's genuinely room for it — see
-  // ALT_GRID_MIN_WIDTH above for why this is measured rather than derived
-  // from a viewport breakpoint.
+  // Tracks this panel's actual rendered width so Best Available/Needs can
+  // switch to a 2-column grid once there's genuinely room for it — see
+  // SECTION_GRID_MIN_WIDTH above for why this is measured rather than
+  // derived from a viewport breakpoint.
   const panelRef = useRef<HTMLDivElement>(null);
   const [isWide, setIsWide] = useState(false);
 
@@ -225,7 +332,7 @@ export default function AIPanel({
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
       const width = entries[0]?.contentRect.width ?? 0;
-      setIsWide(width >= ALT_GRID_MIN_WIDTH);
+      setIsWide(width >= SECTION_GRID_MIN_WIDTH);
     });
     observer.observe(el);
     return () => observer.disconnect();
@@ -384,42 +491,19 @@ export default function AIPanel({
               </div>
             )}
 
-            {/* Main recommendation */}
-            <div className="bg-slate-800 rounded-xl p-4">
-              <div className="flex items-start justify-between gap-2 mb-1">
-                <div className="min-w-0">
-                  <span className="text-lg font-bold text-white break-words">
-                    {recommendation.recommendation.player_name}
-                  </span>
-                  <span
-                    className={`ml-2 text-sm font-semibold ${
-                      POS_COLORS[recommendation.recommendation.position] ?? "text-slate-300"
-                    }`}
-                  >
-                    {recommendation.recommendation.position}
-                  </span>
-                </div>
-                {canDraft && (
-                  <DraftButton
-                    playerName={recommendation.recommendation.player_name}
-                    onConfirm={() =>
-                      onDraftRecommended(recommendation.recommendation.player_id)
-                    }
-                  />
-                )}
-              </div>
-
-              <PlayerMeta
-                suggestion={recommendation.recommendation}
+            {/* Main — the model's synthesized pick, the only one backed by
+                real reasoning (tiers, opportunity cost, VOR, news). */}
+            <div>
+              <SuggestionCard
+                suggestion={recommendation.main}
+                section="main"
                 pickNumber={recommendation.pick_number}
-                player={playersById.get(recommendation.recommendation.player_id)}
+                player={playersById.get(recommendation.main.player_id)}
+                canDraft={canDraft}
+                onDraft={() => onDraftRecommended(recommendation.main.player_id)}
+                variant="primary"
               />
-
-              <p className="text-slate-300 text-sm leading-relaxed mt-2">
-                {recommendation.recommendation.reasoning}
-              </p>
-
-              <div className="flex items-center justify-between gap-2 mt-3">
+              <div className="flex items-center justify-between gap-2 mt-2 px-1">
                 <span
                   className={`px-2 py-0.5 rounded-full border text-xs font-medium ${confidence.className}`}
                 >
@@ -431,74 +515,84 @@ export default function AIPanel({
               </div>
             </div>
 
-            {/* While streaming, the pick arrives ~16s before the rest. Say so
-                explicitly: an empty "Also considered" would otherwise read as
-                "the model had no alternatives", which is a different and
-                much stronger claim than "they haven't finished generating". */}
+            {/* While streaming, the pick arrives well before the rest. Say so
+                explicitly: an empty Best Available/Needs section would
+                otherwise read as "there's nothing else", which is a
+                different and much stronger claim than "they haven't
+                finished generating". */}
             {recommendation.isPartial && (
               <p className="flex items-center gap-2 text-xs text-slate-400">
                 <RefreshCw size={12} className="animate-spin" aria-hidden="true" />
-                Weighing alternatives…
+                Loading best available and needs…
               </p>
             )}
 
-            {/* Alternatives — peers of the recommendation, with the trade-off
-                against it spelled out. */}
-            {recommendation.alternatives.length > 0 && (
+            {/* Best Available — pure ADP value, roster needs ignored. Never
+                model output; see the Recommendation type docstring. */}
+            {recommendation.best_available.length > 0 && (
               <div>
-                <p className="text-xs text-slate-400 uppercase font-semibold mb-2">
-                  Also considered
+                <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">
+                  <TrendingUp size={11} aria-hidden="true" />
+                  Best Available
                 </p>
-                {/* Side-by-side once the panel is genuinely wide enough (see
-                    isWide above) — a stacked list wastes the room focus mode
-                    frees up, and on the clock you're comparing these against
-                    each other, which a 2-up grid supports better than a long
-                    scroll. */}
                 <div className={isWide ? "grid grid-cols-2 gap-2 items-start" : "space-y-2"}>
-                  {recommendation.alternatives.map((alt) => (
-                    <div key={alt.player_id} className="bg-slate-800/60 rounded-xl p-3">
-                      <div className="flex items-start justify-between gap-2 mb-1">
-                        <div className="min-w-0">
-                          <span className="text-slate-100 text-sm font-semibold break-words">
-                            {alt.player_name}
-                          </span>
-                          <span
-                            className={`ml-1.5 text-xs font-semibold ${
-                              POS_COLORS[alt.position] ?? "text-slate-300"
-                            }`}
-                          >
-                            {alt.position}
-                          </span>
-                        </div>
-                        {canDraft && (
-                          <DraftButton
-                            playerName={alt.player_name}
-                            onConfirm={() => onDraftRecommended(alt.player_id)}
-                            variant="subtle"
-                          />
-                        )}
-                      </div>
-
-                      <PlayerMeta
-                        suggestion={alt}
-                        pickNumber={recommendation.pick_number}
-                        player={playersById.get(alt.player_id)}
-                      />
-
-                      {alt.reasoning && (
-                        <p className="text-xs text-slate-300 leading-relaxed mt-1.5">
-                          {alt.reasoning}
-                        </p>
-                      )}
-                      {alt.tradeoff && (
-                        <p className="text-xs text-slate-400 leading-relaxed mt-1.5 pl-2 border-l-2 border-slate-600">
-                          <span className="text-slate-400 font-medium">vs. pick: </span>
-                          {alt.tradeoff}
-                        </p>
-                      )}
-                    </div>
+                  {recommendation.best_available.map((p) => (
+                    <SuggestionCard
+                      key={p.player_id}
+                      suggestion={p}
+                      section="best_available"
+                      pickNumber={recommendation.pick_number}
+                      player={playersById.get(p.player_id)}
+                      canDraft={canDraft}
+                      onDraft={() => onDraftRecommended(p.player_id)}
+                    />
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Needs — fills your highest-priority open starting slot.
+                Empty once every slot is filled; Depth takes over below. */}
+            {recommendation.needs.length > 0 && (
+              <div>
+                <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">
+                  <Target size={11} aria-hidden="true" />
+                  Fills a Need
+                </p>
+                <div className={isWide ? "grid grid-cols-2 gap-2 items-start" : "space-y-2"}>
+                  {recommendation.needs.map((p) => (
+                    <SuggestionCard
+                      key={p.player_id}
+                      suggestion={p}
+                      section="needs"
+                      pickNumber={recommendation.pick_number}
+                      player={playersById.get(p.player_id)}
+                      canDraft={canDraft}
+                      onDraft={() => onDraftRecommended(p.player_id)}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Depth — a QB/TE stash, only ever shown once Needs is empty. */}
+            {recommendation.depth.length > 0 && (
+              <div>
+                <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">
+                  <Layers size={11} aria-hidden="true" />
+                  Depth Stash
+                </p>
+                {recommendation.depth.map((p) => (
+                  <SuggestionCard
+                    key={p.player_id}
+                    suggestion={p}
+                    section="depth"
+                    pickNumber={recommendation.pick_number}
+                    player={playersById.get(p.player_id)}
+                    canDraft={canDraft}
+                    onDraft={() => onDraftRecommended(p.player_id)}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -528,18 +622,18 @@ export default function AIPanel({
                   <div className="flex items-center gap-2">
                     <span className="text-slate-400 tabular-nums">#{past.pickNumber}</span>
                     <span className="text-slate-100 font-medium">
-                      {past.recommendation.recommendation.player_name}
+                      {past.recommendation.main.player_name}
                     </span>
                     <span
                       className={
-                        POS_COLORS[past.recommendation.recommendation.position] ?? "text-slate-300"
+                        POS_COLORS[past.recommendation.main.position] ?? "text-slate-300"
                       }
                     >
-                      {past.recommendation.recommendation.position}
+                      {past.recommendation.main.position}
                     </span>
                   </div>
                   <p className="text-slate-400 leading-relaxed mt-1">
-                    {past.recommendation.recommendation.reasoning}
+                    {past.recommendation.main.reasoning}
                   </p>
                 </div>
               ))}

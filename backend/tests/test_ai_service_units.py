@@ -54,8 +54,17 @@ from backend.app.services.ai_service import (
     _SURVIVAL_GONE,
     _SURVIVAL_SAFE,
     _SURVIVAL_TOSSUP,
-    _MAX_ALTERNATIVES,
     _LISTED_PLAYERS,
+    _best_available,
+    _needs,
+    _depth_pick,
+    _tag_overlaps,
+    _build_sections,
+    _compute_gap_info,
+    _TAG_MAIN,
+    _TAG_BEST_AVAILABLE,
+    _TAG_NEEDS,
+    _TAG_DEPTH,
 )
 
 
@@ -119,17 +128,12 @@ def ctx_with_available(*ids: int) -> RecommendationContext:
     )
 
 
-def valid_payload(rec_id=1, alt_ids=(2, 3)) -> dict:
+def valid_payload(main_id=1) -> dict:
     return {
-        "recommendation": {
-            "player_id": rec_id, "player_name": "P", "position": "RB",
+        "main": {
+            "player_id": main_id, "player_name": "P", "position": "RB",
             "adp": 1.0, "reasoning": "best available",
         },
-        "alternatives": [
-            {"player_id": i, "player_name": f"A{i}", "position": "RB",
-             "adp": float(i), "reasoning": ""}
-            for i in alt_ids
-        ],
         "alerts": ["tier break at RB"],
     }
 
@@ -137,8 +141,7 @@ def valid_payload(rec_id=1, alt_ids=(2, 3)) -> dict:
 def test_valid_json_parses():
     result = _parse_response(json.dumps(valid_payload()), ctx_with_available(1, 2, 3))
     assert result is not None
-    assert result.recommendation.player_id == 1
-    assert [a.player_id for a in result.alternatives] == [2, 3]
+    assert result.main.player_id == 1
     assert result.alerts == ["tier break at RB"]
 
 
@@ -151,50 +154,30 @@ def test_garbage_returns_none():
     assert _parse_response("I think you should draft Gibbs!", ctx_with_available(1)) is None
 
 
-def test_missing_recommendation_returns_none():
-    assert _parse_response(json.dumps({"alternatives": []}), ctx_with_available(1)) is None
+def test_missing_main_returns_none():
+    assert _parse_response(json.dumps({"alerts": []}), ctx_with_available(1)) is None
 
 
 def test_unavailable_player_returns_none():
     # Claude recommending someone who's already drafted must fall back
-    result = _parse_response(json.dumps(valid_payload(rec_id=99)), ctx_with_available(1, 2, 3))
+    result = _parse_response(json.dumps(valid_payload(main_id=99)), ctx_with_available(1, 2, 3))
     assert result is None
 
 
 def test_string_player_id_is_coerced_not_rejected():
     payload = valid_payload()
-    payload["recommendation"]["player_id"] = "1"  # Claude sometimes stringifies
+    payload["main"]["player_id"] = "1"  # Claude sometimes stringifies
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
     assert result is not None
-    assert result.recommendation.player_id == 1
-
-
-def test_unavailable_alternatives_are_dropped_and_capped():
-    # Cap is _MAX_ALTERNATIVES; anything past it is discarded before the
-    # availability filter runs, so an unavailable id inside the cap still
-    # costs you a slot. Six offered, five kept, 99 then dropped as invalid.
-    payload = valid_payload(alt_ids=(2, 99, 3, 4, 5, 6))
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3, 4, 5, 6))
-    assert len(payload["alternatives"]) > _MAX_ALTERNATIVES
-    # Cap applies first, then the availability filter: the first
-    # _MAX_ALTERNATIVES entries are [2, 99, 3, 4], and 99 is then dropped.
-    assert [a.player_id for a in result.alternatives] == [2, 3, 4]
-
-
-def test_malformed_alternative_entries_are_skipped():
-    payload = valid_payload(alt_ids=(2,))
-    payload["alternatives"].append("not a dict")
-    payload["alternatives"].append({"player_id": "not-an-int"})
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
-    assert [a.player_id for a in result.alternatives] == [2]
+    assert result.main.player_id == 1
 
 
 # ---------------------------------------------------------------------------
-# _parse_response — strategy / confidence / tradeoff
+# _parse_response — strategy / confidence
 #
-# These three fields are presentational extras. The rule they all share: a
-# missing or malformed value must degrade to a default, never reject an
-# otherwise-valid recommendation to the ADP fallback.
+# These fields are presentational extras. The rule they share: a missing or
+# malformed value must degrade to a default, never reject an otherwise-valid
+# recommendation to the ADP fallback.
 # ---------------------------------------------------------------------------
 
 def test_strategy_and_confidence_are_parsed():
@@ -206,21 +189,13 @@ def test_strategy_and_confidence_are_parsed():
     assert result.confidence == "high"
 
 
-def test_alternative_tradeoff_is_parsed():
-    payload = valid_payload(alt_ids=(2,))
-    payload["alternatives"][0]["tradeoff"] = "Safer floor, less weekly ceiling."
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
-    assert result.alternatives[0].tradeoff == "Safer floor, less weekly ceiling."
-
-
 def test_missing_extras_fall_back_to_defaults():
-    # valid_payload() has no strategy/confidence/tradeoff at all — the shape
-    # Claude returned before these fields existed.
+    # valid_payload() has no strategy/confidence at all — the shape Claude
+    # returned before these fields existed.
     result = _parse_response(json.dumps(valid_payload()), ctx_with_available(1, 2, 3))
     assert result is not None
     assert result.strategy == ""
     assert result.confidence == "medium"
-    assert all(a.tradeoff == "" for a in result.alternatives)
 
 
 def test_unrecognised_confidence_normalises_to_medium():
@@ -248,13 +223,6 @@ def test_non_string_strategy_is_dropped_not_stringified():
     assert result.strategy == ""
 
 
-def test_non_string_tradeoff_is_dropped_not_stringified():
-    payload = valid_payload(alt_ids=(2,))
-    payload["alternatives"][0]["tradeoff"] = ["a", "list"]
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
-    assert result.alternatives[0].tradeoff == ""
-
-
 # ---------------------------------------------------------------------------
 # Response-size guards
 #
@@ -263,25 +231,9 @@ def test_non_string_tradeoff_is_dropped_not_stringified():
 # the ADP fallback — the failure this suite exists to catch early.
 # ---------------------------------------------------------------------------
 
-def test_alternatives_cap_matches_the_documented_constant():
-    # The prompt tells Claude "at most _MAX_ALTERNATIVES"; the parser enforces
-    # the same number. If these drift, the model spends output budget on
-    # entries that are discarded unread.
-    payload = valid_payload(alt_ids=tuple(range(2, 12)))
-    result = _parse_response(json.dumps(payload), ctx_with_available(*range(1, 12)))
-    assert len(result.alternatives) <= _MAX_ALTERNATIVES
-
-
-def test_prompt_states_the_alternatives_cap():
-    ctx = ctx_with_available(1, 2, 3)
-    prompt = _build_prompt(ctx)
-    assert str(_MAX_ALTERNATIVES) in prompt
-    assert "alternatives" in prompt
-
-
 def test_truncated_json_returns_none_rather_than_raising():
     # What a max_tokens cut-off actually looks like: valid opening, no close.
-    truncated = json.dumps(valid_payload())[:120]
+    truncated = json.dumps(valid_payload())[:60]
     assert _parse_response(truncated, ctx_with_available(1, 2, 3)) is None
 
 
@@ -296,66 +248,37 @@ def test_truncated_json_returns_none_rather_than_raising():
 
 def test_player_name_comes_from_our_data_not_claudes():
     payload = valid_payload()
-    payload["recommendation"]["player_name"] = "Some Drafted Guy"
+    payload["main"]["player_name"] = "Some Drafted Guy"
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
     # ctx_with_available names players P{id}
-    assert result.recommendation.player_name == "P1"
+    assert result.main.player_name == "P1"
 
 
 def test_position_and_adp_come_from_our_data_not_claudes():
     payload = valid_payload()
-    payload["recommendation"]["position"] = "QB"   # actually RB in our data
-    payload["recommendation"]["adp"] = 999.0       # actually 1.0
+    payload["main"]["position"] = "QB"   # actually RB in our data
+    payload["main"]["adp"] = 999.0       # actually 1.0
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
-    assert result.recommendation.position == "RB"
-    assert result.recommendation.adp == 1.0
+    assert result.main.position == "RB"
+    assert result.main.adp == 1.0
 
 
-def test_alternative_fields_are_also_taken_from_our_data():
-    payload = valid_payload(alt_ids=(2,))
-    payload["alternatives"][0]["player_name"] = "Wrong Name"
-    payload["alternatives"][0]["adp"] = 0.1
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
-    assert result.alternatives[0].player_name == "P2"
-    assert result.alternatives[0].adp == 2.0
-
-
-def test_reasoning_and_tradeoff_still_come_from_claude():
+def test_reasoning_still_comes_from_claude():
     # The model's judgement is the one thing it does supply.
-    payload = valid_payload(alt_ids=(2,))
-    payload["recommendation"]["reasoning"] = "Elite volume in a good offence."
-    payload["alternatives"][0]["tradeoff"] = "Higher floor, lower ceiling."
+    payload = valid_payload()
+    payload["main"]["reasoning"] = "Elite volume in a good offence."
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
-    assert result.recommendation.reasoning == "Elite volume in a good offence."
-    assert result.alternatives[0].tradeoff == "Higher floor, lower ceiling."
+    assert result.main.reasoning == "Elite volume in a good offence."
 
 
 def test_suggestion_missing_name_and_adp_entirely_still_parses():
     # Those fields are ours now, so Claude omitting them is harmless.
-    payload = valid_payload(alt_ids=(2,))
+    payload = valid_payload()
     for key in ("player_name", "position", "adp"):
-        payload["recommendation"].pop(key)
-        payload["alternatives"][0].pop(key)
+        payload["main"].pop(key)
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2))
     assert result is not None
-    assert result.recommendation.player_name == "P1"
-    assert result.alternatives[0].player_name == "P2"
-
-
-def test_alternatives_outside_the_available_list_are_dropped_not_kept():
-    # The silent-shrink case: Claude names a real player who isn't in
-    # top_available, so _pick rejects them and 3 alternatives become 2.
-    payload = valid_payload(alt_ids=(2, 999, 3))
-    result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
-    assert [a.player_id for a in result.alternatives] == [2, 3]
-
-
-def test_prompt_asks_for_ids_from_the_listed_players_in_alternatives_too():
-    # Only the recommendation carried this constraint originally, which let
-    # Claude spend tokens on alternatives that were then discarded unread.
-    prompt = _build_prompt(ctx_with_available(1, 2, 3))
-    # The JSON template block should constrain both id fields identically.
-    assert prompt.count('"<int from the tiers above>"') >= 2
+    assert result.main.player_name == "P1"
 
 
 # ---------------------------------------------------------------------------
@@ -1233,11 +1156,6 @@ def test_missing_considered_does_not_reject_the_recommendation():
     assert result.considered == []
 
 
-def test_prompt_requires_alternatives_to_span_two_positions():
-    prompt = _build_prompt(ctx_with_available(1, 2, 3))
-    assert "at least TWO different positions" in prompt
-
-
 def test_temperature_allows_variation_without_being_random():
     assert 0.0 < _TEMPERATURE <= 0.5
 
@@ -1334,13 +1252,13 @@ def test_alert_suppressed_when_the_model_engaged_with_that_player():
 def test_guard_appends_an_alert_without_rejecting_the_pick():
     ctx = _dom_ctx()
     payload = {
-        "recommendation": {"player_id": 2, "player_name": "Worse WR",
-                           "position": "WR", "adp": 21.3, "reasoning": "volume"},
-        "alternatives": [], "alerts": ["existing alert"],
+        "main": {"player_id": 2, "player_name": "Worse WR",
+                 "position": "WR", "adp": 21.3, "reasoning": "volume"},
+        "alerts": ["existing alert"],
     }
     result = _parse_response(json.dumps(payload), ctx)
     assert result is not None                      # never blocks
-    assert result.recommendation.player_id == 2    # never rewrites the pick
+    assert result.main.player_id == 2               # never rewrites the pick
     assert result.alerts[0] == "existing alert"    # appended last
     assert any(a.startswith("Check this") for a in result.alerts)
 
@@ -1489,46 +1407,49 @@ def _survival_ctx_for(adps, horizon=41):
     return ctx
 
 
-def test_survival_code_is_attached_to_recommendation_and_alternatives():
+def test_survival_code_is_attached_to_main():
     ctx = _survival_ctx_for([11.5, 38.0, 90.0])
     payload = {
-        "recommendation": {"player_id": 1, "player_name": "P1", "position": "RB",
-                           "adp": 11.5, "reasoning": "x"},
-        "alternatives": [
-            {"player_id": 2, "player_name": "P2", "position": "RB", "adp": 38.0, "reasoning": "x"},
-            {"player_id": 3, "player_name": "P3", "position": "RB", "adp": 90.0, "reasoning": "x"},
-        ],
+        "main": {"player_id": 1, "player_name": "P1", "position": "RB",
+                 "adp": 11.5, "reasoning": "x"},
         "alerts": [],
     }
     r = _parse_response(json.dumps(payload), ctx)
-    assert r.recommendation.survival == "take_now"
-    assert [a.survival for a in r.alternatives] == ["might_last", "will_last"]
+    assert r.main.survival == "take_now"
+
+
+def test_survival_code_is_attached_to_best_available_entries():
+    # best_available is never model output (see _best_available) but still
+    # has to carry the same computed survival badge as main.
+    ctx = _survival_ctx_for([38.0, 90.0])
+    best = _best_available(ctx, due_late_gaps={})
+    assert [p.survival for p in best] == ["might_last", "will_last"]
 
 
 def test_survival_is_empty_without_a_next_turn():
     # Last pick of the draft: nothing to survive to, so no badge rather than
     # a misleading one.
     ctx = _survival_ctx_for([11.5], horizon=None)
-    payload = {"recommendation": {"player_id": 1, "player_name": "P1",
-                                  "position": "RB", "adp": 11.5, "reasoning": "x"},
-               "alternatives": [], "alerts": []}
-    assert _parse_response(json.dumps(payload), ctx).recommendation.survival == ""
+    payload = {"main": {"player_id": 1, "player_name": "P1",
+                        "position": "RB", "adp": 11.5, "reasoning": "x"},
+               "alerts": []}
+    assert _parse_response(json.dumps(payload), ctx).main.survival == ""
 
 
 def test_survival_is_computed_not_taken_from_the_model():
     # The model claiming otherwise must not change the badge.
     ctx = _survival_ctx_for([90.0])
-    payload = {"recommendation": {"player_id": 1, "player_name": "P1", "position": "RB",
-                                  "adp": 90.0, "reasoning": "x", "survival": "take_now"},
-               "alternatives": [], "alerts": []}
-    assert _parse_response(json.dumps(payload), ctx).recommendation.survival == "will_last"
+    payload = {"main": {"player_id": 1, "player_name": "P1", "position": "RB",
+                        "adp": 90.0, "reasoning": "x", "survival": "take_now"},
+               "alerts": []}
+    assert _parse_response(json.dumps(payload), ctx).main.survival == "will_last"
 
 
 def test_fallback_carries_a_survival_tag_too():
     from backend.app.services.ai_service import _fallback
     ctx = _survival_ctx_for([11.5, 38.0])
     result = _fallback(ctx, "test-model")
-    assert result.recommendation.survival == "take_now"
+    assert result.main.survival == "take_now"
 
 
 def test_survival_codes_are_stable_regardless_of_prompt_wording():
@@ -1753,39 +1674,39 @@ def test_retrieval_survives_a_vector_store_failure(monkeypatch):
 
 def test_extracts_the_pick_before_the_rest_arrives():
     partial = ('{"strategy": "go RB", "confidence": "high", '
-               '"recommendation": {"player_id": 7, "reasoning": "volume"}, '
-               '"alternatives": [{"player_id')          # cut mid-token
-    got = _extract_complete_object(partial, "recommendation")
+               '"main": {"player_id": 7, "reasoning": "volume"}, '
+               '"considered": [{"player_id')          # cut mid-token
+    got = _extract_complete_object(partial, "main")
     assert got == {"player_id": 7, "reasoning": "volume"}
 
 
 def test_returns_none_while_the_object_is_still_arriving():
-    for partial in ('{"recommendation": {"player_id": 7, "reason',
-                    '{"recommendation": {',
+    for partial in ('{"main": {"player_id": 7, "reason',
+                    '{"main": {',
                     '{"strategy": "x"',
                     ''):
-        assert _extract_complete_object(partial, "recommendation") is None
+        assert _extract_complete_object(partial, "main") is None
 
 
 def test_a_brace_inside_prose_does_not_close_the_object_early():
     # Without string-awareness this returns a truncated pick — and the
     # streamed pick is the one the user acts on.
-    partial = ('{"recommendation": {"player_id": 7, '
-               '"reasoning": "a bell-cow {sic} back"}, "alternatives": []}')
-    got = _extract_complete_object(partial, "recommendation")
+    partial = ('{"main": {"player_id": 7, '
+               '"reasoning": "a bell-cow {sic} back"}, "considered": []}')
+    got = _extract_complete_object(partial, "main")
     assert got["reasoning"] == "a bell-cow {sic} back"
     assert got["player_id"] == 7
 
 
 def test_escaped_quotes_do_not_break_string_tracking():
-    partial = ('{"recommendation": {"player_id": 7, '
+    partial = ('{"main": {"player_id": 7, '
                '"reasoning": "they call him \\"the truth\\""}, "x": 1}')
-    got = _extract_complete_object(partial, "recommendation")
+    got = _extract_complete_object(partial, "main")
     assert got["player_id"] == 7
 
 
 def test_missing_key_is_not_an_error():
-    assert _extract_complete_object('{"alternatives": []}', "recommendation") is None
+    assert _extract_complete_object('{"considered": []}', "main") is None
 
 
 def test_streamed_pick_is_validated_like_a_batch_one():
@@ -2478,3 +2399,163 @@ def test_an_empty_position_is_simply_absent(monkeypatch):
     _fake_pool(monkeypatch, pool)
     board = _load_board(None, top_n=30, per_position=6)
     assert {p["position"] for p in board} == {"WR"}
+
+
+# ---------------------------------------------------------------------------
+# Deterministic recommendation sections — best_available / needs / depth
+#
+# These replaced the model-authored "alternatives" list entirely — see
+# RecommendationResult's docstring in ai_service.py. All three are computed
+# straight from ctx.top_available and the gap math (_compute_gap_info), with
+# no Claude call involved, specifically to keep output tokens down: "who's
+# cheapest by ADP" doesn't need a model.
+# ---------------------------------------------------------------------------
+
+def _sections_ctx(top_available, my_roster=None, starting_lineup=None,
+                   round_number=1, total_rounds=15, available_counts=None):
+    return RecommendationContext(
+        pick_number=1, round_number=round_number, my_slot=1, league_size=12,
+        is_my_turn=True, picks_until_my_turn=0, my_next_pick_number=1,
+        total_rounds=total_rounds,
+        top_available=top_available,
+        my_roster=my_roster or [],
+        starting_lineup=starting_lineup or {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "DST": 1},
+        available_counts=available_counts or {},
+    )
+
+
+def test_best_available_ignores_position_takes_cheapest_two():
+    board = [
+        {"id": 1, "rank": 1, "name": "WR1", "position": "WR", "team": "X", "adp": 50.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "RB1", "position": "RB", "team": "X", "adp": 10.0, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "QB1", "position": "QB", "team": "X", "adp": 30.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    out = _best_available(ctx, due_late_gaps={})
+    assert [p.player_id for p in out] == [2, 3]   # cheapest two by ADP
+    assert all(p.tags == [_TAG_BEST_AVAILABLE] for p in out)
+
+
+def test_best_available_excludes_dst_until_due():
+    board = [
+        {"id": 1, "rank": 1, "name": "Some Defense", "position": "DST", "team": "X", "adp": 5.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "RB1", "position": "RB", "team": "X", "adp": 50.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    not_due = _best_available(ctx, due_late_gaps={})
+    assert "Some Defense" not in {p.player_name for p in not_due}
+
+    due = _best_available(ctx, due_late_gaps={"DST": 1})
+    assert "Some Defense" in {p.player_name for p in due}
+
+
+def test_best_available_caps_at_two():
+    board = [{"id": i, "rank": i, "name": f"P{i}", "position": "WR", "team": "X",
+              "adp": float(i), "sleeper_id": None} for i in range(1, 10)]
+    ctx = _sections_ctx(board)
+    assert len(_best_available(ctx, due_late_gaps={})) == 2
+
+
+def test_needs_fills_highest_priority_open_position_first():
+    # QB and RB both open; only QB has a real candidate slate (cheapest +
+    # best VOR), so both needs slots go to QB rather than one each,
+    # matching _POSITION_PRIORITY rather than alphabetical accident.
+    board = [
+        {"id": 1, "rank": 1, "name": "QB-cheap", "position": "QB", "team": "X", "adp": 40.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "QB-best", "position": "QB", "team": "X", "adp": 55.0, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "RB-only", "position": "RB", "team": "X", "adp": 10.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board, my_roster=[])
+    ctx.player_metrics = {2: {"fantasy_points_avg": 20.0}}
+    ctx.replacement_ppg = {"QB": 15.0}
+    skill_gaps = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1}
+    out = _needs(ctx, skill_gaps, due_late_gaps={})
+    assert [p.player_id for p in out] == [1, 2]
+    assert all(p.tags == [_TAG_NEEDS] for p in out)
+
+
+def test_needs_moves_to_next_position_when_one_slot_remains():
+    # QB has only a cheapest candidate (no VOR data), so its second slot is
+    # unfillable — the leftover slot goes to the next open position rather
+    # than being left empty.
+    board = [
+        {"id": 1, "rank": 1, "name": "QB-only", "position": "QB", "team": "X", "adp": 40.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "RB-only", "position": "RB", "team": "X", "adp": 10.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    skill_gaps = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1}
+    out = _needs(ctx, skill_gaps, due_late_gaps={})
+    assert [p.player_id for p in out] == [1, 2]
+
+
+def test_needs_is_empty_once_the_lineup_is_full():
+    board = [{"id": 1, "rank": 1, "name": "WR1", "position": "WR", "team": "X",
+              "adp": 10.0, "sleeper_id": None}]
+    ctx = _sections_ctx(board, my_roster=roster("QB", "RB", "RB", "WR", "WR", "TE", "RB", "DST"))
+    assert _needs(ctx, {}, {}) == []
+
+
+def test_depth_fires_only_when_needs_is_empty_and_only_for_qb_te():
+    board = [
+        {"id": 1, "rank": 1, "name": "QB2", "position": "QB", "team": "X", "adp": 180.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "RB-bench", "position": "RB", "team": "X", "adp": 170.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+
+    # needs non-empty -> depth stays empty even though QB/TE candidates exist
+    fake_needs = [PickSuggestion(9, "placeholder", "TE", 1.0, "")]
+    assert _depth_pick(ctx, fake_needs) == []
+
+    # needs empty -> depth picks the cheapest QB/TE, never the cheaper RB
+    depth = _depth_pick(ctx, [])
+    assert len(depth) == 1
+    assert depth[0].player_id == 1
+    assert depth[0].tags == [_TAG_DEPTH]
+
+
+def test_tag_overlaps_merges_tags_for_the_same_player():
+    main = PickSuggestion(1, "Shared", "RB", 10.0, "reason")
+    best_available = [
+        PickSuggestion(1, "Shared", "RB", 10.0, "value", tags=[_TAG_BEST_AVAILABLE]),
+        PickSuggestion(2, "Other", "WR", 20.0, "value", tags=[_TAG_BEST_AVAILABLE]),
+    ]
+    needs = [PickSuggestion(1, "Shared", "RB", 10.0, "need", tags=[_TAG_NEEDS])]
+    _tag_overlaps(main, best_available, needs, [])
+    assert main.tags == [_TAG_MAIN, _TAG_BEST_AVAILABLE, _TAG_NEEDS]
+    assert best_available[0].tags == [_TAG_MAIN, _TAG_BEST_AVAILABLE, _TAG_NEEDS]
+    assert best_available[1].tags == [_TAG_BEST_AVAILABLE]
+    assert needs[0].tags == [_TAG_MAIN, _TAG_BEST_AVAILABLE, _TAG_NEEDS]
+    # Mutating one player's tags must not silently mutate another's — each
+    # occurrence gets its own list, not a shared reference.
+    main.tags.append("mutated")
+    assert "mutated" not in best_available[0].tags
+
+
+def test_build_sections_never_exceeds_the_five_slot_budget():
+    board = (
+        [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+          "adp": float(i), "sleeper_id": None} for i in range(1, 10)]
+        + [{"id": 100 + i, "rank": 100 + i, "name": f"RB{i}", "position": "RB",
+            "team": "X", "adp": float(100 + i), "sleeper_id": None} for i in range(5)]
+    )
+    ctx = _sections_ctx(board, my_roster=[])
+    main = PickSuggestion(1, "WR1", "WR", 1.0, "top pick")
+    best_available, needs, depth = _build_sections(ctx, main)
+    total = 1 + len(best_available) + len(needs) + len(depth)
+    assert total <= 5
+    assert len(best_available) <= 2
+    assert len(needs) <= 2
+    assert len(depth) <= 1
+    assert not (needs and depth)   # mutually exclusive by construction
+
+
+def test_parse_response_populates_the_deterministic_sections():
+    ctx = ctx_with_available(1, 2, 3)
+    result = _parse_response(json.dumps(valid_payload()), ctx)
+    assert result is not None
+    # ctx_with_available's roster is empty and only stocks RB players, so
+    # best_available draws from the same small pool as main.
+    assert result.best_available
+    assert all(p.player_id in {1, 2, 3} for p in result.best_available)
+    # main always carries at least its own "main" tag once sections are built.
+    assert _TAG_MAIN in result.main.tags

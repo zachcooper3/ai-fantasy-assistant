@@ -2,8 +2,8 @@
 Recommendation endpoints.
 
 GET /api/recommend/pick                    — AI pick for the current draft state
-GET /api/recommend/pick/stream             — same, as SSE; the pick arrives well
-                                             before the alternatives finish
+GET /api/recommend/pick/stream             — same, as SSE; the main pick arrives
+                                             well before considered/alerts finish
 GET /api/recommend/handcuff?player_id=X   — handcuff target for a drafted RB
 GET /api/recommend/scarcity               — positional scarcity analysis
 
@@ -62,10 +62,12 @@ class PickSuggestionResponse(BaseModel):
     position: str
     adp: float
     reasoning: str
-    # Populated on alternatives only: what taking this player instead of the
-    # main recommendation gains and costs. Empty string when absent (older
-    # model output, or the no-AI fallback path).
-    tradeoff: str = ""
+    # Which RecommendationResponse section(s) this player appears in — e.g.
+    # ["main"], ["best_available"], or both when the same player wins two
+    # sections. See PickSuggestion.tags in ai_service.py: overlap is kept,
+    # not deduplicated away, because it's meaningful ("this is also your
+    # best value on the board"), not redundant.
+    tags: list[str] = []
     # "take_now" | "might_last" | "will_last", or "" on the last pick of the
     # draft. Computed server-side from ADP vs the horizon pick — see
     # PickSuggestion.survival — so the badge always matches the prompt.
@@ -73,8 +75,18 @@ class PickSuggestionResponse(BaseModel):
 
 
 class RecommendationResponse(BaseModel):
-    recommendation: PickSuggestionResponse
-    alternatives: list[PickSuggestionResponse]
+    # The model's single synthesized pick. best_available/needs/depth below
+    # are NOT model output — see RecommendationResult's docstring in
+    # ai_service.py — they're computed straight from the same board data,
+    # specifically to keep this endpoint's Claude-generation cost down.
+    main: PickSuggestionResponse
+    # Up to 2, cheapest by ADP regardless of roster need.
+    best_available: list[PickSuggestionResponse]
+    # Up to 2, the realistic slate at your highest-priority open starting
+    # slot. Empty once every starting slot is filled.
+    needs: list[PickSuggestionResponse]
+    # 0 or 1. A QB/TE stash pick, only ever present when `needs` is empty.
+    depth: list[PickSuggestionResponse]
     alerts: list[str]
     model: str
     # One sentence on the roster's shape and what this pick does about it.
@@ -83,6 +95,10 @@ class RecommendationResponse(BaseModel):
     confidence: str = "medium"
     # One line per must-evaluate player: taken, or passed and why. Surfaces
     # omission, which is how every live mis-recommendation has manifested.
+    # Not rendered anywhere in the UI — kept purely as a server-side
+    # reliability signal (see ai_service._shortlist's docstring), so it
+    # still costs generation tokens but not bandwidth-worth-caring-about or
+    # screen space.
     considered: list[str] = []
     # Draft context echoed back for the frontend
     pick_number: int
@@ -544,8 +560,10 @@ async def recommend_pick(
     result = await ai.recommend(ctx)
 
     return RecommendationResponse(
-        recommendation=PickSuggestionResponse(**result.recommendation.__dict__),
-        alternatives=[PickSuggestionResponse(**a.__dict__) for a in result.alternatives],
+        main=PickSuggestionResponse(**result.main.__dict__),
+        best_available=[PickSuggestionResponse(**p.__dict__) for p in result.best_available],
+        needs=[PickSuggestionResponse(**p.__dict__) for p in result.needs],
+        depth=[PickSuggestionResponse(**p.__dict__) for p in result.depth],
         alerts=result.alerts,
         model=result.model,
         strategy=result.strategy,
@@ -568,13 +586,13 @@ async def recommend_pick_stream(
     pick can be shown before the rest of the response finishes generating.
 
     Two event types:
-        event: pick      — the recommendation alone, ~4s in
+        event: pick      — the main pick alone, well before the rest
         event: complete  — the full payload, identical to GET /pick
 
-    Total time is the same. Generation is sequential and output-bound (about
-    1,660 tokens at ~75 tok/sec), so the batch endpoint shows nothing for
-    twenty seconds while the answer has in fact existed since second four.
-    This changes only when it becomes visible.
+    Total time is the same — generation is sequential, so the batch endpoint
+    shows nothing until the whole response lands even though the pick itself
+    finished streaming much earlier. This changes only when it becomes
+    visible.
 
     GET /pick is deliberately kept: it is simpler to call, and a client that
     does not need progressive rendering should not have to parse an event
@@ -597,13 +615,15 @@ async def recommend_pick_stream(
             async for kind, value in ai.recommend_stream(ctx):
                 if kind == "pick":
                     yield _event("pick", {
-                        "recommendation": PickSuggestionResponse(**value.__dict__).model_dump(),
+                        "main": PickSuggestionResponse(**value.__dict__).model_dump(),
                         "pick_number": ctx.pick_number,
                     })
                 else:
                     yield _event("complete", RecommendationResponse(
-                        recommendation=PickSuggestionResponse(**value.recommendation.__dict__),
-                        alternatives=[PickSuggestionResponse(**a.__dict__) for a in value.alternatives],
+                        main=PickSuggestionResponse(**value.main.__dict__),
+                        best_available=[PickSuggestionResponse(**p.__dict__) for p in value.best_available],
+                        needs=[PickSuggestionResponse(**p.__dict__) for p in value.needs],
+                        depth=[PickSuggestionResponse(**p.__dict__) for p in value.depth],
                         alerts=value.alerts,
                         model=value.model,
                         strategy=value.strategy,

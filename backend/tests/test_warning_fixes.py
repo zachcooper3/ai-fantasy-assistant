@@ -99,7 +99,7 @@ def test_unexpected_exception_falls_back_not_raises():
 
     result = asyncio.run(make_service_with(boom).recommend(simple_ctx()))
     assert result.model.endswith(":fallback")
-    assert result.recommendation.player_id == 1  # top ADP
+    assert result.main.player_id == 1  # top ADP
 
 
 def test_empty_content_falls_back():
@@ -116,9 +116,9 @@ def test_non_text_first_block_is_skipped_not_crashed():
 
     class TextBlock:
         text = (
-            '{"recommendation": {"player_id": 2, "player_name": "Bravo Wide", '
+            '{"main": {"player_id": 2, "player_name": "Bravo Wide", '
             '"position": "WR", "adp": 2.1, "reasoning": "ok"}, '
-            '"alternatives": [], "alerts": []}'
+            '"alerts": []}'
         )
 
     class Response:
@@ -126,16 +126,18 @@ def test_non_text_first_block_is_skipped_not_crashed():
 
     result = asyncio.run(make_service_with(Response).recommend(simple_ctx()))
     assert not result.model.endswith(":fallback")
-    assert result.recommendation.player_id == 2
+    assert result.main.player_id == 2
 
 
-def test_no_client_uses_fallback_with_alternatives():
+def test_no_client_uses_fallback_with_best_available():
     svc = AIService.__new__(AIService)
     svc._client = None
     svc._model = "test-model"
     result = asyncio.run(svc.recommend(simple_ctx()))
     assert result.model.endswith(":fallback")
-    assert [a.player_id for a in result.alternatives] == [2]
+    # best_available is deterministic, not model output — see _best_available
+    # — so the fallback path computes it identically to a live recommendation.
+    assert [p.player_id for p in result.best_available] == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +156,7 @@ def test_recommend_route_returns_fallback(client, seeded_players):
     assert r.status_code == 200
     body = r.json()
     assert body["model"].endswith(":fallback")
-    assert body["recommendation"]["player_id"] == 1  # best ADP on the board
+    assert body["main"]["player_id"] == 1  # best ADP on the board
 
 
 def test_recommend_route_404_when_board_empty(client):

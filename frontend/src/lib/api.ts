@@ -98,14 +98,20 @@ export interface Board {
 // Recommendation types
 // ---------------------------------------------------------------------------
 
+/** Which Recommendation section(s) a player appears in — see Recommendation's
+ * docstring. A player can carry more than one tag; overlap is meaningful
+ * (e.g. "this is both the main pick and your best value on the board") and
+ * is never deduplicated away. */
+export type SectionTag = "main" | "best_available" | "needs" | "depth";
+
 export interface PickSuggestion {
   player_id: number;
   player_name: string;
   position: string;
   adp: number;
   reasoning: string;
-  /** Alternatives only: what this player gains and costs vs. the main pick. */
-  tradeoff: string;
+  /** Which Recommendation section(s) this entry appears in. */
+  tags: SectionTag[];
   /**
    * Whether this player is expected to survive to your next turn, computed
    * server-side from ADP vs. the horizon pick. Empty on the last pick of a
@@ -123,8 +129,27 @@ export type Survival = "take_now" | "might_last" | "will_last" | "";
 export type Confidence = "high" | "medium" | "low";
 
 export interface Recommendation {
-  recommendation: PickSuggestion;
-  alternatives: PickSuggestion[];
+  /**
+   * The model's single synthesized pick — the only entry backed by real
+   * reasoning (tiers, opportunity cost, VOR, news). best_available/needs/
+   * depth below are NOT model output: they're computed server-side straight
+   * from the same board data ("cheapest by ADP" / "fills your open slot" is
+   * a lookup, not a judgement call), specifically to keep generation cost
+   * down. See the backend's RecommendationResult docstring.
+   */
+  main: PickSuggestion;
+  /** Up to 2, cheapest by ADP regardless of roster need. */
+  best_available: PickSuggestion[];
+  /**
+   * Up to 2, the realistic slate at your highest-priority open starting
+   * slot. Empty once every starting slot is filled — see `depth`.
+   */
+  needs: PickSuggestion[];
+  /**
+   * 0 or 1. A QB/TE stash pick, only ever present when `needs` is empty —
+   * nowhere else does this app ever suggest a second QB/TE.
+   */
+  depth: PickSuggestion[];
   alerts: string[];
   model: string;
   /** One sentence on the roster's shape and what this pick does about it. */
@@ -135,17 +160,18 @@ export interface Recommendation {
    * One line per must-evaluate player: taken, or passed and why. Exists to
    * make omission visible — every live mis-recommendation so far has been a
    * top-of-board player never mentioned at all, rather than one rejected on
-   * the merits. Empty on the ADP fallback, which evaluates nothing.
+   * the merits. Empty on the ADP fallback, which evaluates nothing. Not
+   * rendered anywhere in the UI — a server-side reliability signal only.
    */
   considered: string[];
   pick_number: number;
   is_my_turn: boolean;
   picks_until_my_turn: number;
   /**
-   * True while only the pick has arrived and the alternatives, verdicts and
-   * alerts are still generating. Set client-side by the streaming path, never
-   * sent by the server — it describes how much of the response we have, not
-   * anything about the recommendation itself.
+   * True while only `main` has arrived and best_available/needs/depth,
+   * verdicts and alerts are still generating. Set client-side by the
+   * streaming path, never sent by the server — it describes how much of the
+   * response we have, not anything about the recommendation itself.
    */
   isPartial?: boolean;
 }
@@ -283,11 +309,11 @@ export const api = {
    * Streams the recommendation, calling `onPick` as soon as the pick itself
    * has been generated and resolving with the full response.
    *
-   * Generation is sequential and output-bound — about 1,660 tokens at ~75
-   * tok/sec — so the plain endpoint shows nothing for twenty seconds even
-   * though the pick was written after roughly four. This does not make the
-   * model faster; it stops hiding the answer until the alternatives,
-   * verdicts and alerts have finished.
+   * Generation is sequential and output-bound, so the plain endpoint shows
+   * nothing until the whole response lands even though `main` — near the
+   * front of the schema — finished much earlier. This does not make the
+   * model faster; it stops hiding the answer until best_available/needs/
+   * depth, verdicts and alerts have finished.
    *
    * Uses fetch + a ReadableStream rather than EventSource: EventSource
    * cannot send the Authorization header this API requires, and silently
@@ -325,7 +351,7 @@ export const api = {
         if (!event || !data) continue;
         const payload = JSON.parse(data);
         if (event === "pick") {
-          onPick(payload.recommendation as PickSuggestion, payload.pick_number);
+          onPick(payload.main as PickSuggestion, payload.pick_number);
         } else if (event === "complete") {
           complete = payload as Recommendation;
         } else if (event === "error") {
