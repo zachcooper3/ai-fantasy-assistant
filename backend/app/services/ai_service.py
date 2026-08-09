@@ -126,8 +126,13 @@ class RecommendationResult:
     it just isn't asked to re-derive facts this module already knows.
 
     Capped at 5 players total across all sections (main counts as 1):
-    best_available up to 2, and either needs (up to 2) or, once every
-    starting slot is filled, depth (0-1) — never both in the same response.
+    best_available up to 2, needs up to 2, depth 0-1. needs and depth CAN
+    both be non-empty at once — once the skill lineup (QB/RB/WR/TE/FLEX) is
+    filled, needs starts recommending DST/K (see _needs) while depth keeps
+    offering its QB/TE stash, deliberately not gated behind each other (see
+    _depth_pick). This still fits the 5-slot budget in practice: DST/K never
+    have PlayerMetrics, so _needs' best-VOR second entry never fires for
+    them and needs contributes at most 1 entry during that phase, not 2.
     Overlap between sections is expected, not an error: the main pick is
     routinely also the cheapest available or the neediest-position fill,
     and PickSuggestion.tags is how the UI shows that rather than hiding it.
@@ -541,11 +546,21 @@ class _GapInfo:
     gaps: dict[str, int]
     skill_gaps: dict[str, int]
     late_gaps: dict[str, int]
-    # late_gaps, but only once the roster-tax gate has actually opened
-    # (rounds_remaining <= late_reserved) — empty otherwise. See RULE 9 and
-    # _shortlist's docstring for the live bug this distinction exists to
-    # prevent: DST/K must never be forced onto the board or into a
-    # recommendation before the prompt itself says they're due.
+    # late_gaps, but only once the roster-tax gate has actually opened —
+    # empty otherwise. See RULE 9 and _shortlist's docstring for the live
+    # bug this distinction exists to prevent: DST/K must never be forced
+    # onto the board or into a recommendation before the prompt itself says
+    # they're due.
+    #
+    # Opens on EITHER of two conditions (see _compute_gap_info): the skill
+    # starting lineup (QB/RB/WR/TE/FLEX) is complete, or — as a backstop
+    # regardless of lineup state — there are no longer enough rounds left to
+    # defer it further. The first is the normal case and the one Coop asked
+    # for directly: a skill player fills a real roster gap a defense can't,
+    # so defer DST until that's no longer true, then it's fair game. The
+    # second exists so a draft that somehow reaches its last pick with an
+    # unfilled skill slot AND no DST still gets DST flagged rather than
+    # ending with neither ever recommended.
     due_late_gaps: dict[str, int]
     rounds_remaining: int
     late_reserved: int
@@ -578,7 +593,12 @@ def _compute_gap_info(ctx: RecommendationContext) -> _GapInfo:
     rounds_remaining = max(0, ctx.total_rounds - ctx.round_number + 1)
     late_reserved = sum(late_gaps.values())
     skill_rounds_remaining = max(0, rounds_remaining - late_reserved)
-    due_late_gaps = late_gaps if (late_gaps and rounds_remaining <= late_reserved) else {}
+    # See due_late_gaps' docstring on _GapInfo above for the two conditions.
+    due_late_gaps = (
+        late_gaps
+        if late_gaps and (not skill_gaps or rounds_remaining <= late_reserved)
+        else {}
+    )
 
     return _GapInfo(
         lineup=lineup, gaps=gaps, skill_gaps=skill_gaps, late_gaps=late_gaps,
@@ -1195,10 +1215,13 @@ _TAG_NEEDS = "needs"
 _TAG_DEPTH = "depth"
 
 # Slot budget. `main` is always exactly 1 and isn't counted here. `needs`
-# and `depth` are mutually exclusive per response (depth only fires when
-# needs is empty — see _depth_pick), so the real ceiling on any single
-# response is 1 (main) + _BEST_AVAILABLE_SLOTS + max(_NEEDS_SLOTS,
-# _DEPTH_SLOTS) = 5.
+# and `depth` CAN both be non-empty at once (depth fires once the skill
+# lineup is filled, independently of whether DST/K still owe `needs` an
+# entry — see _depth_pick) — but needs still contributes at most 1 entry
+# during that phase, since DST/K never have PlayerMetrics and so never win
+# _needs' best-VOR second slot. Real ceiling on any single response stays
+# 1 (main) + _BEST_AVAILABLE_SLOTS + 1 (needs, DST/K-only phase) +
+# _DEPTH_SLOTS = 5. See RecommendationResult's docstring.
 _BEST_AVAILABLE_SLOTS = 2
 _NEEDS_SLOTS = 2
 _DEPTH_SLOTS = 1
@@ -1223,28 +1246,84 @@ def _best_available(
     ctx: RecommendationContext, due_late_gaps: dict[str, int]
 ) -> list[PickSuggestion]:
     """
-    Pure ADP value, roster needs ignored entirely — the cheapest players on
-    the board regardless of position.
+    The best value on the board, roster needs ignored entirely — blended
+    across two axes (cheapest by ADP, highest VOR), not ADP alone.
+
+    ADP-only missed real value picks. Confirmed live: with a full starting
+    lineup and no roster gap, `main` was a running back at ADP 129 taken on
+    VOR/opportunity-cost grounds (the board's RB value was about to fall
+    off a cliff before the next turn) — a real value pick, and the exact
+    reasoning this section exists to surface — while two cheaper (ADP ~118)
+    receivers won every slot here on raw ADP. The model's own pick never
+    appeared in ANY section despite being exactly the kind of pick this one
+    is for.
+
+    VOR (see _vor) is this app's cross-position value signal specifically
+    because replacement level normalizes across positions, so "best VOR on
+    the board" is a like-for-like comparison in a way raw ADP position-blind
+    ranking isn't. Same two-axis pattern _shortlist already uses for MUST
+    EVALUATE (cheapest-by-ADP, best-by-VOR) — applied here instead of
+    reinvented.
+
+    Still entirely free: VOR is already computed from ctx.player_metrics/
+    replacement_ppg, data this call already has loaded for the prompt, so
+    this is a Python ranking change, not an extra Claude call or an extra
+    output field — the token cost of a recommendation is unchanged.
 
     DST/K are excluded unless `due_late_gaps` says the roster-tax gate has
     already opened (RULE 9) — otherwise a thin skill-player board could let
-    a defense win on pure ADP long before it's ever supposed to be
+    a defense win on pure ADP (or VOR, since a rare DST/K row with metrics
+    would be exactly as wrong here) long before it's ever supposed to be
     recommendable, contradicting the exact rule the prompt states.
     """
     eligible = [
         p for p in ctx.top_available
         if p["position"] not in _LATE_ROUND_POSITIONS or p["position"] in due_late_gaps
     ]
-    ranked = sorted(eligible, key=lambda p: p["adp"])[:_BEST_AVAILABLE_SLOTS]
-    return [
-        PickSuggestion(
-            player_id=p["id"], player_name=p["name"], position=p["position"],
-            adp=p["adp"], reasoning=f"Best value on the board (ADP {p['adp']:g}).",
-            tags=[_TAG_BEST_AVAILABLE],
-            survival=_survival_code(p["adp"], ctx.my_following_pick_number),
-        )
-        for p in ranked
+    if not eligible:
+        return []
+
+    cheapest = min(eligible, key=lambda p: p["adp"])
+    scored = [
+        (v, p) for p in eligible
+        if (v := _vor(p, ctx.player_metrics, ctx.replacement_ppg)) is not None
     ]
+    best_vor = max(scored, key=lambda t: t[0])[1] if scored else None
+
+    # Cheapest is always slot 1. Best-VOR takes slot 2 when he's a genuinely
+    # different player — when VOR data doesn't exist yet (early draft,
+    # rookies) or the two axes agree, backfill from the next-cheapest by
+    # ADP instead of returning a single-entry section.
+    picked: list[dict] = [cheapest]
+    if best_vor is not None and best_vor["id"] != cheapest["id"]:
+        picked.append(best_vor)
+    if len(picked) < _BEST_AVAILABLE_SLOTS:
+        picked_ids = {p["id"] for p in picked}
+        for p in sorted(eligible, key=lambda p: p["adp"]):
+            if len(picked) >= _BEST_AVAILABLE_SLOTS:
+                break
+            if p["id"] not in picked_ids:
+                picked.append(p)
+                picked_ids.add(p["id"])
+    picked.sort(key=lambda p: p["adp"])
+
+    out = []
+    for p in picked:
+        # Only the actual VOR-axis winner gets the VOR-framed reason — a
+        # backfill entry is here because he's cheap, not because his VOR
+        # won anything, and crediting him with a comparison he didn't win
+        # would misstate why he's on this list.
+        if best_vor is not None and p["id"] == best_vor["id"] and p["id"] != cheapest["id"]:
+            v = _vor(p, ctx.player_metrics, ctx.replacement_ppg)
+            reason = f"Best value on the board (VOR {v:+.1f})."
+        else:
+            reason = f"Best value on the board (ADP {p['adp']:g})."
+        out.append(PickSuggestion(
+            player_id=p["id"], player_name=p["name"], position=p["position"],
+            adp=p["adp"], reasoning=reason, tags=[_TAG_BEST_AVAILABLE],
+            survival=_survival_code(p["adp"], ctx.my_following_pick_number),
+        ))
+    return out
 
 
 def _needs(
@@ -1264,8 +1343,17 @@ def _needs(
     same convention the rest of the prompt uses) gets priority rather than
     spreading thin across every open slot.
 
-    Empty once every starting slot is filled — see _depth_pick for what
-    fills that space instead.
+    `due_late_gaps` is what lets DST/K into `gaps` at all — see
+    _compute_gap_info's due_late_gaps docstring: normally that opens as soon
+    as `skill_gaps` clears (once QB/RB/WR/TE/FLEX are all filled, a DST
+    recommendation belongs here even with several rounds still left to
+    play), not only in the literal final rounds. DST/K never win the
+    best-VOR second slot below (no PlayerMetrics ever exists for them), so
+    they contribute at most one entry here regardless.
+
+    Only truly empty once every starting slot — skill AND DST/K — is
+    filled. _depth_pick fires independently of this, not only once this is
+    empty; see its docstring.
     """
     gaps = {**skill_gaps, **due_late_gaps}
     if not gaps:
@@ -1314,18 +1402,24 @@ def _needs(
     return out[:_NEEDS_SLOTS]
 
 
-def _depth_pick(ctx: RecommendationContext, needs: list[PickSuggestion]) -> list[PickSuggestion]:
+def _depth_pick(ctx: RecommendationContext, skill_gaps: dict[str, int]) -> list[PickSuggestion]:
     """
     A QB/TE stash pick — see _DEPTH_POSITIONS for why only those two.
 
-    Fires ONLY when `needs` is empty: a real starting-lineup gap always
-    outranks a speculative second QB/TE, so this never competes with
-    _needs for the same slot, it only fills the space _needs leaves behind.
+    Fires once the skill starting lineup (QB/RB/WR/TE/FLEX) is filled —
+    gated on `skill_gaps`, deliberately NOT on `needs` being empty. Those
+    two used to be the same condition, back when DST only ever appeared in
+    `needs` at the very end of the draft; now that DST can populate `needs`
+    as soon as skill_gaps clears (see _compute_gap_info's due_late_gaps),
+    gating on `needs` would silently suppress this section for the entire
+    stretch between "lineup done" and "DST drafted" — Coop asked for both
+    to be able to show at once, not for one to block the other.
+
     Cheapest by ADP among QB/TE — this is upside speculation, not a
     requirement, so there's no best-VOR pairing the way _needs has; one
     candidate is enough.
     """
-    if needs:
+    if skill_gaps:
         return []
     eligible = sorted(
         (p for p in ctx.top_available if p["position"] in _DEPTH_POSITIONS),
@@ -1389,7 +1483,11 @@ def _build_sections(
     gap_info = _compute_gap_info(ctx)
     best_available = _best_available(ctx, gap_info.due_late_gaps)
     needs = _needs(ctx, gap_info.skill_gaps, gap_info.due_late_gaps)
-    depth = _depth_pick(ctx, needs)
+    # Gated on skill_gaps, not on `needs` — see _depth_pick's docstring:
+    # once the skill lineup is done, DST can populate `needs` on its own,
+    # and depth should still be able to show alongside it, not wait for DST
+    # to be drafted too.
+    depth = _depth_pick(ctx, gap_info.skill_gaps)
     _tag_overlaps(main, best_available, needs, depth)
     return best_available, needs, depth
 
@@ -2446,18 +2544,33 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     # "draft now" and the model was never actually required to look at one.
     if late_gaps:
         late_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(late_gaps.items()))
-        if due_late_gaps:
+        if due_late_gaps and not skill_gaps:
+            # The normal, expected way this opens: the skill starting lineup
+            # is done, so there's no longer a skill player this pick would
+            # be filling a real gap with instead.
             lines.append(
-                f"Still owed (draft now — you are out of rounds to defer them): {late_str}."
+                f"Fair game now (starting lineup is set): {late_str}. Still no "
+                f"matchup/scheme data for these — see RULE 9 — so ADP is the only "
+                f"real signal and ordering among them should follow it. No rush to "
+                f"take one immediately, but it's a legitimate pick from here whenever "
+                f"the board or your remaining rounds call for it."
+            )
+        elif due_late_gaps:
+            # Backstop: still an unfilled skill slot, but out of rounds to
+            # defer this any further regardless — see due_late_gaps' docstring
+            # on _GapInfo. Rare in practice; exists so a draft can't end with
+            # neither ever recommended.
+            lines.append(
+                f"Still owed (draft now — you are out of rounds to defer them even "
+                f"though your starting lineup isn't fully set): {late_str}."
             )
         else:
             lines.append(
                 f"Still owed, but NOT yet: {late_str}. These are roster taxes with "
                 f"near-random weekly output and no supporting data in this app — do NOT "
-                f"recommend one until the final {late_reserved} round(s) of the draft "
-                f"(round {ctx.total_rounds - late_reserved + 1} onward). Spending an "
-                f"earlier pick here wastes a roster spot on a position that will still "
-                f"be freely available at the end."
+                f"recommend one until your starting lineup below (QB/RB/WR/TE/FLEX) is "
+                f"filled. Spending an earlier pick here wastes a roster spot on a "
+                f"position that will still be freely available in the later rounds."
             )
     lines.append("")
 
@@ -2899,14 +3012,18 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "— the market is pricing in growth you can see the reason for right in the "
         "tag.\n\n"
 
-        "RULE 9 — DST AND K ARE END-OF-DRAFT ROSTER TAXES. This app has no matchup, "
+        "RULE 9 — DST AND K ARE LATE-ROUND ROSTER TAXES. This app has no matchup, "
         "scheme, or opponent-strength data for any position, so nothing grounds a "
         "claim that one defense or kicker is better than another; ADP order is the "
         "only signal you have for them. Never invent outside knowledge about which "
-        "real defense or kicker is 'good.' Do not recommend either position until the "
-        "prompt says you are inside the reserved final rounds — a DST or K taken "
-        "earlier costs you a skill player for a position that will still be freely "
-        "available at the end.\n\n"
+        "real defense or kicker is 'good.' Defer both to the later rounds of the "
+        "draft: the prompt tells you exactly when each becomes fair game (once your "
+        "starting lineup is filled, or as a backstop once you're genuinely out of "
+        "rounds to defer it further) — do not recommend either before that point, "
+        "since a DST or K taken earlier costs you a skill player for a position that "
+        "will still be freely available later. Once the prompt says one is fair "
+        "game, it's a legitimate pick when the board or your remaining rounds call "
+        "for it — you don't need to wait for the literal last pick of the draft.\n\n"
 
         "RULE 10 — STAY INSIDE THE EVIDENCE. Every factual claim in your reasoning must "
         "trace to something in the prompt. You have no bye-week data, no depth-chart "

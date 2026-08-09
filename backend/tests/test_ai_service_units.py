@@ -2456,6 +2456,42 @@ def test_best_available_caps_at_two():
     assert len(_best_available(ctx, due_late_gaps={})) == 2
 
 
+def test_best_available_surfaces_the_vor_winner_not_just_cheapest_adp():
+    # Live bug: with a full starting lineup and no roster gap, `main` was an
+    # RB taken on VOR/opportunity-cost grounds while two cheaper receivers
+    # (pure ADP) filled both best_available slots — the model's own pick
+    # never appeared in ANY section. ADP-only ranking was too narrow.
+    board = [
+        {"id": 1, "rank": 1, "name": "Cheap WR1", "position": "WR", "team": "X", "adp": 118.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "Cheap WR2", "position": "WR", "team": "X", "adp": 118.2, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "Value RB", "position": "RB", "team": "X", "adp": 129.4, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    ctx.player_metrics = {
+        1: {"fantasy_points_avg": 8.0}, 2: {"fantasy_points_avg": 8.0},
+        3: {"fantasy_points_avg": 15.0},
+    }
+    ctx.replacement_ppg = {"WR": 7.5, "RB": 8.0}
+    out = _best_available(ctx, due_late_gaps={})
+    names = {p.player_name for p in out}
+    assert "Cheap WR1" in names        # ADP-axis winner
+    assert "Value RB" in names         # VOR-axis winner, despite worse ADP
+    assert "Cheap WR2" not in names    # backfill only fires when needed
+    value_rb = next(p for p in out if p.player_name == "Value RB")
+    assert "VOR" in value_rb.reasoning
+
+
+def test_best_available_backfills_by_adp_when_axes_agree_or_vor_is_unknown():
+    # No metrics at all (e.g. very early draft, rookies) -> VOR is None for
+    # everyone, so both slots must still fill from ADP alone.
+    board = [{"id": i, "rank": i, "name": f"P{i}", "position": "WR", "team": "X",
+              "adp": float(i), "sleeper_id": None} for i in range(1, 5)]
+    ctx = _sections_ctx(board)
+    out = _best_available(ctx, due_late_gaps={})
+    assert [p.player_id for p in out] == [1, 2]
+    assert all("ADP" in p.reasoning for p in out)
+
+
 def test_needs_fills_highest_priority_open_position_first():
     # QB and RB both open; only QB has a real candidate slate (cheapest +
     # best VOR), so both needs slots go to QB rather than one each,
