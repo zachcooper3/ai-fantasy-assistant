@@ -48,6 +48,7 @@ def make_player(
     rank: int = 1,
     sleeper_id: str | None = None,
     is_available: bool = True,
+    injury_status: str | None = None,
 ) -> Player:
     return Player(
         id=id,
@@ -60,6 +61,7 @@ def make_player(
         adp=adp,
         sleeper_id=sleeper_id,
         is_available=is_available,
+        injury_status=injury_status,
     )
 
 

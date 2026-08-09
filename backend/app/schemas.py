@@ -24,6 +24,7 @@ class PlayerResponse(BaseModel):
     pos_rank: str
     adp: float
     is_available: bool
+    injury_status: str | None = None
 
     model_config = {"from_attributes": True}
 

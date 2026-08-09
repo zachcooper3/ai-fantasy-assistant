@@ -6,8 +6,37 @@ Author: Zach Cooper
 
 import re
 
-from sqlmodel import Session, select
+from sqlmodel import Session, select, or_
 from backend.db.models import Player, PlayerMetrics
+
+
+# Sleeper injury_status values that mean a player cannot currently take the
+# field at all — IR, PUP, and Suspended are roster-level designations that
+# typically run weeks to a full season, and "Out" is a definitive ruling for
+# the upcoming game. These are a hard exclusion from every "available" board
+# query, not a risk to weigh: Player.injury_status was added specifically
+# after an IR player got recommended live with the field populated and
+# unread (see its docstring in backend/db/models.py) — and it turned out
+# nothing had ever actually queried it, so the same player was recommended
+# again. Questionable/Doubtful are lower-confidence game-day tags, not "this
+# player cannot play," so they deliberately stay in the pool.
+UNDRAFTABLE_STATUSES = {"IR", "PUP", "Suspended", "Out"}
+
+
+def _exclude_undraftable(query):
+    """
+    Applied on top of `.where(Player.is_available == True)` wherever a query
+    feeds the recommendation board, scarcity counts, or a handcuff
+    suggestion. NULL-safe: `.notin_()` alone would silently drop every row
+    where injury_status IS NULL, since SQL's NOT IN evaluates NULL rather
+    than true for those rows.
+    """
+    return query.where(
+        or_(
+            Player.injury_status.is_(None),  # type: ignore[union-attr]
+            Player.injury_status.notin_(UNDRAFTABLE_STATUSES),  # type: ignore[union-attr]
+        )
+    )
 
 
 # --- Name normalization — same idea as sync_sleeper_ids.py's normalizer,
@@ -59,10 +88,13 @@ def get_top_available(
     n: int = 10,
     position: str | None = None,
 ) -> list[Player]:
-    """Returns the top N available players by ADP, optionally filtered by position."""
-    query = (
-        select(Player)
-        .where(Player.is_available == True)
+    """
+    Returns the top N available players by ADP, optionally filtered by
+    position. Excludes players who cannot currently play at all (IR/PUP/
+    Suspended/Out) — see UNDRAFTABLE_STATUSES.
+    """
+    query = _exclude_undraftable(
+        select(Player).where(Player.is_available == True)
     )
     if position:
         query = query.where(Player.position == position.upper())
@@ -84,8 +116,13 @@ def get_available_from_adp(
     built from the cheapest few at the position never contains him — and
     without him the prompt reports "every RB will be gone", which is both
     false and unactionable.
+
+    Excludes IR/PUP/Suspended/Out the same as get_top_available — a player
+    who can't play isn't a real answer to "who survives to my next turn."
     """
-    query = select(Player).where(Player.is_available == True, Player.adp >= min_adp)
+    query = _exclude_undraftable(
+        select(Player).where(Player.is_available == True, Player.adp >= min_adp)
+    )
     if position:
         query = query.where(Player.position == position.upper())
     return session.exec(query.order_by(Player.adp).limit(n)).all()
@@ -114,8 +151,10 @@ def get_best_available_by_ppg(
     Players with no PlayerMetrics row are excluded — not a judgement, just
     the join. They reach the pool through the ADP queries instead, which is
     the only signal that exists for them.
+
+    Excludes IR/PUP/Suspended/Out the same as get_top_available.
     """
-    query = (
+    query = _exclude_undraftable(
         select(Player)
         .join(PlayerMetrics, PlayerMetrics.player_id == Player.id)  # type: ignore[arg-type]
         .where(
@@ -187,12 +226,17 @@ def get_players_by_position(session: Session, position: str) -> list[Player]:
 def count_available_by_position(session: Session) -> dict[str, int]:
     """
     Returns a dict of {position: count_of_available_players}.
-    Used for positional scarcity calculations.
+    Used for positional scarcity calculations, and for the DST/K
+    availability check that decides whether those requirements are droppable
+    (see ai_service.py's kicker-note logic).
 
     Example: {"QB": 18, "RB": 42, "WR": 58, "TE": 16, "K": 12, "DST": 10}
+
+    Excludes IR/PUP/Suspended/Out — an IR-only position would otherwise
+    read as "available" and never trigger the drop-the-requirement note.
     """
     players = session.exec(
-        select(Player).where(Player.is_available == True)
+        _exclude_undraftable(select(Player).where(Player.is_available == True))
     ).all()
 
     counts: dict[str, int] = {}
@@ -263,17 +307,20 @@ def get_handcuff(session: Session, player_id: int) -> Player | None:
     Returns None if:
     - The player isn't found
     - The player isn't an RB
-    - No other available RBs exist on the same team
+    - No other available RBs exist on the same team (after excluding
+      IR/PUP/Suspended/Out — a backup on IR himself is not a real handcuff)
     """
     player = session.get(Player, player_id)
     if player is None or player.position != "RB":
         return None
 
     return session.exec(
-        select(Player)
-        .where(Player.team == player.team)
-        .where(Player.position == "RB")
-        .where(Player.is_available == True)
-        .where(Player.id != player_id)
+        _exclude_undraftable(
+            select(Player)
+            .where(Player.team == player.team)
+            .where(Player.position == "RB")
+            .where(Player.is_available == True)
+            .where(Player.id != player_id)
+        )
         .order_by(Player.adp)
     ).first()
