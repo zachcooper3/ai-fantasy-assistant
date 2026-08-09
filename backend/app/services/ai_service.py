@@ -30,6 +30,36 @@ logger = logging.getLogger(__name__)
 # Use Haiku on the clock (fast, cheap); override with CLAUDE_MODEL env var for richer analysis
 _DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
+# Models the AI panel's toggle can switch between (see AIService.set_model
+# and GET/POST /api/recommend/model). Aliases, not raw model IDs, are what
+# cross the API/frontend boundary — the UI shouldn't have to know or get a
+# dated snapshot ID right, and a stale/wrong ID here would just silently
+# 404 against Anthropic on the next recommend() call instead of failing
+# where the mistake was made. (.env.example previously suggested
+# "claude-sonnet-4-6" for this, which was never a real model ID.)
+AI_MODEL_CHOICES: dict[str, str] = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-5",
+}
+
+
+def _model_alias(model_id: str) -> str:
+    """
+    Reverse lookup of AI_MODEL_CHOICES, for the alias AIService reports back
+    (over the API, and in the startup banner) when it was constructed from
+    _DEFAULT_MODEL rather than an explicit set_model() call.
+
+    A custom CLAUDE_MODEL override that matches neither alias still works
+    fine for actually generating recommendations (recommend() always sends
+    self._model, the raw ID) — it just won't show as either toggle option
+    being "active" in the UI, which is the correct thing to show for a
+    model the toggle doesn't know about.
+    """
+    for alias, model in AI_MODEL_CHOICES.items():
+        if model == model_id:
+            return alias
+    return "custom"
+
 # Accepted values for RecommendationResult.confidence. Anything else the model
 # returns is normalised to "medium".
 _CONFIDENCE_LEVELS = {"high", "medium", "low"}
@@ -3534,6 +3564,38 @@ class AIService:
     @property
     def model_name(self) -> str:
         return self._model
+
+    @property
+    def model_alias(self) -> str:
+        """
+        "haiku", "sonnet", or "custom" — what the AI panel's toggle should
+        show as currently selected.
+
+        Derived from self._model on every access rather than cached
+        alongside it, so the two can never drift out of sync — including
+        for AIService.__new__(AIService) test doubles (see conftest.py's
+        `client` fixture) that set _model directly without going through
+        __init__ or set_model().
+        """
+        return _model_alias(self._model)
+
+    def set_model(self, alias: str) -> None:
+        """
+        Switches the model used from the NEXT recommend()/recommend_stream()
+        call onward — no client rebuild or restart needed, since the model
+        is passed per-call (self._model) rather than fixed at client
+        construction. A call already in flight keeps running on whichever
+        model it started with.
+
+        Raises ValueError on an unknown alias — the API layer turns that
+        into a 422 rather than silently keeping the old model, which would
+        make the toggle lie about what's selected.
+        """
+        if alias not in AI_MODEL_CHOICES:
+            raise ValueError(
+                f"Unknown model {alias!r} — choices are {sorted(AI_MODEL_CHOICES)}"
+            )
+        self._model = AI_MODEL_CHOICES[alias]
 
     async def recommend_stream(self, ctx: RecommendationContext):
         """

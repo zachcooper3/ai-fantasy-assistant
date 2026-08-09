@@ -32,6 +32,7 @@ from backend.app.serializers import build_pick_response, build_state_response, s
 from backend.app.services.draft_state import DraftConfig, DraftStateService
 from backend.app.services.connection_manager import ConnectionManager
 from backend.app.services.draft_sync import DraftSyncService
+from backend.app.services.ai_service import AIService
 
 router = APIRouter(prefix="/api/draft", tags=["draft"])
 
@@ -46,6 +47,10 @@ def get_draft_service(request: Request) -> DraftStateService:
 
 def get_connection_manager(request: Request) -> ConnectionManager:
     return request.app.state.connection_manager
+
+
+def get_ai_service(request: Request) -> AIService:
+    return request.app.state.ai_service
 
 
 def get_sync_service(request: Request) -> DraftSyncService:
@@ -70,6 +75,7 @@ async def start_session(
     svc: DraftStateService = Depends(get_draft_service),
     mgr: ConnectionManager = Depends(get_connection_manager),
     sync: DraftSyncService = Depends(get_sync_service),
+    ai: AIService = Depends(get_ai_service),
     db: Session = Depends(get_session),
 ):
     """
@@ -92,7 +98,12 @@ async def start_session(
         dst_slots=body.dst_slots,
     )
     svc.start_session(config)
-    draft_session_repo.save_config(db, config)  # persist for crash recovery
+    # Carry the currently-active Haiku/Sonnet choice into the new session
+    # row — otherwise starting a fresh draft after switching models would
+    # silently reset the persisted value back to unset (None) on the very
+    # next restart, even though the toggle itself keeps showing your choice
+    # in memory until then.
+    draft_session_repo.save_config(db, config, ai_model=ai.model_alias)
     repo.reset_draft_availability(db)
     await mgr.broadcast({"type": "reset"})
     return build_state_response(svc)

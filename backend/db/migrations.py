@@ -47,6 +47,11 @@ _COLUMNS: list[tuple[str, str, str]] = [
     # note sitting in the prompt. A column can be rendered on the board and
     # checked in Python.
     ("player", "injury_status", "VARCHAR"),
+    # The AI panel's Haiku/Sonnet toggle (see AI_MODEL_CHOICES in
+    # ai_service.py) — persisted so a mid-draft backend restart resumes on
+    # whichever model you'd switched to instead of silently reverting to
+    # the CLAUDE_MODEL env default.
+    ("draftsession", "ai_model", "VARCHAR"),
 ]
 
 

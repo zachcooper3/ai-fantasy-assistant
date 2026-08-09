@@ -378,7 +378,10 @@ and defaults) — nothing requires a code change to adjust, including for deploy
 - `ANTHROPIC_API_KEY` — Claude API key. Unset (or left as the `.env.example` placeholder) →
   recommendations fall back to best-available-by-ADP. The startup banner tells you which mode
   you're in.
-- `CLAUDE_MODEL` — override the recommendation model (default: `claude-haiku-4-5-20251001`).
+- `CLAUDE_MODEL` — override the recommendation model's INITIAL value on boot (default:
+  `claude-haiku-4-5-20251001`). The AI panel has a live Haiku/Sonnet toggle
+  (`GET`/`POST /api/recommend/model`) that switches without a restart and takes over from
+  there — this env var only matters for what the toggle starts on.
 - `SYNTHESIS_MODEL` — override the model used for batch "what it means" note generation
   (`fetch_synthesis.py` and `fetch_rookie_synthesis.py`). Defaults to `CLAUDE_MODEL`; safe to
   point at a pricier model since it runs offline, not on the clock.

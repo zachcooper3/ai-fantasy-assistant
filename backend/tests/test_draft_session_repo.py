@@ -87,3 +87,41 @@ def test_clear_removes_everything(db):
 
 def test_load_state_none_when_no_session(db):
     assert jrepo.load_state(db) is None
+
+
+# ---------------------------------------------------------------------------
+# ai_model — the AI panel's Haiku/Sonnet toggle
+# ---------------------------------------------------------------------------
+
+def test_ai_model_defaults_to_unset(db):
+    jrepo.save_config(db, CFG)
+    assert jrepo.get_ai_model(db) is None
+
+
+def test_save_config_carries_an_explicit_ai_model(db):
+    jrepo.save_config(db, CFG, ai_model="sonnet")
+    assert jrepo.get_ai_model(db) == "sonnet"
+
+
+def test_set_ai_model_updates_in_place_without_touching_picks(db):
+    jrepo.save_config(db, CFG)
+    svc = DraftStateService()
+    svc.start_session(CFG)
+    journal_picks(db, svc, [(1, "A", "RB", "X")])
+
+    jrepo.set_ai_model(db, "sonnet")
+
+    assert jrepo.get_ai_model(db) == "sonnet"
+    _, picks, _ = jrepo.load_state(db)
+    assert len(picks) == 1  # untouched — set_ai_model must not be save_config
+
+
+def test_set_ai_model_is_a_noop_with_no_active_session(db):
+    # Toggling the model before a draft has started shouldn't raise or
+    # create a partial session row — it just has nothing to write to yet.
+    jrepo.set_ai_model(db, "sonnet")
+    assert jrepo.load_state(db) is None
+
+
+def test_get_ai_model_none_with_no_active_session(db):
+    assert jrepo.get_ai_model(db) is None

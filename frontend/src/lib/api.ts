@@ -45,6 +45,11 @@ export interface Scarcity {
   K: number;
 }
 
+export interface ModelChoice {
+  model: string;       // "haiku" | "sonnet" | "custom"
+  choices: string[];   // what setModel accepts — currently ["haiku", "sonnet"]
+}
+
 // ---------------------------------------------------------------------------
 // Draft types
 // ---------------------------------------------------------------------------
@@ -365,6 +370,15 @@ export const api = {
   },
 
   getScarcity: () => get<ScarcityAnalysis>("/api/recommend/scarcity"),
+
+  // AI model toggle — "haiku" | "sonnet" (or "custom" on GET, if
+  // CLAUDE_MODEL was overridden to something neither option matches).
+  // Switches live, no backend restart; persists across one while a draft
+  // session is active. See backend/app/api/recommendations.py.
+  getModel: () => get<ModelChoice>("/api/recommend/model"),
+
+  setModel: (model: "haiku" | "sonnet") =>
+    post<ModelChoice>("/api/recommend/model", { model }),
 
   getHandcuff: (playerId: number) =>
     get<Player>(`/api/recommend/handcuff?player_id=${playerId}`),

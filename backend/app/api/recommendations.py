@@ -22,6 +22,7 @@ from backend.db.database import get_session
 from backend.db import player_repo as repo
 from backend.db import metrics_repo
 from backend.db import draft_profile_repo
+from backend.db import draft_session_repo
 from backend.app.schemas import PlayerResponse
 from backend.db.models import Player, PlayerMetrics
 from backend.app.services.ai_service import (
@@ -30,6 +31,7 @@ from backend.app.services.ai_service import (
     compute_position_scarcity,
     compute_replacement_levels,
     survivor_adp_floor,
+    AI_MODEL_CHOICES,
     _ROSTER_CHANGE_MIN_SHARE,
     _ROSTER_CHANGE_POSITIONS,
 )
@@ -116,6 +118,17 @@ class ScarcityAlert(BaseModel):
 class ScarcityAnalysisResponse(BaseModel):
     alerts: list[ScarcityAlert]
     available_counts: dict[str, int]
+
+
+class ModelChoiceRequest(BaseModel):
+    model: str  # "haiku" | "sonnet" — see AI_MODEL_CHOICES
+
+
+class ModelChoiceResponse(BaseModel):
+    model: str          # currently active alias — "haiku", "sonnet", or
+                         # "custom" if CLAUDE_MODEL was overridden to
+                         # something neither toggle option matches
+    choices: list[str]  # what POST accepts
 
 
 # ---------------------------------------------------------------------------
@@ -753,3 +766,33 @@ def analyze_scarcity(
     alerts.sort(key=lambda a: tier_order[a.tier])
 
     return ScarcityAnalysisResponse(alerts=alerts, available_counts=counts)
+
+
+@router.get("/model", response_model=ModelChoiceResponse)
+def get_model(ai: AIService = Depends(get_ai_service)):
+    """Current Haiku/Sonnet selection for the AI panel's toggle."""
+    return ModelChoiceResponse(model=ai.model_alias, choices=sorted(AI_MODEL_CHOICES))
+
+
+@router.post("/model", response_model=ModelChoiceResponse)
+def set_model(
+    body: ModelChoiceRequest,
+    ai: AIService = Depends(get_ai_service),
+    db: Session = Depends(get_session),
+):
+    """
+    Switches the model used for pick recommendations from the next call
+    onward — no backend restart needed (see AIService.set_model).
+
+    Also persists the choice on the active draft session, if one exists
+    (draft_session_repo.set_ai_model is a no-op otherwise), so a mid-draft
+    backend restart resumes on the model you'd switched to.
+    """
+    if body.model not in AI_MODEL_CHOICES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"model must be one of {sorted(AI_MODEL_CHOICES)}, got {body.model!r}",
+        )
+    ai.set_model(body.model)
+    draft_session_repo.set_ai_model(db, body.model)
+    return ModelChoiceResponse(model=ai.model_alias, choices=sorted(AI_MODEL_CHOICES))

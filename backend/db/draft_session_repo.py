@@ -34,11 +34,17 @@ _SESSION_ROW_ID = 1
 # Session lifecycle
 # ---------------------------------------------------------------------------
 
-def save_config(session: Session, config: DraftConfig) -> None:
+def save_config(session: Session, config: DraftConfig, ai_model: str | None = None) -> None:
     """
     Persists the session config, replacing any previous session and its
     pick journal — mirrors DraftStateService.start_session(), which also
     wipes pick history.
+
+    ai_model carries the AI panel's current Haiku/Sonnet choice into the new
+    row (see draft.py's start_session), so starting a fresh draft after
+    already switching models doesn't silently reset the toggle back to
+    Haiku. None (the default) leaves it unset — AIService falls back to its
+    own env-derived default in that case.
     """
     session.exec(delete(DraftPick))
     session.exec(delete(DraftSession))
@@ -54,8 +60,38 @@ def save_config(session: Session, config: DraftConfig) -> None:
         te_slots=config.te_slots,
         flex_slots=config.flex_slots,
         dst_slots=config.dst_slots,
+        ai_model=ai_model,
     ))
     session.commit()
+
+
+def set_ai_model(session: Session, model: str) -> None:
+    """
+    Updates the persisted model choice on the ALREADY-ACTIVE session in
+    place. Deliberately not save_config, which wipes the pick journal — this
+    is a settings change, not a new draft.
+
+    No-op if no session is active yet (id=1 row doesn't exist): the choice
+    still takes effect immediately via AIService.set_model, and gets carried
+    into the session row the next time one is created (see save_config's
+    ai_model param and draft.py's start_session).
+    """
+    row = session.get(DraftSession, _SESSION_ROW_ID)
+    if row is None:
+        return
+    row.ai_model = model
+    session.add(row)
+    session.commit()
+
+
+def get_ai_model(session: Session) -> str | None:
+    """
+    Returns the persisted model choice for the active session, or None if
+    none is set (no session active, or one is active but the toggle was
+    never touched) — caller should fall back to AIService's own default.
+    """
+    row = session.get(DraftSession, _SESSION_ROW_ID)
+    return row.ai_model if row else None
 
 
 def clear(session: Session) -> None:

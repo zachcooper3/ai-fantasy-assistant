@@ -89,6 +89,7 @@ async def lifespan(app: FastAPI):
     # old ADP is a far smaller cost than a corrupted live draft.
     with Session(engine) as db:
         persisted = draft_session_repo.load_state(db)
+        persisted_model = draft_session_repo.get_ai_model(db)
 
     if persisted is None:
         # Auto-refresh ADP data if the CSV is older than the threshold
@@ -102,6 +103,18 @@ async def lifespan(app: FastAPI):
     app.state.connection_manager = connection_manager
     app.state.ai_service = AIService()
     app.state.sync_service = DraftSyncService(draft_service, connection_manager)
+
+    if persisted_model is not None:
+        # Resume the Haiku/Sonnet choice from before the restart, rather
+        # than silently reverting to the CLAUDE_MODEL env default — see
+        # DraftSession.ai_model's docstring.
+        try:
+            app.state.ai_service.set_model(persisted_model)
+        except ValueError:
+            # The persisted alias no longer exists (e.g. AI_MODEL_CHOICES
+            # changed since it was saved). Not fatal — keep the built-in
+            # default rather than failing startup over a stale toggle.
+            print(f"Ignoring unrecognized persisted AI model {persisted_model!r}.")
 
     if persisted is not None:
         config, picks, started_at = persisted

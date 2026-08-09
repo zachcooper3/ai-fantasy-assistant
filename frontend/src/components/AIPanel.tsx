@@ -36,7 +36,7 @@ import {
   Layers,
 } from "lucide-react";
 
-import { Confidence, Player, PickSuggestion, Recommendation, Scarcity, SectionTag, Survival } from "@/lib/api";
+import { api, Confidence, Player, PickSuggestion, Recommendation, Scarcity, SectionTag, Survival } from "@/lib/api";
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
 import ConfirmButton from "@/components/ConfirmButton";
@@ -242,6 +242,77 @@ function DraftButton({
 }
 
 /**
+ * Haiku/Sonnet switch. Self-contained: fetches the current choice on mount
+ * and posts a switch directly through `api`, rather than routing through
+ * useDraft — unlike Auto (a client-only localStorage preference), this is
+ * server state (AIService.set_model, persisted on the active DraftSession),
+ * so the panel talking to the endpoint directly is the more honest shape.
+ *
+ * Switches take effect on the NEXT "Get pick" — there is deliberately no
+ * attempt to re-fetch the current recommendation on toggle, since that
+ * would spend a second paid Claude call nobody asked for.
+ */
+function ModelToggle() {
+  const [model, setModel] = useState<string | null>(null);
+  const [isSwitching, setIsSwitching] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getModel()
+      .then((choice) => { if (!cancelled) setModel(choice.model); })
+      .catch(() => {
+        // Best-effort — an unreachable backend already surfaces loudly
+        // elsewhere (Get pick will fail too). No point duplicating an
+        // error state for a settings toggle nobody's clicked yet.
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // "custom" covers a CLAUDE_MODEL env override that matches neither
+  // option (see the backend's AIService.model_alias) — nothing to
+  // highlight as active, but the switch still works from here.
+  if (model === null) return null;
+
+  const isSonnet = model === "sonnet";
+
+  async function toggle() {
+    const next = isSonnet ? "haiku" : "sonnet";
+    setIsSwitching(true);
+    try {
+      const choice = await api.setModel(next);
+      setModel(choice.model);
+    } catch {
+      // Leave the displayed value as whatever it last confirmed to be —
+      // safer than optimistically showing a switch that didn't take.
+    } finally {
+      setIsSwitching(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isSonnet}
+      onClick={toggle}
+      disabled={isSwitching}
+      title={
+        isSonnet
+          ? "Sonnet — richer analysis, slower and costs more. Click for Haiku."
+          : "Haiku — fast and cheap. Click for Sonnet (richer analysis, higher cost)."
+      }
+      className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+        isSonnet
+          ? "bg-violet-950 border-violet-800/60 text-violet-300"
+          : "bg-slate-800 border-slate-600 text-slate-300"
+      }`}
+    >
+      {model === "custom" ? "Model: custom" : isSonnet ? "Sonnet" : "Haiku"}
+    </button>
+  );
+}
+
+/**
  * One player row, shared by the Main card and every Best Available/Needs/
  * Depth card — the only real differences between them are size (`variant`)
  * and which section's own tag gets excluded from the overlap badges (see
@@ -418,6 +489,8 @@ export default function AIPanel({
                 Focus
               </button>
             )}
+
+            <ModelToggle />
 
             {/* Auto-recommend toggle. Each automatic fetch is a paid Claude
                 call, so this is a real preference rather than something to

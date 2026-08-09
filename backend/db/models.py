@@ -82,6 +82,13 @@ class DraftSession(SQLModel, table=True):
     te_slots: int = 1
     flex_slots: int = 1
     dst_slots: int = 1
+    # Which Claude model the AI panel's toggle is currently set to ("haiku" /
+    # "sonnet" — see AI_MODEL_CHOICES in ai_service.py), so a mid-draft
+    # backend restart resumes on the model you'd switched to rather than
+    # silently falling back to the CLAUDE_MODEL env default. None means "no
+    # explicit choice yet" — AIService keeps using its own env-derived
+    # default in that case.
+    ai_model: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
