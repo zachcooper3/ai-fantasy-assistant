@@ -965,6 +965,7 @@ def _shortlist(
     player_metrics: dict[int, dict],
     replacement: dict[str, float],
     gaps: dict[str, int] | None = None,
+    due_late_gaps: dict[str, int] | None = None,
 ) -> list[dict]:
     """
     The players the model is not allowed to ignore: best ADP, highest VOR,
@@ -991,6 +992,19 @@ def _shortlist(
     which is the axis that was actually missing: without it a board whose top
     is all receivers produces an all-receiver shortlist, and the
     cross-position call never gets forced.
+
+    `due_late_gaps` gets its own parameter rather than folding into `gaps`
+    for the same reason as _board_for_prompt's identically-named argument:
+    only pass a _LATE_ROUND_POSITIONS entry here once the roster-tax gate
+    has actually opened. It exists because this is the exact mechanism that
+    was omitting DST/K entirely — a defense could sit at #5 on the board
+    with the prompt saying "draft now" and still never appear in this list,
+    because neither the by-VOR axis (DST/K have no PlayerMetrics row, ever
+    — see _format_metrics_section) nor the by-ADP axis (a waiver-tier WR is
+    routinely cheaper than every defense) can surface one on their own.
+    Confirmed live: at a pick where DST was the only true gap left, the
+    shortlist that reached the model was five skill players and zero
+    defenses, despite four defenses sitting in the top 25 of the board.
     """
     if not board:
         return []
@@ -1012,9 +1026,9 @@ def _shortlist(
     # no required verdict, and the model recommended the cheaper one while
     # asserting he was "the only TE on the board". A player who must be
     # accounted for cannot be waved away as absent.
-    needed = set(gaps or {})
+    needed = set(gaps or {}) | set(due_late_gaps or {})
     per_position: list[dict] = []
-    for pos in ("QB", "RB", "WR", "TE"):
+    for pos in ("QB", "RB", "WR", "TE", *(due_late_gaps or {})):
         at_pos = [p for p in board if p["position"] == pos]
         if not at_pos:
             continue
@@ -1909,7 +1923,11 @@ def _format_metrics_section(
 # Prompt builder
 # ---------------------------------------------------------------------------
 
-def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[dict]:
+def _board_for_prompt(
+    ctx: RecommendationContext,
+    gaps: dict[str, int],
+    due_late_gaps: dict[str, int] | None = None,
+) -> list[dict]:
     """
     The players actually shown: the top _LISTED_PLAYERS by ADP, plus the best
     available player at every position still missing from the starting
@@ -1938,6 +1956,23 @@ def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[
     picks later (VOR -0.68, 16% target share, 75% snaps, no new
     competition). The better player was off the board because he was
     slightly more expensive.
+
+    `due_late_gaps` is the DST/K counterpart of `gaps`, kept as a separate
+    argument rather than merged by the caller into `gaps` so the ordinary
+    "still missing, not yet due" case (`gaps` never contains a
+    _LATE_ROUND_POSITIONS key) can't accidentally force a DST/K onto the
+    board before the prompt says the reserved rounds have started — see
+    RULE 9. Only pass a position here once the roster-tax gate has already
+    opened it up.
+
+    Exists because the ADP-window guarantee this function provides for QB/
+    RB/WR/TE never applied to DST/K at all: they were on the raw top-N ADP
+    slice by luck, same as before this function existed for skill
+    positions. Confirmed live: with a 15-round, non-superflex board, the
+    league's DST ADP values happened to be low enough to appear on the raw
+    slice by the final round — but that's the same accident this function
+    was written to stop relying on, and a deeper league or a different ADP
+    source would silently reproduce the exact TE-at-128 failure for DST.
     """
     board = list(ctx.top_available[:_LISTED_PLAYERS])
     present = {p["id"] for p in board}
@@ -1947,6 +1982,16 @@ def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[
             board.append(player)
             present.add(player["id"])
 
+    # Two separate loops, deliberately not one merged dict: `gaps` keeps its
+    # original "skip FLEX and any _LATE_ROUND_POSITIONS entry" behavior
+    # unconditionally (a caller passing DST/K in `gaps` — e.g. the full
+    # roster-gap dict before it's split — must NOT force one onto the board
+    # early), while `due_late_gaps` is trusted as already gated by the
+    # caller and skips nothing but FLEX. Merging them into one dict and
+    # keying the skip off _LATE_ROUND_POSITIONS membership would silently
+    # let a not-yet-due DST/K in through `gaps` the moment the caller ever
+    # passed one there, which is exactly the premature-DST bug RULE 9
+    # exists to prevent.
     for pos in gaps:
         # FLEX is filled by an RB/WR/TE, all of which are covered by their
         # own entries — there is no "best available FLEX" to look up.
@@ -1958,6 +2003,27 @@ def _board_for_prompt(ctx: RecommendationContext, gaps: dict[str, int]) -> list[
 
         # The cheapest few, in ADP order — the realistic slate, not just the
         # single cheapest.
+        for p in at_pos[:_NEEDED_POSITION_DEPTH]:
+            _add(p)
+
+        # And the most productive, which is regularly outside that window:
+        # the best tight end available sat sixth by ADP. Skipped when nobody
+        # at the position has a VOR rather than falling back to ADP and
+        # re-adding someone already listed.
+        scored = [
+            (v, p) for p in at_pos
+            if (v := _vor(p, ctx.player_metrics, ctx.replacement_ppg)) is not None
+        ]
+        if scored:
+            _add(max(scored, key=lambda t: t[0])[1])
+
+    for pos in due_late_gaps or {}:
+        if pos == "FLEX":
+            continue
+        at_pos = [p for p in ctx.top_available if p["position"] == pos]
+        if not at_pos:
+            continue
+
         for p in at_pos[:_NEEDED_POSITION_DEPTH]:
             _add(p)
 
@@ -2090,9 +2156,17 @@ def _build_prompt(ctx: RecommendationContext) -> str:
             "waivers after the draft instead."
         )
 
+    # Positions from late_gaps that the "draft now" line above actually
+    # applies to — i.e. the roster-tax gate has opened. Threaded into
+    # _board_for_prompt/_shortlist below so a DST/K that's due can't be
+    # gated by text alone: see _shortlist's docstring for the live failure
+    # where the prompt said "draft now" and the model was never actually
+    # required to look at one.
+    due_late_gaps: dict[str, int] = {}
     if late_gaps:
         late_str = ", ".join(f"{pos} x{n}" for pos, n in sorted(late_gaps.items()))
         if rounds_remaining <= late_reserved:
+            due_late_gaps = late_gaps
             lines.append(
                 f"Still owed (draft now — you are out of rounds to defer them): {late_str}."
             )
@@ -2122,9 +2196,10 @@ def _build_prompt(ctx: RecommendationContext) -> str:
 
     # Everything below shows THIS list, not a raw ADP slice — see
     # _board_for_prompt for why the two differ late in a draft.
-    board = _board_for_prompt(ctx, skill_gaps)
+    board = _board_for_prompt(ctx, skill_gaps, due_late_gaps)
     shortlist = _shortlist(
-        board, advised_pick, ctx.player_metrics, ctx.replacement_ppg, skill_gaps
+        board, advised_pick, ctx.player_metrics, ctx.replacement_ppg, skill_gaps,
+        due_late_gaps,
     )
 
     for section in (

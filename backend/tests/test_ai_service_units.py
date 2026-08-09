@@ -2078,6 +2078,71 @@ def test_no_duplicates_when_the_same_player_wins_both_axes():
     assert len(out) == len({p["id"] for p in out}) == _LISTED_PLAYERS + 1
 
 
+# ---------------------------------------------------------------------------
+# DST/K coverage once the roster-tax gate opens
+#
+# Live bug (Coop's league, 14 teams, round 15 of 15, pick 203): the roster
+# gap dict correctly showed only DST left, the prompt correctly said "draft
+# now — you are out of rounds to defer them", and the board correctly held
+# four available defenses in the top 25 by ADP. The recommendation still
+# never once suggested one, across all 15 rounds. Root cause: the MUST
+# EVALUATE shortlist that forces the model to weigh in on a candidate is
+# built from three axes — cheapest overall, best VOR, cheapest per
+# position — and DST/K structurally cannot win any of the three (no
+# PlayerMetrics row ever exists for them, so VOR is always None, and a
+# waiver-tier WR/RB is routinely cheaper by ADP than any defense). "Draft
+# now" was true and unenforced: nothing required the model to ever look at
+# one. due_late_gaps is the fix — see _board_for_prompt's and _shortlist's
+# docstrings for why it's a separate argument from `gaps` rather than
+# merged into it.
+# ---------------------------------------------------------------------------
+
+def test_late_position_is_ignored_until_explicitly_due():
+    # Passing DST/K through the ordinary `gaps` argument must stay a no-op
+    # even though this fixture's board has no DST/K in the top 25 — this is
+    # the "not yet" case (RULE 9), and it must behave identically whether
+    # the caller passes {} or {"DST": 1} through `gaps`.
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    ctx.top_available.append(
+        {"id": 90, "rank": 90, "name": "Some Defense", "position": "DST",
+         "team": "SF", "adp": 200.0, "sleeper_id": None}
+    )
+    out = _board_for_prompt(ctx, {"DST": 1})
+    assert "DST" not in {p["position"] for p in out}
+
+
+def test_due_late_position_is_pulled_onto_the_board():
+    from backend.app.services.ai_service import _board_for_prompt
+    ctx = _coverage_ctx()
+    ctx.top_available.append(
+        {"id": 90, "rank": 90, "name": "Some Defense", "position": "DST",
+         "team": "SF", "adp": 200.0, "sleeper_id": None}
+    )
+    out = _board_for_prompt(ctx, {}, due_late_gaps={"DST": 1})
+    assert "Some Defense" in {p["name"] for p in out}
+
+
+def test_due_dst_is_forced_into_the_must_evaluate_shortlist():
+    # This is the actual live failure: a DST present on the board, with no
+    # PlayerMetrics row (so VOR is None) and an ADP well behind the cheapest
+    # skill players filling the shortlist's other two axes, still has to
+    # get a forced verdict once it's the roster tax that's due.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 21)]
+    board.append({"id": 90, "rank": 90, "name": "Some Defense", "position": "DST",
+                   "team": "SF", "adp": 144.9, "sleeper_id": None})
+    metrics = {i: {"fantasy_points_avg": 6.0} for i in range(1, 21)}  # no entry for the DST
+    repl = {"WR": 5.0}
+
+    without_gate = _shortlist(board, 203, metrics, repl, {})
+    assert "Some Defense" not in {p["name"] for p in without_gate}, \
+        "fixture must reproduce the live omission before the fix is applied"
+
+    with_gate = _shortlist(board, 203, metrics, repl, {}, due_late_gaps={"DST": 1})
+    assert "Some Defense" in {p["name"] for p in with_gate}
+
+
 def test_board_says_why_a_late_player_is_listed():
     ctx = _coverage_ctx()
     ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR")   # no TE
