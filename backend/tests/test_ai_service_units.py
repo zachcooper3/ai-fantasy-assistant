@@ -368,15 +368,22 @@ def test_dst_and_k_are_deferred_out_of_the_urgency_math():
     prompt = _build_prompt(ctx)
     assert "URGENT" in prompt
     assert "1 usable round(s) left" in prompt
-    assert "do NOT recommend one until the final" in prompt
+    # Wording changed from "until the final N round(s)" to naming the actual
+    # condition (starting lineup filled) once the "Fair game now" branch was
+    # split out — see test_kicker_requirement_stands_when_kickers_exist.
+    assert "do NOT recommend one until your starting lineup below" in prompt
 
 
 def test_dst_and_k_are_demanded_once_the_reserved_rounds_arrive():
+    # Must still have an unfilled skill slot (QB here) so this hits the
+    # backstop branch ("out of rounds to defer them") rather than the
+    # softer "Fair game now" branch, which is what fires once the starting
+    # lineup is already complete — see test_kicker_requirement_stands_when_kickers_exist.
     ctx = ctx_with_available(1, 2, 3)
     ctx.available_counts = {"K": 12, "DST": 12}
     ctx.round_number = 14
     ctx.total_rounds = 15
-    ctx.my_roster = roster("QB", "RB", "RB", "WR", "WR", "TE", "RB")
+    ctx.my_roster = roster("RB", "RB", "WR", "WR", "TE", "RB")
     prompt = _build_prompt(ctx)
     assert "out of rounds to defer them" in prompt
 
@@ -958,8 +965,13 @@ def test_missing_kickers_are_announced_not_silently_dropped():
 
 
 def test_kicker_requirement_stands_when_kickers_exist():
+    # This fixture's starting lineup is already full (DST included), so a
+    # real, draftable K now hits the "Fair game now" branch, not "Still
+    # owed" — that phrasing is reserved for the backstop case where a skill
+    # slot is still open and there's no more room to defer. See
+    # test_dst_and_k_are_demanded_once_the_reserved_rounds_arrive.
     prompt = _build_prompt(_late_ctx(k_available=12))
-    assert "Still owed" in prompt and "K x1" in prompt
+    assert "Fair game now" in prompt and "K x1" in prompt
     assert "no kickers at all" not in prompt
 
 
@@ -972,7 +984,12 @@ def test_absent_kickers_do_not_consume_a_reserved_round():
     no_k = _build_prompt(_late_ctx(k_available=0, round_number=13))
     with_k = _build_prompt(_late_ctx(k_available=12, round_number=13))
     assert "Still owed" not in no_k
-    assert "final 1 round(s)" in with_k
+    assert "Fair game now" not in no_k
+    # With a real kicker on the board and the starting lineup already full,
+    # this is the (non-urgent) "Fair game now" branch, not a reserved-round
+    # count — the reserved-round math (URGENT / "usable round(s) left")
+    # only fires while a skill slot is still open, which isn't this fixture.
+    assert "Fair game now" in with_k and "K x1" in with_k
 
 
 # ---------------------------------------------------------------------------
