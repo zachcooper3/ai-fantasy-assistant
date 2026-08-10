@@ -3725,10 +3725,48 @@ class AIService:
                             sent_pick = True
                             yield "pick", pick
 
-            result = _parse_response(_restore_prefill(buffer), ctx)
-            if result is None:
-                logger.warning("Falling back to ADP — could not parse streamed response.")
-                result = _fallback(ctx, self._model, "Claude's response could not be parsed")
+                # The complete accumulated Message — stop_reason, full content
+                # blocks (including any non-text ones), usage — rather than
+                # relying on `buffer` alone. `buffer` exists to support the
+                # early "pick" event above and is a convenience copy of the
+                # text deltas, not necessarily the authoritative record of
+                # everything the response contained; this is the same object
+                # `messages.create()`'s non-streaming path gets back directly.
+                final_message = await stream.get_final_message()
+
+            # Mirrors recommend()'s truncation diagnostic below — was missing
+            # here entirely, so a streamed response cut off by the token
+            # ceiling logged as an anonymous parse failure with no way to
+            # tell that apart from any other kind of bad response.
+            if getattr(final_message, "stop_reason", None) == "max_tokens":
+                logger.warning(
+                    "Claude's streamed response hit the %d-token ceiling and "
+                    "was truncated — the JSON will not parse. Raise "
+                    "_MAX_RESPONSE_TOKENS or tighten the requested response shape.",
+                    _MAX_RESPONSE_TOKENS,
+                )
+
+            raw = next(
+                (block.text for block in final_message.content if hasattr(block, "text")),
+                None,
+            )
+            block_types = [getattr(b, "type", "?") for b in final_message.content]
+            if raw is None:
+                logger.warning(
+                    "Falling back to ADP — Claude's streamed response had no text "
+                    "content. stop_reason=%s, content block types=%s",
+                    getattr(final_message, "stop_reason", None), block_types,
+                )
+                result = _fallback(ctx, self._model, "Claude's response had no usable content")
+            else:
+                result = _parse_response(_restore_prefill(raw), ctx)
+                if result is None:
+                    logger.warning(
+                        "Falling back to ADP — could not parse streamed response. "
+                        "stop_reason=%s, content block types=%s, text length=%d chars.",
+                        getattr(final_message, "stop_reason", None), block_types, len(raw),
+                    )
+                    result = _fallback(ctx, self._model, "Claude's response could not be parsed")
             yield "complete", result
 
         except anthropic.APIError as e:

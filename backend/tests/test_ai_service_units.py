@@ -1257,6 +1257,120 @@ def test_parse_response_handles_a_fully_unprefilled_reply():
 
 
 # ---------------------------------------------------------------------------
+# recommend_stream() reads the FINAL message, not just the accumulated buffer
+#
+# Live failure: a streamed claude-sonnet-5 call fell back to ADP with
+# "Length=1 chars. Head: { ... Tail: {" — the accumulated text_stream buffer
+# was a single opening brace, and recommend_stream() had no visibility into
+# WHY (no stop_reason check, unlike recommend(); no record of what content
+# block types actually came back). stream.get_final_message() returns the
+# same complete Message object messages.create() gets directly, so this pins
+# both that the diagnostic fires and that a case where the buffer under-
+# delivers but the final message has the real text now succeeds instead of
+# needlessly falling back.
+# ---------------------------------------------------------------------------
+
+class _FakeBlock:
+    def __init__(self, type_, text=None):
+        self.type = type_
+        if text is not None:
+            self.text = text
+
+
+class _FakeFinalMessage:
+    def __init__(self, content, stop_reason="end_turn"):
+        self.content = content
+        self.stop_reason = stop_reason
+
+
+class _FakeStream:
+    """Minimal stand-in for anthropic's AsyncMessageStream: async context
+    manager exposing `.text_stream` (async-iterable) and an awaitable
+    `get_final_message()`, matching exactly what recommend_stream() uses."""
+
+    def __init__(self, chunks: list[str], final_message: _FakeFinalMessage):
+        self._chunks = chunks
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    @property
+    async def text_stream(self):
+        for c in self._chunks:
+            yield c
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _stream_result(chunks, final_message, ctx=None):
+    """Runs recommend_stream() to completion against a _FakeStream and
+    returns the ("complete", RecommendationResult) payload."""
+    import asyncio
+    from backend.app.services.ai_service import AIService
+
+    class _FakeMessages:
+        def stream(self, **kwargs):
+            return _FakeStream(chunks, final_message)
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    svc = AIService.__new__(AIService)
+    svc._client = _FakeClient()
+    svc._model = "claude-sonnet-5"
+
+    async def _run():
+        events = []
+        async for event in svc.recommend_stream(ctx or ctx_with_available(1)):
+            events.append(event)
+        return events
+
+    events = asyncio.run(_run())
+    complete = [e for e in events if e[0] == "complete"]
+    assert len(complete) == 1
+    return complete[0][1]
+
+
+def test_stream_uses_final_message_when_buffer_underdelivers(caplog):
+    # The exact live shape: text_stream only ever yielded "{", but the real
+    # final message actually has the complete, valid JSON.
+    good_json = json.dumps({
+        "main": {"player_id": 1, "player_name": "P1", "position": "RB",
+                  "adp": 1.0, "reasoning": "ok"},
+        "alerts": [],
+    })
+    final = _FakeFinalMessage(content=[_FakeBlock("text", text=good_json)])
+    result = _stream_result(chunks=["{"], final_message=final)
+    assert not result.model.endswith(":fallback")
+    assert result.main.player_id == 1
+
+
+def test_stream_truncation_is_logged_with_stop_reason(caplog):
+    final = _FakeFinalMessage(
+        content=[_FakeBlock("text", text='{"main": {"player_id"')],  # cut off
+        stop_reason="max_tokens",
+    )
+    with caplog.at_level("WARNING"):
+        result = _stream_result(chunks=['{"main": {"player_id"'], final_message=final)
+    assert result.model.endswith(":fallback")
+    assert any("token ceiling" in r.message for r in caplog.records)
+
+
+def test_stream_no_text_content_falls_back_with_specific_reason(caplog):
+    final = _FakeFinalMessage(content=[_FakeBlock("thinking")])  # no .text at all
+    with caplog.at_level("WARNING"):
+        result = _stream_result(chunks=[], final_message=final)
+    assert result.model.endswith(":fallback")
+    assert any("no text content" in r.message for r in caplog.records)
+    assert any("thinking" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # Dominated-pick guard
 #
 # Same-position only. Across positions, taking a "worse" player is routinely
