@@ -277,3 +277,52 @@ class DraftProfile(SQLModel, table=True):
     # --- Metadata ---
     source: str = Field(default="nflreadpy")
     last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class Game(SQLModel, table=True):
+    """
+    The published NFL schedule — one row per game — sourced from
+    nflreadpy's load_schedules() (same nflverse data source fetch_metrics.py
+    already depends on; see backend/ingestion/fetch_schedule.py).
+
+    Exists so the AI service can reason about a player's ACTUAL upcoming
+    opponent instead of asking Claude to recall or guess the schedule from
+    its own training data. That matters specifically because the schedule
+    for the season being drafted is typically published (mid-May) AFTER
+    Claude's reliable knowledge cutoff for that season, so an unaided model
+    has no real way to know it and risks stating a confident, wrong
+    opponent/week rather than admitting the gap.
+
+    Keyed by team abbreviation, not by any Player foreign key — deliberately.
+    PlayerMetrics and DraftProfile both need player_id relinking machinery
+    (see their docstrings) because Player rows get reassigned new
+    autoincrement IDs on every ADP reingest. NFL team abbreviations don't
+    have that problem: there are 32 of them, they don't get "reingested,"
+    and "DET" means the same team from one refresh to the next. So this
+    table needs none of that — see game_repo.replace_season, which does a
+    plain delete-and-reinsert per season with no relink step at all.
+
+    One row per game (not one row per team per week) — home_team/away_team
+    together are enough to answer "who does team X play in week N" from
+    either side, without doubling the row count.
+    """
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    season: int = Field(index=True)
+    week: int = Field(index=True)
+    # "REG" | "POST" | "PRE" — nflverse's own values (see fetch_metrics.py's
+    # _filter_regular_season, which confirmed "REG" live for this same
+    # nflverse data source). Stored rather than pre-filtered out at
+    # ingestion time, in case a caller ever wants playoff-week context.
+    game_type: str = Field(default="REG", index=True)
+    home_team: str = Field(index=True)
+    away_team: str = Field(index=True)
+    # Calendar date of the game, if nflverse provides one for this row yet
+    # (early-offseason schedule releases sometimes have the week set but not
+    # every kickoff time finalized) — optional so a missing value degrades
+    # to "unknown," not a bad default.
+    game_date: Optional[datetime] = None
+
+    # --- Metadata ---
+    source: str = Field(default="nflreadpy")
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

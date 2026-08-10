@@ -298,6 +298,26 @@ matching those instead of the real Sleeper/RotoWire content).
 
 ---
 
+## Schedule Data
+
+The NFL schedule (opponent/week/home-away) for the season being drafted, from `nflreadpy` —
+same nflverse data source `fetch_metrics` uses above, no new library or API key. Backs the
+Opportunity recommendation section's matchup context, which otherwise has no way to know the
+real schedule: it's published (typically mid-May) after Claude's reliable knowledge cutoff for
+that season, so asking the model to recall it directly risks a confident, wrong answer rather
+than an honest "I don't know."
+
+```bash
+py -m backend.ingestion.fetch_schedule            # current draft season
+py -m backend.ingestion.fetch_schedule --season 2026
+```
+
+Optional, same as steps 1-6 above — recommendations work without it, just without real
+opponent context. Run it once the season's schedule is out (mid-May) and it won't change again
+except rare game-time moves, so there's no need to re-run this on a schedule of its own.
+
+---
+
 ## Troubleshooting
 
 Three read-only diagnostics. None of them writes to the database.

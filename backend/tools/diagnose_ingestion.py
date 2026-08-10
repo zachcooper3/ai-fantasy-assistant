@@ -43,6 +43,11 @@ _SOURCES: list[tuple[str, dict, str]] = [
     ("load_depth_charts", {}, "depth_chart_rank, depth_chart_trend"),
     ("load_team_stats", {"summary_level": "week"}, "team_pass_rate"),
     ("load_pbp", {}, "red_zone_touches_per_game"),
+    # Not part of refresh_metrics() — this is fetch_schedule.py's source
+    # (see backend/db/models.py::Game). Included here anyway since it's the
+    # same "guessed column names against a live pull" risk fetch_metrics.py
+    # already has this tool for, just for a different ingestion script.
+    ("load_schedules", {}, "the entire Game table (fetch_schedule.py)"),
 ]
 
 # Columns fetch_metrics.py reads, by source. Each entry is the candidate list
@@ -94,6 +99,13 @@ _EXPECTED: dict[str, dict[str, tuple[str, ...]]] = {
         "team":        ("team", "recent_team", "team_abbr"),
         "pass atts":   ("attempts", "passing_attempts"),
         "rush atts":   ("carries", "rushing_attempts"),
+    },
+    "load_schedules": {
+        "week":        ("week",),
+        "home team":   ("home_team",),
+        "away team":   ("away_team",),
+        "game type":   ("game_type", "season_type"),
+        "game date":   ("gameday", "game_date"),
     },
 }
 
