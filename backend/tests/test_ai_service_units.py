@@ -1253,16 +1253,22 @@ def test_completion_kwargs_uses_the_normal_ceiling_even_with_thinking_disabled()
 
 
 # ---------------------------------------------------------------------------
-# _build_messages — prefill is unconditional now that thinking is disabled
-# for every model this app calls (prefill is only incompatible with
-# thinking being ON — see _THINKING_DISABLED_MODELS).
+# _build_messages — some models reject a request ending on an assistant turn
+#
+# Live failure, same draft, AFTER thinking was already disabled for Sonnet:
+# the exact same 400 — "This model does not support assistant message
+# prefill" — came back anyway. Disabling thinking did not fix this; per
+# Anthropic's Sonnet-5-specific docs the prefill rejection is unconditional
+# on this model generation, inherited unchanged from Sonnet 4.6, not a
+# thinking side effect. See _NO_PREFILL_MODELS.
 # ---------------------------------------------------------------------------
 
-def test_build_messages_prefills_for_sonnet():
-    from backend.app.services.ai_service import _build_messages
-    messages = _build_messages("claude-sonnet-5", "prompt text")
-    assert [m["role"] for m in messages] == ["user", "assistant"]
-    assert messages[1]["content"] == "{"
+def test_build_messages_drops_prefill_for_sonnet():
+    from backend.app.services.ai_service import _build_messages, _NO_PREFILL_MODELS
+    for model in _NO_PREFILL_MODELS:
+        messages = _build_messages(model, "prompt text")
+        assert [m["role"] for m in messages] == ["user"]
+        assert messages[0]["content"] == "prompt text"
 
 
 def test_build_messages_still_prefills_for_haiku():

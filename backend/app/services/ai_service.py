@@ -115,26 +115,44 @@ _NO_TEMPERATURE_MODELS = {"claude-sonnet-5"}
 # about, no risk of a stray close-call pick triggering an expensive
 # thinking pass mid-draft.
 #
-# Disabling thinking also resolves two bugs that were fixed around it
-# rather than at the root while thinking stayed on:
+# Disabling thinking also resolves one bug that was fixed around it rather
+# than at the root while thinking stayed on: a streamed response could
+# truncate to a single "{" and nothing else, because thinking tokens are
+# billed against max_tokens even when invisible, and could exhaust the
+# whole budget before the visible JSON started. With thinking off there's
+# no invisible token spend to budget for, so max_tokens goes back to the
+# same _MAX_RESPONSE_TOKENS ceiling every other model uses.
 #
-#   - Assistant-turn prefill was rejected — "This model does not support
-#     assistant message prefill" — because prefill is specifically
-#     incompatible with thinking being on, per Anthropic's docs
-#     (platform.claude.com/docs/en/build-with-claude/thinking). With
-#     thinking off, prefill works again; _build_messages no longer needs a
-#     model-specific carve-out for it.
-#   - A streamed response could truncate to a single "{" and nothing else,
-#     because thinking tokens are billed against max_tokens even when
-#     invisible, and could exhaust the whole budget before the visible JSON
-#     started. With thinking off there's no invisible token spend to budget
-#     for, so max_tokens goes back to the same _MAX_RESPONSE_TOKENS ceiling
-#     every other model uses.
+# It does NOT resolve the assistant-prefill 400 — that turned out to be a
+# separate, unconditional constraint of this model generation. See
+# _NO_PREFILL_MODELS below; disabling thinking here does not touch it.
 #
-# `temperature` stays blocked either way — per the docs that restriction is
-# unconditional on Sonnet 5, not a thinking side effect (see
-# _NO_TEMPERATURE_MODELS above).
+# `temperature` also stays blocked either way — per the docs that
+# restriction is unconditional on Sonnet 5 too, not a thinking side effect
+# (see _NO_TEMPERATURE_MODELS above).
 _THINKING_DISABLED_MODELS = {"claude-sonnet-5"}
+
+# Models that reject an assistant-turn prefill outright, UNCONDITIONALLY —
+# not a thinking side effect, despite what the general Thinking page's "You
+# can't pre-fill the assistant response while thinking is on" line implies
+# in isolation. Confirmed live and in writing: disabling thinking for Sonnet
+# (_THINKING_DISABLED_MODELS above) did NOT fix the prefill 400 — the exact
+# same "This model does not support assistant message prefill" error came
+# back with thinking off. Per Anthropic's Sonnet-5-specific docs
+# (platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5,
+# "API constraints inherited from Claude Sonnet 4.6"): "Prefilling the
+# assistant message returns a 400 error, unchanged from Claude Sonnet 4.6."
+# It's a standing constraint of the Sonnet 4.6/5 generation itself, present
+# whether or not thinking is on — same shape as _NO_TEMPERATURE_MODELS, not
+# downstream of it.
+#
+# Safe to drop the prefill entirely rather than needing a replacement:
+# _restore_prefill already re-adds the opening "{" only when a response
+# doesn't already start with one, and _parse_response already strips
+# ```json fences before giving up. The "Respond with ONLY valid JSON — no
+# markdown, no commentary" line already in the prompt is what keeps a
+# non-prefilled response landing clean without the brace forced open.
+_NO_PREFILL_MODELS = {"claude-sonnet-5"}
 
 
 def _completion_kwargs(model: str) -> dict:
@@ -162,13 +180,13 @@ def _completion_kwargs(model: str) -> dict:
 def _build_messages(model: str, prompt: str) -> list[dict]:
     """
     The user turn, plus a prefilled assistant turn forcing the response to
-    open mid-JSON. Prefill is incompatible with thinking being on, but
-    every model this app currently calls either doesn't think by default
-    or has thinking explicitly disabled (_THINKING_DISABLED_MODELS), so
-    prefill is unconditional. If a future model both thinks by default and
-    can't have thinking disabled (some can't — see that constant's
-    docstring), skip the prefill turn for it here.
+    open mid-JSON — except for _NO_PREFILL_MODELS, which reject a request
+    that ends on an assistant turn at all, unconditionally (see that
+    constant's docstring — it is NOT just a thinking side effect).
     """
+    if model in _NO_PREFILL_MODELS:
+        return [{"role": "user", "content": prompt}]
+
     # Forces the response to begin mid-JSON — no room for a "Here's my
     # pick:" preamble or a ```json fence to wrap it. Also saves a few
     # output tokens per call.
@@ -176,6 +194,7 @@ def _build_messages(model: str, prompt: str) -> list[dict]:
         {"role": "user", "content": prompt},
         {"role": "assistant", "content": "{"},
     ]
+
 
 # How many players from top_available are actually rendered in the tiers
 # table / metrics / news sections. ctx.top_available is deliberately deeper
