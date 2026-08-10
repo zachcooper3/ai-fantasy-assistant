@@ -4,11 +4,12 @@
  *
  * Renders three sections instead of one pick plus a footnote list of
  * alternatives: Main (the model's synthesized pick, with real reasoning),
- * Best Available (up to 2, cheapest by ADP regardless of need), and either
- * Needs (up to 2, fills your highest-priority open starting slot) or, once
- * every starting slot is filled, Depth (0-1, a QB/TE stash pick). Only Main
- * is model-generated — the rest are computed server-side from the same
- * board data, so they're never asked of Claude at all. See the backend's
+ * Best Available (up to 2, cheapest by ADP regardless of need), Needs (up
+ * to 2, fills your highest-priority open starting slot), and Depth (0-2,
+ * one QB stash and one TE stash — see the backend's _depth_pick — which can
+ * appear alongside Needs, not just once it empties). Only Main is
+ * model-generated — the rest are computed server-side from the same board
+ * data, so they're never asked of Claude at all. See the backend's
  * RecommendationResult docstring.
  *
  * Sections are allowed to overlap: the main pick is routinely also the best
@@ -639,7 +640,10 @@ export default function AIPanel({
             )}
 
             {/* Needs — fills your highest-priority open starting slot.
-                Empty once every slot is filled; Depth takes over below. */}
+                Empty once the skill lineup is filled, EXCEPT it can pick
+                back up recommending DST/K once those become the last open
+                slots — see the backend's _needs docstring. Can render
+                alongside Depth below during that phase. */}
             {recommendation.needs.length > 0 && (
               <div>
                 <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">
@@ -662,7 +666,9 @@ export default function AIPanel({
               </div>
             )}
 
-            {/* Depth — a QB/TE stash, only ever shown once Needs is empty. */}
+            {/* Depth — a QB stash and a TE stash (up to 2), once the skill
+                starting lineup is filled. Can render alongside Needs above
+                during the DST/K phase — see the backend's _depth_pick. */}
             {recommendation.depth.length > 0 && (
               <div>
                 <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">

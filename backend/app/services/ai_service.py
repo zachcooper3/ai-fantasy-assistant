@@ -262,23 +262,28 @@ class RecommendationResult:
     The model still gets the last word on how to WEIGH all that (`main`),
     it just isn't asked to re-derive facts this module already knows.
 
-    Capped at 5 players total across all sections (main counts as 1):
-    best_available up to 2, needs up to 2, depth 0-1. needs and depth CAN
-    both be non-empty at once — once the skill lineup (QB/RB/WR/TE/FLEX) is
-    filled, needs starts recommending DST/K (see _needs) while depth keeps
-    offering its QB/TE stash, deliberately not gated behind each other (see
-    _depth_pick). This still fits the 5-slot budget in practice: DST/K never
-    have PlayerMetrics, so _needs' best-VOR second entry never fires for
-    them and needs contributes at most 1 entry during that phase, not 2.
-    Overlap between sections is expected, not an error: the main pick is
-    routinely also the cheapest available or the neediest-position fill,
-    and PickSuggestion.tags is how the UI shows that rather than hiding it.
+    Capped at 6 players total across all sections (main counts as 1):
+    best_available up to 2, needs up to 2, depth 0-2 (one per
+    _DEPTH_POSITIONS: QB and TE). needs and depth CAN both be non-empty at
+    once — once the skill lineup (QB/RB/WR/TE/FLEX) is filled, needs starts
+    recommending DST/K (see _needs) while depth keeps offering its QB/TE
+    stash, deliberately not gated behind each other (see _depth_pick). In
+    practice the two rarely both max out: DST/K never have PlayerMetrics,
+    so _needs' best-VOR second entry never fires for them and needs
+    contributes at most 1 entry during that phase, not 2 — but depth alone
+    can legitimately fill both of its slots (a QB stash AND a TE stash) any
+    time both positions have eligible players on the board, so 6 is a real
+    ceiling, not just a nominal one. Overlap between sections is expected,
+    not an error: the main pick is routinely also the cheapest available or
+    the neediest-position fill, and PickSuggestion.tags is how the UI shows
+    that rather than hiding it.
     """
     main: PickSuggestion
     best_available: list[PickSuggestion]
     needs: list[PickSuggestion]
-    # 0 or 1 entries. Only ever populated when `needs` is empty — see
-    # _depth_pick.
+    # 0-2 entries, one per _DEPTH_POSITIONS (QB, TE) — not just whichever of
+    # the two is cheaper by ADP overall. Can be non-empty at the same time
+    # as `needs` — see _depth_pick.
     depth: list[PickSuggestion]
     alerts: list[str]
     model: str
@@ -1358,10 +1363,13 @@ _TAG_DEPTH = "depth"
 # during that phase, since DST/K never have PlayerMetrics and so never win
 # _needs' best-VOR second slot. Real ceiling on any single response stays
 # 1 (main) + _BEST_AVAILABLE_SLOTS + 1 (needs, DST/K-only phase) +
-# _DEPTH_SLOTS = 5. See RecommendationResult's docstring.
+# _DEPTH_SLOTS = 6. See RecommendationResult's docstring.
 _BEST_AVAILABLE_SLOTS = 2
 _NEEDS_SLOTS = 2
-_DEPTH_SLOTS = 1
+# One slot per _DEPTH_POSITIONS entry (QB, TE) — see that constant and
+# _depth_pick for why this isn't a single combined "cheapest of the two"
+# slot.
+_DEPTH_SLOTS = 2
 
 # Positions eligible for a Depth stash pick: a second QB or TE specifically.
 # Nowhere else in this app ever surfaces that pick — the opportunity-cost
@@ -1370,6 +1378,10 @@ _DEPTH_SLOTS = 1
 # is actually done and a speculative stash becomes a real option. RB/WR
 # aren't included: bench value at those positions already flows through
 # `best_available` naturally, since FLEX keeps them relevant all draft.
+#
+# _depth_pick offers one candidate per position here, not just whichever
+# is cheapest overall — see that function's docstring for the live report
+# that motivated the split.
 _DEPTH_POSITIONS = ("QB", "TE")
 
 # Priority order for _needs when more than one position is still open —
@@ -1552,26 +1564,38 @@ def _depth_pick(ctx: RecommendationContext, skill_gaps: dict[str, int]) -> list[
     stretch between "lineup done" and "DST drafted" — Coop asked for both
     to be able to show at once, not for one to block the other.
 
-    Cheapest by ADP among QB/TE — this is upside speculation, not a
-    requirement, so there's no best-VOR pairing the way _needs has; one
-    candidate is enough.
+    One candidate PER POSITION in _DEPTH_POSITIONS (cheapest by ADP at that
+    position), not the single cheapest across QB and TE combined. Combining
+    them was the original design and it silently starved whichever position
+    happened to run more expensive by ADP — reported live: with backup QBs
+    routinely cheaper by ADP than backup TEs, this section surfaced QB
+    stash after QB stash and never once offered a TE, even on rosters
+    genuinely thin at TE. Roster-depth risk at QB and TE aren't substitutes
+    for each other, so a thin spot at one position shouldn't have to
+    outbid the other on ADP just to get suggested — each gets its own shot
+    at the slot whenever it has an eligible player on the board. Still pure
+    upside speculation, not a requirement, so there's no best-VOR pairing
+    the way _needs has; one candidate per position is enough.
     """
     if skill_gaps:
         return []
-    eligible = sorted(
-        (p for p in ctx.top_available if p["position"] in _DEPTH_POSITIONS),
-        key=lambda p: p["adp"],
-    )
-    if not eligible:
-        return []
-    p = eligible[0]
-    return [PickSuggestion(
-        player_id=p["id"], player_name=p["name"], position=p["position"],
-        adp=p["adp"],
-        reasoning=f"{p['position']} depth stash — starting needs are covered.",
-        tags=[_TAG_DEPTH],
-        survival=_survival_code(p["adp"], ctx.my_following_pick_number),
-    )]
+    out: list[PickSuggestion] = []
+    for pos in _DEPTH_POSITIONS:
+        at_pos = sorted(
+            (p for p in ctx.top_available if p["position"] == pos),
+            key=lambda p: p["adp"],
+        )
+        if not at_pos:
+            continue
+        p = at_pos[0]
+        out.append(PickSuggestion(
+            player_id=p["id"], player_name=p["name"], position=p["position"],
+            adp=p["adp"],
+            reasoning=f"{p['position']} depth stash — starting needs are covered.",
+            tags=[_TAG_DEPTH],
+            survival=_survival_code(p["adp"], ctx.my_following_pick_number),
+        ))
+    return out[:_DEPTH_SLOTS]
 
 
 def _tag_overlaps(

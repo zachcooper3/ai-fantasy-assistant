@@ -2815,22 +2815,65 @@ def test_needs_is_empty_once_the_lineup_is_full():
     assert _needs(ctx, {}, {}) == []
 
 
-def test_depth_fires_only_when_needs_is_empty_and_only_for_qb_te():
+def test_depth_fires_only_once_skill_gaps_clear_and_only_for_qb_te():
     board = [
         {"id": 1, "rank": 1, "name": "QB2", "position": "QB", "team": "X", "adp": 180.0, "sleeper_id": None},
         {"id": 2, "rank": 2, "name": "RB-bench", "position": "RB", "team": "X", "adp": 170.0, "sleeper_id": None},
     ]
     ctx = _sections_ctx(board)
 
-    # needs non-empty -> depth stays empty even though QB/TE candidates exist
-    fake_needs = [PickSuggestion(9, "placeholder", "TE", 1.0, "")]
-    assert _depth_pick(ctx, fake_needs) == []
+    # skill_gaps non-empty -> depth stays empty even though a QB candidate
+    # exists (gated on skill_gaps, not on `needs` — see _depth_pick).
+    assert _depth_pick(ctx, {"WR": 1}) == []
 
-    # needs empty -> depth picks the cheapest QB/TE, never the cheaper RB
-    depth = _depth_pick(ctx, [])
+    # skill_gaps empty -> depth picks the cheapest QB, never the cheaper
+    # RB (RB/WR aren't in _DEPTH_POSITIONS). No TE on the board, so only
+    # one entry comes back — see the next test for both firing at once.
+    depth = _depth_pick(ctx, {})
     assert len(depth) == 1
     assert depth[0].player_id == 1
     assert depth[0].tags == [_TAG_DEPTH]
+
+
+def test_depth_recommends_both_qb_and_te_when_both_available():
+    # Live report: with backup QBs routinely cheaper by ADP than backup
+    # TEs, a combined "cheapest of QB or TE" silently starved TE stash
+    # recommendations even on rosters genuinely thin at TE. One candidate
+    # per position fixes that — QB's cheaper ADP no longer crowds TE out.
+    board = [
+        {"id": 1, "rank": 1, "name": "QB2", "position": "QB", "team": "X", "adp": 180.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "TE2", "position": "TE", "team": "X", "adp": 210.0, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "RB-bench", "position": "RB", "team": "X", "adp": 170.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    depth = _depth_pick(ctx, {})
+    assert {p.player_id for p in depth} == {1, 2}
+    assert {p.position for p in depth} == {"QB", "TE"}
+    assert all(p.tags == [_TAG_DEPTH] for p in depth)
+
+
+def test_depth_picks_cheapest_within_each_position_independently():
+    # Two QB candidates and one TE candidate: depth should return the
+    # cheaper QB (not both QBs) plus the one TE — one slot per position,
+    # not one slot for "cheapest overall" per position count.
+    board = [
+        {"id": 1, "rank": 1, "name": "QB-cheap", "position": "QB", "team": "X", "adp": 160.0, "sleeper_id": None},
+        {"id": 2, "rank": 2, "name": "QB-pricier", "position": "QB", "team": "X", "adp": 180.0, "sleeper_id": None},
+        {"id": 3, "rank": 3, "name": "TE2", "position": "TE", "team": "X", "adp": 210.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    depth = _depth_pick(ctx, {})
+    assert {p.player_id for p in depth} == {1, 3}
+
+
+def test_depth_returns_only_te_when_no_qb_is_available():
+    board = [
+        {"id": 1, "rank": 1, "name": "TE2", "position": "TE", "team": "X", "adp": 210.0, "sleeper_id": None},
+    ]
+    ctx = _sections_ctx(board)
+    depth = _depth_pick(ctx, {})
+    assert [p.player_id for p in depth] == [1]
+    assert depth[0].position == "TE"
 
 
 def test_tag_overlaps_merges_tags_for_the_same_player():

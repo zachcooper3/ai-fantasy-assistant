@@ -147,12 +147,16 @@ export interface Recommendation {
   best_available: PickSuggestion[];
   /**
    * Up to 2, the realistic slate at your highest-priority open starting
-   * slot. Empty once every starting slot is filled — see `depth`.
+   * slot. Empty once the skill lineup is filled, except it can resume
+   * recommending DST/K once those become the last open slots — see the
+   * backend's _needs docstring. Can be non-empty alongside `depth`.
    */
   needs: PickSuggestion[];
   /**
-   * 0 or 1. A QB/TE stash pick, only ever present when `needs` is empty —
-   * nowhere else does this app ever suggest a second QB/TE.
+   * 0-2: one QB stash and one TE stash, once the skill starting lineup is
+   * filled — one candidate per position, not just whichever of the two is
+   * cheaper by ADP overall. Nowhere else does this app ever suggest a
+   * second QB/TE. Can be non-empty alongside `needs`.
    */
   depth: PickSuggestion[];
   alerts: string[];
