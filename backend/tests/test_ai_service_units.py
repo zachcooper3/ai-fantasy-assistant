@@ -1469,6 +1469,32 @@ def test_fallback_carries_a_survival_tag_too():
     assert result.main.survival == "take_now"
 
 
+# ---------------------------------------------------------------------------
+# Fallback reason — six different failure paths used to collapse into one
+# generic "AI service unavailable" alert, and the frontend hardcoded "no
+# ANTHROPIC_API_KEY" for all of them. A live draft hit a real Claude API
+# error (a configured, valid key) and was told to go check .env for a key
+# that was never the problem.
+# ---------------------------------------------------------------------------
+
+def test_fallback_default_reason_is_generic():
+    from backend.app.services.ai_service import _fallback
+    ctx = _survival_ctx_for([11.5])
+    result = _fallback(ctx, "test-model")
+    assert result.alerts == ["AI service unavailable — showing best available by ADP only."]
+
+
+def test_fallback_reason_is_specific_when_given():
+    from backend.app.services.ai_service import _fallback
+    ctx = _survival_ctx_for([11.5])
+    result = _fallback(ctx, "test-model", "Claude API error")
+    assert result.alerts == ["Claude API error — showing best available by ADP only."]
+    # Must NOT still claim the key is missing — that's a different, specific
+    # cause with a different fix (see the six call sites in recommend()/
+    # recommend_stream()).
+    assert "ANTHROPIC_API_KEY" not in result.alerts[0]
+
+
 def test_survival_codes_are_stable_regardless_of_prompt_wording():
     # The prompt labels have been rewritten once already ("GONE" read as
     # unavailable). The API codes must not move with them.

@@ -420,13 +420,27 @@ export default function AIPanel({
   // exists to prevent.
   const canDraft = !isSyncing && !isStale;
 
-  // "AI service unavailable" is already communicated by the fallback notice on
-  // the card itself; repeating it as an alert is noise.
+  // The fallback alert (whatever the specific reason — see FALLBACK_REASON_RE
+  // below) is already communicated by the badge on the card itself; repeating
+  // it as a full alert banner is noise. Matched by suffix rather than the old
+  // "AI service unavailable" substring, now that the backend names the
+  // SPECIFIC cause (missing key, API error, unparseable response, ...)
+  // instead of one generic sentence for all of them.
   const alerts = recommendation
-    ? recommendation.alerts.filter((a) => !a.includes("AI service unavailable"))
+    ? recommendation.alerts.filter((a) => !a.endsWith("showing best available by ADP only."))
     : [];
 
   const isFallback = recommendation?.model.includes("fallback") ?? false;
+
+  // The fallback alert's reason prefix, e.g. "No ANTHROPIC_API_KEY configured"
+  // or "Claude API error" — see _fallback's `reason` param in ai_service.py.
+  // Falls back to a generic label on the off chance alerts is empty (should
+  // not happen alongside isFallback, but the badge shouldn't blank out if it
+  // ever does).
+  const fallbackReason =
+    recommendation?.alerts
+      .find((a) => a.endsWith("showing best available by ADP only."))
+      ?.replace(/ — showing best available by ADP only\.$/, "") ?? "AI service unavailable";
   const confidence = CONFIDENCE_STYLES[recommendation?.confidence ?? "medium"];
 
   return (
@@ -582,8 +596,8 @@ export default function AIPanel({
                 >
                   {confidence.label}
                 </span>
-                <span className="text-xs text-slate-400 truncate">
-                  {isFallback ? "⚠ Fallback — no ANTHROPIC_API_KEY" : recommendation.model}
+                <span className="text-xs text-slate-400 truncate" title={isFallback ? fallbackReason : undefined}>
+                  {isFallback ? `⚠ Fallback — ${fallbackReason}` : recommendation.model}
                 </span>
               </div>
             </div>

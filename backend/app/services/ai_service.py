@@ -3446,10 +3446,25 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
 # Fallback — top available player by ADP (no AI needed)
 # ---------------------------------------------------------------------------
 
-def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
+def _fallback(
+    ctx: RecommendationContext,
+    model: str,
+    reason: str = "AI service unavailable",
+) -> RecommendationResult:
     """
     Returns a safe, data-driven recommendation when Claude is unavailable.
     Simply picks the top available player by ADP.
+
+    `reason` names the SPECIFIC cause (see the six call sites in
+    recommend()/recommend_stream()) rather than always saying the same
+    generic sentence. Live confusion: every one of those six paths used to
+    produce the identical alert text, and the frontend hardcoded "no
+    ANTHROPIC_API_KEY" for all of them — so a configured key that hit a
+    transient network error, a rate limit, or an unparseable response read
+    to the user exactly the same as "you never set a key," sending them to
+    check .env for a problem that wasn't there. The backend log always knew
+    the real reason (see each site's logger.warning/error call); this just
+    stops throwing that fact away before it reaches the UI.
     """
     if not ctx.top_available:
         raise RuntimeError("No available players to recommend.")
@@ -3475,7 +3490,7 @@ def _fallback(ctx: RecommendationContext, model: str) -> RecommendationResult:
         best_available=best_available,
         needs=needs,
         depth=depth,
-        alerts=["AI service unavailable — showing best available by ADP only."],
+        alerts=[f"{reason} — showing best available by ADP only."],
         model=f"{model}:fallback",
         strategy="",
         # The fallback is pure ADP ordering with no roster awareness at all —
@@ -3620,7 +3635,7 @@ class AIService:
         clock does not care why the API is unhappy.
         """
         if self._client is None:
-            yield "complete", _fallback(ctx, self._model)
+            yield "complete", _fallback(ctx, self._model, "No ANTHROPIC_API_KEY configured")
             return
 
         prompt = await asyncio.to_thread(_build_prompt, ctx)
@@ -3658,15 +3673,15 @@ class AIService:
             result = _parse_response(_restore_prefill(buffer), ctx)
             if result is None:
                 logger.warning("Falling back to ADP — could not parse streamed response.")
-                result = _fallback(ctx, self._model)
+                result = _fallback(ctx, self._model, "Claude's response could not be parsed")
             yield "complete", result
 
         except anthropic.APIError as e:
             logger.error("Anthropic API error during stream: %s", e)
-            yield "complete", _fallback(ctx, self._model)
+            yield "complete", _fallback(ctx, self._model, "Claude API error")
         except Exception:
             logger.exception("Unexpected error during streamed recommendation.")
-            yield "complete", _fallback(ctx, self._model)
+            yield "complete", _fallback(ctx, self._model, "Unexpected error contacting Claude")
 
     async def recommend(self, ctx: RecommendationContext) -> RecommendationResult:
         """
@@ -3674,7 +3689,7 @@ class AIService:
         Falls back to top-ADP logic if the API call fails.
         """
         if self._client is None:
-            return _fallback(ctx, self._model)
+            return _fallback(ctx, self._model, "No ANTHROPIC_API_KEY configured")
 
         # _build_prompt is sync on purpose (it's also used by the CLI
         # preview in main() below) and it performs the ChromaDB lookup, so
@@ -3727,25 +3742,25 @@ class AIService:
             )
             if raw is None:
                 logger.warning("Falling back to ADP — Claude response had no text content.")
-                return _fallback(ctx, self._model)
+                return _fallback(ctx, self._model, "Claude's response had no usable content")
 
             result = _parse_response(_restore_prefill(raw), ctx)
 
             if result is None:
                 logger.warning("Falling back to ADP — could not parse Claude response.")
-                return _fallback(ctx, self._model)
+                return _fallback(ctx, self._model, "Claude's response could not be parsed")
 
             return result
 
         except anthropic.APIError as e:
             logger.error("Anthropic API error: %s", e)
-            return _fallback(ctx, self._model)
+            return _fallback(ctx, self._model, "Claude API error")
         except Exception:
             # This method's contract is "never fail on draft day" — any
             # unexpected error (network weirdness the SDK didn't wrap,
             # response-shape surprises) degrades to ADP, never a 500.
             logger.exception("Unexpected error during recommendation — falling back to ADP.")
-            return _fallback(ctx, self._model)
+            return _fallback(ctx, self._model, "Unexpected error contacting Claude")
 
 
 # ---------------------------------------------------------------------------
