@@ -1208,84 +1208,61 @@ def test_completion_kwargs_always_sets_model_and_max_tokens():
 
 
 # ---------------------------------------------------------------------------
-# _completion_kwargs — thinking-by-default models need a roomier max_tokens
+# _completion_kwargs — thinking is explicitly disabled for Sonnet
 #
 # Live failure, same draft, minutes after the prefill fix: Sonnet calls
 # started succeeding (200, no 400) but the streamed body was a single "{"
 # character that failed to parse. Root cause (confirmed via Anthropic's
 # docs, not a live call): claude-sonnet-5 has adaptive thinking on by
 # default, and thinking tokens are billed against max_tokens even when
-# invisible to the caller. At the old 3072-token ceiling, thinking alone
-# could exhaust the budget before a single character of the JSON answer
-# was emitted. Fix: give thinking-by-default models a much roomier ceiling
-# instead of disabling thinking (which would defeat the point of offering
-# Sonnet as the "richer analysis" option).
-# ---------------------------------------------------------------------------
-
-def test_completion_kwargs_gives_thinking_models_a_roomier_ceiling():
-    from backend.app.services.ai_service import (
-        _completion_kwargs,
-        _THINKING_BY_DEFAULT_MODELS,
-        _MAX_RESPONSE_TOKENS_THINKING,
-        _MAX_RESPONSE_TOKENS,
-    )
-    for model in _THINKING_BY_DEFAULT_MODELS:
-        kwargs = _completion_kwargs(model)
-        assert kwargs["max_tokens"] == _MAX_RESPONSE_TOKENS_THINKING
-        assert _MAX_RESPONSE_TOKENS_THINKING > _MAX_RESPONSE_TOKENS
-
-
-def test_completion_kwargs_leaves_non_thinking_models_at_the_normal_ceiling():
-    from backend.app.services.ai_service import (
-        _completion_kwargs,
-        _THINKING_BY_DEFAULT_MODELS,
-        _MAX_RESPONSE_TOKENS,
-    )
-    model = "claude-haiku-4-5-20251001"
-    assert model not in _THINKING_BY_DEFAULT_MODELS
-    assert _completion_kwargs(model)["max_tokens"] == _MAX_RESPONSE_TOKENS
-
-
-# ---------------------------------------------------------------------------
-# _completion_kwargs — thinking-by-default models run at low effort
+# invisible to the caller — at the old 3072-token ceiling, thinking alone
+# could exhaust the budget before a single character of the JSON answer was
+# emitted.
 #
-# Adaptive thinking already skips itself on simple requests; the cost risk
-# is a hard pick running unbounded at the API's default `high` effort.
-# `effort: "low"` is Anthropic's own recommendation for latency-sensitive,
-# non-coding workloads — a live draft pick under a clock qualifies. This is
-# a deliberate middle ground: not disabling thinking outright (which would
-# give up Sonnet's whole reason for being offered), not leaving it at the
-# uncapped default either.
+# Two token-budget-based fixes (a roomier ceiling, then effort tuning) were
+# tried and superseded by disabling thinking outright: Coop's call, given
+# this app's per-pick prompt already spells out the analysis framework and
+# runs under a live draft clock, where thinking's cost isn't worth its
+# marginal value here. Disabling thinking also means max_tokens no longer
+# needs special-casing — no invisible thinking spend to leave headroom for.
 # ---------------------------------------------------------------------------
 
-def test_completion_kwargs_runs_low_effort_for_thinking_models():
-    from backend.app.services.ai_service import _completion_kwargs, _LOW_EFFORT_MODELS
-    for model in _LOW_EFFORT_MODELS:
+def test_completion_kwargs_disables_thinking_for_sonnet():
+    from backend.app.services.ai_service import _completion_kwargs, _THINKING_DISABLED_MODELS
+    for model in _THINKING_DISABLED_MODELS:
         kwargs = _completion_kwargs(model)
-        assert kwargs["output_config"] == {"effort": "low"}
+        assert kwargs["thinking"] == {"type": "disabled"}
 
 
-def test_completion_kwargs_omits_effort_for_haiku():
+def test_completion_kwargs_omits_thinking_for_haiku():
     from backend.app.services.ai_service import _completion_kwargs
     kwargs = _completion_kwargs("claude-haiku-4-5-20251001")
-    assert "output_config" not in kwargs
+    assert "thinking" not in kwargs
+
+
+def test_completion_kwargs_uses_the_normal_ceiling_even_with_thinking_disabled():
+    # With thinking off there's no invisible token spend to budget for, so
+    # every model — including Sonnet — uses the same ceiling.
+    from backend.app.services.ai_service import (
+        _completion_kwargs,
+        _THINKING_DISABLED_MODELS,
+        _MAX_RESPONSE_TOKENS,
+    )
+    for model in _THINKING_DISABLED_MODELS:
+        assert _completion_kwargs(model)["max_tokens"] == _MAX_RESPONSE_TOKENS
 
 
 # ---------------------------------------------------------------------------
-# _build_messages — some models reject a request ending on an assistant turn
-#
-# Live failure, same draft, minutes after the temperature fix: the next
-# Sonnet call 400'd too — "This model does not support assistant message
-# prefill. The conversation must end with a user message." claude-sonnet-5
-# rejects the prefill trick outright, not just a specific value of it.
+# _build_messages — prefill is unconditional now that thinking is disabled
+# for every model this app calls (prefill is only incompatible with
+# thinking being ON — see _THINKING_DISABLED_MODELS).
 # ---------------------------------------------------------------------------
 
-def test_build_messages_drops_prefill_for_a_broken_model():
-    from backend.app.services.ai_service import _build_messages, _NO_PREFILL_MODELS
-    for model in _NO_PREFILL_MODELS:
-        messages = _build_messages(model, "prompt text")
-        assert [m["role"] for m in messages] == ["user"]
-        assert messages[0]["content"] == "prompt text"
+def test_build_messages_prefills_for_sonnet():
+    from backend.app.services.ai_service import _build_messages
+    messages = _build_messages("claude-sonnet-5", "prompt text")
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[1]["content"] == "{"
 
 
 def test_build_messages_still_prefills_for_haiku():
@@ -1305,10 +1282,11 @@ def test_restore_prefill_handles_a_response_with_no_prefill_sent():
 
 
 def test_parse_response_handles_a_fully_unprefilled_reply():
-    # End-to-end proof that dropping the prefill doesn't need a parser
-    # change: a complete, self-contained JSON object (what a
-    # _NO_PREFILL_MODELS response looks like) parses exactly like a
-    # restored-prefill one would.
+    # End-to-end proof that _restore_prefill/_parse_response don't need a
+    # model-specific carve-out: a complete, self-contained JSON object (what
+    # a non-prefilled response would look like, if some future model ever
+    # rejects prefill again) parses exactly like a restored-prefill one
+    # would.
     ctx = ctx_with_available(1)
     payload = json.dumps({
         "main": {"player_id": 1, "player_name": "P1", "position": "RB",

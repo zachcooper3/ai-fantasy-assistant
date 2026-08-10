@@ -91,11 +91,11 @@ async def _run(use_api: bool, repeat: int) -> None:
                 with _timed("4. Claude API call"):
                     # Goes through the same _completion_kwargs/_build_messages
                     # helpers recommend()/recommend_stream() use, rather than
-                    # reconstructing the call by hand — this duplicated the
-                    # hand-built version and so silently missed both the
-                    # temperature and assistant-prefill fixes for
-                    # claude-sonnet-5 (S._NO_TEMPERATURE_MODELS /
-                    # S._NO_PREFILL_MODELS) when they landed in ai_service.py.
+                    # reconstructing the call by hand — a hand-built version
+                    # previously duplicated the call and so silently missed
+                    # the temperature/thinking fixes for claude-sonnet-5
+                    # (S._NO_TEMPERATURE_MODELS / S._THINKING_DISABLED_MODELS)
+                    # when they landed in ai_service.py.
                     response = await svc_ai._client.messages.create(
                         **S._completion_kwargs(svc_ai.model_name),
                         system=system,
