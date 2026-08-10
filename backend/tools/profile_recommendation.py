@@ -89,13 +89,17 @@ async def _run(use_api: bool, repeat: int) -> None:
                 print("\n  no ANTHROPIC_API_KEY — skipping the API call")
             else:
                 with _timed("4. Claude API call"):
+                    # Goes through the same _completion_kwargs/_build_messages
+                    # helpers recommend()/recommend_stream() use, rather than
+                    # reconstructing the call by hand — this duplicated the
+                    # hand-built version and so silently missed both the
+                    # temperature and assistant-prefill fixes for
+                    # claude-sonnet-5 (S._NO_TEMPERATURE_MODELS /
+                    # S._NO_PREFILL_MODELS) when they landed in ai_service.py.
                     response = await svc_ai._client.messages.create(
-                        model=svc_ai.model_name,
-                        max_tokens=S._MAX_RESPONSE_TOKENS,
-                        temperature=S._TEMPERATURE,
+                        **S._completion_kwargs(svc_ai.model_name),
                         system=system,
-                        messages=[{"role": "user", "content": prompt},
-                                  {"role": "assistant", "content": "{"}],
+                        messages=S._build_messages(svc_ai.model_name, prompt),
                     )
                 usage = getattr(response, "usage", None)
                 raw = next((b.text for b in response.content if hasattr(b, "text")), "")

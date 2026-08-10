@@ -89,6 +89,66 @@ _MAX_RESPONSE_TOKENS = 3072
 # on JSON validity at this level.
 _TEMPERATURE = 0.3
 
+# Models that 400 on ANY `temperature` value at all — "`temperature` is
+# deprecated for this model" — rather than clamping or ignoring it. Confirmed
+# live: every single call failed the instant the Haiku/Sonnet toggle (see
+# AI_MODEL_CHOICES) made claude-sonnet-5 actually reachable, silently
+# degrading a whole draft to the ADP fallback. claude-haiku-4-5-20251001 has
+# been sending `temperature` successfully since before that toggle existed,
+# so this is scoped to the specific model(s) proven broken rather than
+# guessed at generation-wide — add to this set if another model 400s the
+# same way.
+_NO_TEMPERATURE_MODELS = {"claude-sonnet-5"}
+
+# Models that 400 on an assistant-turn prefill — "This model does not
+# support assistant message prefill. The conversation must end with a user
+# message." — found seconds after fixing _NO_TEMPERATURE_MODELS above, same
+# model, same "first real call this app ever made to it" story. Two
+# unrelated classic-API knobs gone on the same new model in one sitting
+# means a THIRD surprise here is plausible — if a future 400 mentions some
+# other parameter, the fix is the same shape: read the message, don't guess.
+#
+# Safe to drop entirely rather than needing a replacement: _restore_prefill
+# already re-adds the opening "{" only when a response doesn't already start
+# with one (see its docstring — written defensively for exactly a call path
+# that stops prefilling), and _parse_response already strips ```json fences
+# before giving up. The "Respond with ONLY valid JSON — no markdown, no
+# commentary" line already in the prompt is what keeps a non-prefilled
+# response landing clean without the brace forced open.
+_NO_PREFILL_MODELS = {"claude-sonnet-5"}
+
+
+def _completion_kwargs(model: str) -> dict:
+    """
+    Shared kwargs for messages.create()/messages.stream(), minus `messages`
+    itself (recommend() and recommend_stream() build slightly different
+    message lists). Omits `temperature` entirely for _NO_TEMPERATURE_MODELS
+    rather than sending some "safe" fallback value — the API error was that
+    the PARAMETER is deprecated, not that 0.3 specifically is out of range,
+    so any value would 400 the same way.
+    """
+    kwargs = {"model": model, "max_tokens": _MAX_RESPONSE_TOKENS}
+    if model not in _NO_TEMPERATURE_MODELS:
+        kwargs["temperature"] = _TEMPERATURE
+    return kwargs
+
+
+def _build_messages(model: str, prompt: str) -> list[dict]:
+    """
+    The user turn, plus a prefilled assistant turn forcing the response to
+    open mid-JSON — except for _NO_PREFILL_MODELS, which reject a request
+    that ends on an assistant turn at all. See _NO_PREFILL_MODELS' comment
+    for why dropping the prefill outright (rather than replacing it with
+    something else) is safe for parsing.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    if model not in _NO_PREFILL_MODELS:
+        # Forces the response to begin mid-JSON — no room for a "Here's my
+        # pick:" preamble or a ```json fence to wrap it. Also saves a few
+        # output tokens per call.
+        messages.append({"role": "assistant", "content": "{"})
+    return messages
+
 # How many players from top_available are actually rendered in the tiers
 # table / metrics / news sections. ctx.top_available is deliberately deeper
 # than this (see _build_context's top_n) so the positional drop-off and
@@ -3644,14 +3704,9 @@ class AIService:
 
         try:
             async with self._client.messages.stream(
-                model=self._model,
-                max_tokens=_MAX_RESPONSE_TOKENS,
-                temperature=_TEMPERATURE,
+                **_completion_kwargs(self._model),
                 system=_build_system_prompt(ctx.scoring_format),
-                messages=[
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "{"},
-                ],
+                messages=_build_messages(self._model, prompt),
             ) as stream:
                 async for chunk in stream.text_stream:
                     buffer += chunk
@@ -3703,20 +3758,9 @@ class AIService:
 
         try:
             response = await self._client.messages.create(
-                model=self._model,
-                max_tokens=_MAX_RESPONSE_TOKENS,
-                temperature=_TEMPERATURE,
+                **_completion_kwargs(self._model),
                 system=_build_system_prompt(ctx.scoring_format),
-                messages=[
-                    {"role": "user", "content": prompt},
-                    # Prefilled assistant turn: the response is forced to begin
-                    # mid-JSON, so there is no room for a "Here's my pick:"
-                    # preamble or a ```json fence to wrap it. Both were real
-                    # parse failures, and a parse failure here doesn't degrade
-                    # the recommendation, it discards it for the ADP fallback.
-                    # Also saves a few output tokens per call.
-                    {"role": "assistant", "content": "{"},
-                ],
+                messages=_build_messages(self._model, prompt),
             )
 
             # A truncated response is invalid JSON, so it fails in

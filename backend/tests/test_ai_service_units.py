@@ -1178,6 +1178,85 @@ def test_temperature_allows_variation_without_being_random():
 
 
 # ---------------------------------------------------------------------------
+# _completion_kwargs — some models 400 on ANY `temperature` value
+#
+# Live failure: the Haiku/Sonnet toggle made claude-sonnet-5 reachable for
+# the first time, and every single request 400'd — "`temperature` is
+# deprecated for this model" — silently degrading the whole draft to the ADP
+# fallback. claude-haiku-4-5-20251001 had been sending `temperature`
+# successfully the entire time; the bug only existed for a model nothing
+# had ever actually called before the toggle shipped.
+# ---------------------------------------------------------------------------
+
+def test_completion_kwargs_omits_temperature_for_a_broken_model():
+    from backend.app.services.ai_service import _completion_kwargs, _NO_TEMPERATURE_MODELS
+    for model in _NO_TEMPERATURE_MODELS:
+        assert "temperature" not in _completion_kwargs(model)
+
+
+def test_completion_kwargs_still_sends_temperature_for_haiku():
+    from backend.app.services.ai_service import _completion_kwargs
+    kwargs = _completion_kwargs("claude-haiku-4-5-20251001")
+    assert kwargs.get("temperature") == _TEMPERATURE
+
+
+def test_completion_kwargs_always_sets_model_and_max_tokens():
+    from backend.app.services.ai_service import _completion_kwargs, _MAX_RESPONSE_TOKENS
+    kwargs = _completion_kwargs("claude-sonnet-5")
+    assert kwargs["model"] == "claude-sonnet-5"
+    assert kwargs["max_tokens"] == _MAX_RESPONSE_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# _build_messages — some models reject a request ending on an assistant turn
+#
+# Live failure, same draft, minutes after the temperature fix: the next
+# Sonnet call 400'd too — "This model does not support assistant message
+# prefill. The conversation must end with a user message." claude-sonnet-5
+# rejects the prefill trick outright, not just a specific value of it.
+# ---------------------------------------------------------------------------
+
+def test_build_messages_drops_prefill_for_a_broken_model():
+    from backend.app.services.ai_service import _build_messages, _NO_PREFILL_MODELS
+    for model in _NO_PREFILL_MODELS:
+        messages = _build_messages(model, "prompt text")
+        assert [m["role"] for m in messages] == ["user"]
+        assert messages[0]["content"] == "prompt text"
+
+
+def test_build_messages_still_prefills_for_haiku():
+    from backend.app.services.ai_service import _build_messages
+    messages = _build_messages("claude-haiku-4-5-20251001", "prompt text")
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert messages[1]["content"] == "{"
+
+
+def test_restore_prefill_handles_a_response_with_no_prefill_sent():
+    # The parsing-layer half of the same fix: a non-prefilled response
+    # already starts with its own "{" and must NOT get a second one
+    # prepended (which would corrupt otherwise-valid JSON into "{{...").
+    from backend.app.services.ai_service import _restore_prefill
+    already_braced = '{"main": {"player_id": 1}}'
+    assert _restore_prefill(already_braced) == already_braced
+
+
+def test_parse_response_handles_a_fully_unprefilled_reply():
+    # End-to-end proof that dropping the prefill doesn't need a parser
+    # change: a complete, self-contained JSON object (what a
+    # _NO_PREFILL_MODELS response looks like) parses exactly like a
+    # restored-prefill one would.
+    ctx = ctx_with_available(1)
+    payload = json.dumps({
+        "main": {"player_id": 1, "player_name": "P1", "position": "RB",
+                  "adp": 10.0, "reasoning": "test"},
+        "alerts": [],
+    })
+    result = _parse_response(payload, ctx)
+    assert result is not None
+    assert result.main.player_id == 1
+
+
+# ---------------------------------------------------------------------------
 # Dominated-pick guard
 #
 # Same-position only. Across positions, taking a "worse" player is routinely
