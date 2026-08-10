@@ -100,22 +100,94 @@ _TEMPERATURE = 0.3
 # same way.
 _NO_TEMPERATURE_MODELS = {"claude-sonnet-5"}
 
-# Models that 400 on an assistant-turn prefill — "This model does not
-# support assistant message prefill. The conversation must end with a user
-# message." — found seconds after fixing _NO_TEMPERATURE_MODELS above, same
-# model, same "first real call this app ever made to it" story. Two
-# unrelated classic-API knobs gone on the same new model in one sitting
-# means a THIRD surprise here is plausible — if a future 400 mentions some
-# other parameter, the fix is the same shape: read the message, don't guess.
+# Models where Anthropic's "adaptive thinking" runs by default — no
+# `thinking` field needed to turn it on, and per Anthropic's own docs
+# (platform.claude.com/docs/en/build-with-claude/thinking) it cannot be
+# turned off without giving up the entire reason this app offers Sonnet as
+# an option (see AI_MODEL_CHOICES): "richer analysis," i.e. reasoning,
+# not just a differently-priced Haiku.
 #
-# Safe to drop entirely rather than needing a replacement: _restore_prefill
-# already re-adds the opening "{" only when a response doesn't already start
-# with one (see its docstring — written defensively for exactly a call path
-# that stops prefilling), and _parse_response already strips ```json fences
-# before giving up. The "Respond with ONLY valid JSON — no markdown, no
-# commentary" line already in the prompt is what keeps a non-prefilled
-# response landing clean without the brace forced open.
+# This is the root cause of TWO separate symptoms:
+#
+#   1. Assistant-turn prefill 400s — "This model does not support assistant
+#      message prefill." Per the docs: "You can't pre-fill the assistant
+#      response while thinking is on." Prefill itself isn't gone from the
+#      API; it's specifically incompatible with thinking being enabled, and
+#      thinking is on unconditionally for these models. (_NO_PREFILL_MODELS
+#      below — kept as its own set/name since the *fix* — drop the prefill
+#      message — applies regardless of whether the reader already knows
+#      why.)
+#
+#   2. A streamed response whose only visible text was a single "{" and
+#      then nothing — confirmed live. Per the docs: "Thinking tokens count
+#      toward max_tokens, so set it high enough to leave room for both the
+#      thinking and the response text" — and thinking tokens are billed as
+#      output tokens even when not shown. This app's _MAX_RESPONSE_TOKENS
+#      (3072) was sized for a non-thinking model's visible JSON output
+#      alone; on a thinking-by-default model, that entire budget can be
+#      consumed by invisible thinking before a single character of the
+#      actual response is emitted. See _MAX_RESPONSE_TOKENS_THINKING below.
+_THINKING_BY_DEFAULT_MODELS = {"claude-sonnet-5"}
+
+# "Roomy" per Anthropic's own adaptive-thinking examples (their sample code
+# uses max_tokens=16000 for a single trivial math question). Thinking depth
+# scales with task complexity, and evaluating a full draft board against
+# several stated rules is not trivial, so this errs toward Anthropic's own
+# suggested ceiling rather than a smaller guess — still comfortably under
+# the SDK's 21,333 threshold where non-streaming requests must move to
+# streaming to avoid HTTP timeouts.
+_MAX_RESPONSE_TOKENS_THINKING = 16000
+
+# Models that 400 on ANY `temperature` value at all — "`temperature` is
+# deprecated for this model" — rather than clamping or ignoring it. Confirmed
+# live: every single call failed the instant the Haiku/Sonnet toggle (see
+# AI_MODEL_CHOICES) made claude-sonnet-5 actually reachable, silently
+# degrading a whole draft to the ADP fallback. claude-haiku-4-5-20251001 has
+# been sending `temperature` successfully since before that toggle existed,
+# so this is scoped to the specific model(s) proven broken rather than
+# guessed at generation-wide — add to this set if another model 400s the
+# same way. Unlike the two symptoms above, this is unconditional on Sonnet
+# 5 (true even with thinking off), per Anthropic's docs — a separate
+# constraint of the model generation itself, not a thinking side effect.
+_NO_TEMPERATURE_MODELS = {"claude-sonnet-5"}
+
+# Models that reject an assistant-turn prefill — see
+# _THINKING_BY_DEFAULT_MODELS above for why (thinking-on is incompatible
+# with prefill, and these models can't turn thinking off without losing the
+# reason they're offered at all).
+#
+# Safe to drop the prefill entirely rather than needing a replacement:
+# _restore_prefill already re-adds the opening "{" only when a response
+# doesn't already start with one (see its docstring — written defensively
+# for exactly a call path that stops prefilling), and _parse_response
+# already strips ```json fences before giving up. The "Respond with ONLY
+# valid JSON — no markdown, no commentary" line already in the prompt is
+# what keeps a non-prefilled response landing clean without the brace
+# forced open.
 _NO_PREFILL_MODELS = {"claude-sonnet-5"}
+
+# Models where adaptive thinking stays on but is dialed down via the
+# `effort` parameter rather than left at the API default (`high`).
+#
+# Adaptive thinking already skips itself on requests it judges simple — the
+# cost problem isn't that it always fires, it's that when it does, `high`
+# effort lets it run uncapped. Per Anthropic's docs
+# (platform.claude.com/docs/en/build-with-claude/effort), `effort: "low"` is
+# their own recommendation for "chat and non-coding use cases where faster
+# turnaround is prioritized" — a fair description of one pick under a live
+# draft clock. This is a deliberate choice over the two extremes:
+# disabling thinking entirely would restore prefill and let max_tokens drop
+# back down, but it also gives up the "richer analysis" reasoning that's
+# the whole reason Sonnet is offered as an alternative to Haiku
+# (see AI_MODEL_CHOICES); leaving effort at the default `high` costs more
+# tokens/latency per pick than a live draft assistant should spend on the
+# common case. `low` keeps thinking available for a genuinely close call
+# while capping the ordinary one.
+#
+# `effort` is a request-level field (`output_config: {"effort": ...}`), not
+# part of `thinking`, so this is orthogonal to _THINKING_BY_DEFAULT_MODELS —
+# thinking stays on, it's just told to spend less by default.
+_LOW_EFFORT_MODELS = {"claude-sonnet-5"}
 
 
 def _completion_kwargs(model: str) -> dict:
@@ -126,10 +198,25 @@ def _completion_kwargs(model: str) -> dict:
     rather than sending some "safe" fallback value — the API error was that
     the PARAMETER is deprecated, not that 0.3 specifically is out of range,
     so any value would 400 the same way.
+
+    max_tokens is raised to _MAX_RESPONSE_TOKENS_THINKING for
+    _THINKING_BY_DEFAULT_MODELS — see that constant's docstring for why the
+    normal budget silently starves the actual response on those models.
+    Sized for `effort: "low"`'s reduced thinking depth (see
+    _LOW_EFFORT_MODELS), not the API default of `high` — if effort is ever
+    raised back up for these models, revisit whether 16000 is still enough
+    headroom.
     """
-    kwargs = {"model": model, "max_tokens": _MAX_RESPONSE_TOKENS}
+    max_tokens = (
+        _MAX_RESPONSE_TOKENS_THINKING
+        if model in _THINKING_BY_DEFAULT_MODELS
+        else _MAX_RESPONSE_TOKENS
+    )
+    kwargs = {"model": model, "max_tokens": max_tokens}
     if model not in _NO_TEMPERATURE_MODELS:
         kwargs["temperature"] = _TEMPERATURE
+    if model in _LOW_EFFORT_MODELS:
+        kwargs["output_config"] = {"effort": "low"}
     return kwargs
 
 
@@ -3739,11 +3826,19 @@ class AIService:
             # ceiling logged as an anonymous parse failure with no way to
             # tell that apart from any other kind of bad response.
             if getattr(final_message, "stop_reason", None) == "max_tokens":
+                ceiling = (
+                    _MAX_RESPONSE_TOKENS_THINKING
+                    if self._model in _THINKING_BY_DEFAULT_MODELS
+                    else _MAX_RESPONSE_TOKENS
+                )
                 logger.warning(
                     "Claude's streamed response hit the %d-token ceiling and "
-                    "was truncated — the JSON will not parse. Raise "
-                    "_MAX_RESPONSE_TOKENS or tighten the requested response shape.",
-                    _MAX_RESPONSE_TOKENS,
+                    "was truncated — the JSON will not parse. On a thinking-"
+                    "by-default model this ceiling is shared with invisible "
+                    "thinking tokens (see _THINKING_BY_DEFAULT_MODELS); "
+                    "otherwise raise _MAX_RESPONSE_TOKENS or tighten the "
+                    "requested response shape.",
+                    ceiling,
                 )
 
             raw = next(
@@ -3806,11 +3901,18 @@ class AIService:
             # Calling it out here makes the difference obvious in the log —
             # "raise the budget" and "fix the prompt" are very different fixes.
             if getattr(response, "stop_reason", None) == "max_tokens":
+                ceiling = (
+                    _MAX_RESPONSE_TOKENS_THINKING
+                    if self._model in _THINKING_BY_DEFAULT_MODELS
+                    else _MAX_RESPONSE_TOKENS
+                )
                 logger.warning(
                     "Claude response hit the %d-token ceiling and was truncated — "
-                    "the JSON will not parse. Raise _MAX_RESPONSE_TOKENS or tighten "
-                    "the requested response shape.",
-                    _MAX_RESPONSE_TOKENS,
+                    "the JSON will not parse. On a thinking-by-default model this "
+                    "ceiling is shared with invisible thinking tokens (see "
+                    "_THINKING_BY_DEFAULT_MODELS); otherwise raise "
+                    "_MAX_RESPONSE_TOKENS or tighten the requested response shape.",
+                    ceiling,
                 )
 
             # Take the first text block rather than indexing content[0]

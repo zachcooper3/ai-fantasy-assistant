@@ -1202,9 +1202,73 @@ def test_completion_kwargs_still_sends_temperature_for_haiku():
 
 def test_completion_kwargs_always_sets_model_and_max_tokens():
     from backend.app.services.ai_service import _completion_kwargs, _MAX_RESPONSE_TOKENS
-    kwargs = _completion_kwargs("claude-sonnet-5")
-    assert kwargs["model"] == "claude-sonnet-5"
+    kwargs = _completion_kwargs("claude-haiku-4-5-20251001")
+    assert kwargs["model"] == "claude-haiku-4-5-20251001"
     assert kwargs["max_tokens"] == _MAX_RESPONSE_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# _completion_kwargs — thinking-by-default models need a roomier max_tokens
+#
+# Live failure, same draft, minutes after the prefill fix: Sonnet calls
+# started succeeding (200, no 400) but the streamed body was a single "{"
+# character that failed to parse. Root cause (confirmed via Anthropic's
+# docs, not a live call): claude-sonnet-5 has adaptive thinking on by
+# default, and thinking tokens are billed against max_tokens even when
+# invisible to the caller. At the old 3072-token ceiling, thinking alone
+# could exhaust the budget before a single character of the JSON answer
+# was emitted. Fix: give thinking-by-default models a much roomier ceiling
+# instead of disabling thinking (which would defeat the point of offering
+# Sonnet as the "richer analysis" option).
+# ---------------------------------------------------------------------------
+
+def test_completion_kwargs_gives_thinking_models_a_roomier_ceiling():
+    from backend.app.services.ai_service import (
+        _completion_kwargs,
+        _THINKING_BY_DEFAULT_MODELS,
+        _MAX_RESPONSE_TOKENS_THINKING,
+        _MAX_RESPONSE_TOKENS,
+    )
+    for model in _THINKING_BY_DEFAULT_MODELS:
+        kwargs = _completion_kwargs(model)
+        assert kwargs["max_tokens"] == _MAX_RESPONSE_TOKENS_THINKING
+        assert _MAX_RESPONSE_TOKENS_THINKING > _MAX_RESPONSE_TOKENS
+
+
+def test_completion_kwargs_leaves_non_thinking_models_at_the_normal_ceiling():
+    from backend.app.services.ai_service import (
+        _completion_kwargs,
+        _THINKING_BY_DEFAULT_MODELS,
+        _MAX_RESPONSE_TOKENS,
+    )
+    model = "claude-haiku-4-5-20251001"
+    assert model not in _THINKING_BY_DEFAULT_MODELS
+    assert _completion_kwargs(model)["max_tokens"] == _MAX_RESPONSE_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# _completion_kwargs — thinking-by-default models run at low effort
+#
+# Adaptive thinking already skips itself on simple requests; the cost risk
+# is a hard pick running unbounded at the API's default `high` effort.
+# `effort: "low"` is Anthropic's own recommendation for latency-sensitive,
+# non-coding workloads — a live draft pick under a clock qualifies. This is
+# a deliberate middle ground: not disabling thinking outright (which would
+# give up Sonnet's whole reason for being offered), not leaving it at the
+# uncapped default either.
+# ---------------------------------------------------------------------------
+
+def test_completion_kwargs_runs_low_effort_for_thinking_models():
+    from backend.app.services.ai_service import _completion_kwargs, _LOW_EFFORT_MODELS
+    for model in _LOW_EFFORT_MODELS:
+        kwargs = _completion_kwargs(model)
+        assert kwargs["output_config"] == {"effort": "low"}
+
+
+def test_completion_kwargs_omits_effort_for_haiku():
+    from backend.app.services.ai_service import _completion_kwargs
+    kwargs = _completion_kwargs("claude-haiku-4-5-20251001")
+    assert "output_config" not in kwargs
 
 
 # ---------------------------------------------------------------------------
