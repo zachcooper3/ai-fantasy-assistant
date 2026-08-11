@@ -2,15 +2,17 @@
 /**
  * AIPanel — AI recommendation + positional scarcity alerts.
  *
- * Renders three sections instead of one pick plus a footnote list of
+ * Renders sections instead of one pick plus a footnote list of
  * alternatives: Main (the model's synthesized pick, with real reasoning),
  * Best Available (up to 2, cheapest by ADP regardless of need), Needs (up
- * to 2, fills your highest-priority open starting slot), and Depth (0-2,
- * one QB stash and one TE stash — see the backend's _depth_pick — which can
- * appear alongside Needs, not just once it empties). Only Main is
- * model-generated — the rest are computed server-side from the same board
- * data, so they're never asked of Claude at all. See the backend's
- * RecommendationResult docstring.
+ * to 2, fills your highest-priority open starting slot), Depth (0-2, one QB
+ * stash and one TE stash — see the backend's _depth_pick — which can appear
+ * alongside Needs, not just once it empties), and Opportunity (0-1, an
+ * RB/WR/TE whose role looks bigger than his ADP/tier reflects — see the
+ * backend's _opportunity_pick_from). Main and Opportunity are the only
+ * model-generated sections — the rest are computed server-side from the
+ * same board data, so they're never asked of Claude at all. See the
+ * backend's RecommendationResult docstring.
  *
  * Sections are allowed to overlap: the main pick is routinely also the best
  * value on the board, or the neediest-position fill. Rather than hiding
@@ -35,6 +37,7 @@ import {
   TrendingUp,
   Target,
   Layers,
+  Rocket,
 } from "lucide-react";
 
 import { api, Confidence, Player, PickSuggestion, Recommendation, Scarcity, SectionTag, Survival } from "@/lib/api";
@@ -83,6 +86,7 @@ const TAG_META: Record<SectionTag, { label: string; icon: typeof TrendingUp }> =
   best_available: { label: "Best Value", icon: TrendingUp },
   needs: { label: "Fills Need", icon: Target },
   depth: { label: "Depth Stash", icon: Layers },
+  opportunity: { label: "Opportunity", icon: Rocket },
 };
 
 /** Tags to badge on a card, excluding the section it's already shown under —
@@ -680,6 +684,31 @@ export default function AIPanel({
                     key={p.player_id}
                     suggestion={p}
                     section="depth"
+                    pickNumber={recommendation.pick_number}
+                    player={playersById.get(p.player_id)}
+                    canDraft={canDraft}
+                    onDraft={() => onDraftRecommended(p.player_id)}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Opportunity — an RB/WR/TE whose role looks bigger than his
+                ADP/tier reflects (0-1). Model-generated, unlike every other
+                section here except Main — see the backend's
+                _opportunity_pick_from. Empty whenever the AI is unavailable
+                or names someone invalid, not gated by any other section. */}
+            {recommendation.opportunity.length > 0 && (
+              <div>
+                <p className="flex items-center gap-1.5 text-xs text-slate-400 uppercase font-semibold mb-2">
+                  <Rocket size={11} aria-hidden="true" />
+                  Opportunity
+                </p>
+                {recommendation.opportunity.map((p) => (
+                  <SuggestionCard
+                    key={p.player_id}
+                    suggestion={p}
+                    section="opportunity"
                     pickNumber={recommendation.pick_number}
                     player={playersById.get(p.player_id)}
                     canDraft={canDraft}

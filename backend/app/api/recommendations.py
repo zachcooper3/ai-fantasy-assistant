@@ -23,6 +23,7 @@ from backend.db import player_repo as repo
 from backend.db import metrics_repo
 from backend.db import draft_profile_repo
 from backend.db import draft_session_repo
+from backend.db import game_repo
 from backend.app.schemas import PlayerResponse
 from backend.db.models import Player, PlayerMetrics
 from backend.app.services.ai_service import (
@@ -34,6 +35,9 @@ from backend.app.services.ai_service import (
     AI_MODEL_CHOICES,
     _ROSTER_CHANGE_MIN_SHARE,
     _ROSTER_CHANGE_POSITIONS,
+    _infer_current_season,
+    _OPPORTUNITY_SCHEDULE_FROM_WEEK,
+    _OPPORTUNITY_SCHEDULE_THROUGH_WEEK,
 )
 from backend.app.services.draft_state import DraftStateService
 
@@ -85,10 +89,19 @@ class RecommendationResponse(BaseModel):
     # Up to 2, cheapest by ADP regardless of roster need.
     best_available: list[PickSuggestionResponse]
     # Up to 2, the realistic slate at your highest-priority open starting
-    # slot. Empty once every starting slot is filled.
+    # slot. Empty once the skill lineup is filled, except it can resume for
+    # DST/K once those become the last open slots — see ai_service.py's
+    # _needs docstring. Can be non-empty alongside `depth`.
     needs: list[PickSuggestionResponse]
-    # 0 or 1. A QB/TE stash pick, only ever present when `needs` is empty.
+    # 0-2: one QB stash and one TE stash, once the skill starting lineup is
+    # filled — see ai_service.py's _depth_pick. Can be non-empty alongside
+    # `needs`.
     depth: list[PickSuggestionResponse]
+    # 0-1: an RB/WR/TE whose role looks bigger than his ADP/tier reflects.
+    # Unlike best_available/needs/depth, this IS model output (see
+    # RecommendationResult.opportunity's docstring in ai_service.py) —
+    # empty whenever Claude is unavailable or names someone invalid.
+    opportunity: list[PickSuggestionResponse]
     alerts: list[str]
     model: str
     # One sentence on the roster's shape and what this pick does about it.
@@ -475,6 +488,26 @@ def _build_context(
         for pid, dp in draft_profile_rows.items()
     }
 
+    # Real upcoming schedule for teams on the board — feeds the Opportunity
+    # pick's matchup reasoning (see ai_service.py's RecommendationContext
+    # .team_schedules docstring and _format_schedule_section). `season` is
+    # inferred from the same data-driven signal _format_metrics_section
+    # already uses (_infer_current_season), rather than a second,
+    # potentially-disagreeing wall-clock rule — see that function's
+    # docstring. Empty when neither signal has anything to go on (e.g. an
+    # empty database) or when fetch_schedule.py hasn't been run for that
+    # season yet; either way the section is simply omitted, not guessed.
+    current_season = _infer_current_season(player_metrics, draft_profiles)
+    team_schedules: dict[str, list[dict]] = {}
+    if current_season is not None:
+        team_schedules = game_repo.get_schedules_bulk(
+            db,
+            sorted({p["team"] for p in top_available if p.get("team")}),
+            current_season,
+            _OPPORTUNITY_SCHEDULE_FROM_WEEK,
+            _OPPORTUNITY_SCHEDULE_THROUGH_WEEK,
+        )
+
     # My roster as plain dicts
     my_roster = [
         {"player_name": pick.player_name, "position": pick.position, "nfl_team": pick.nfl_team}
@@ -540,6 +573,7 @@ def _build_context(
         upcoming_pick_slots=upcoming_pick_slots,
         replacement_ppg=replacement_ppg,
         roster_changes=_compute_roster_changes(db),
+        team_schedules=team_schedules,
     )
 
 
@@ -577,6 +611,7 @@ async def recommend_pick(
         best_available=[PickSuggestionResponse(**p.__dict__) for p in result.best_available],
         needs=[PickSuggestionResponse(**p.__dict__) for p in result.needs],
         depth=[PickSuggestionResponse(**p.__dict__) for p in result.depth],
+        opportunity=[PickSuggestionResponse(**p.__dict__) for p in result.opportunity],
         alerts=result.alerts,
         model=result.model,
         strategy=result.strategy,
@@ -637,6 +672,7 @@ async def recommend_pick_stream(
                         best_available=[PickSuggestionResponse(**p.__dict__) for p in value.best_available],
                         needs=[PickSuggestionResponse(**p.__dict__) for p in value.needs],
                         depth=[PickSuggestionResponse(**p.__dict__) for p in value.depth],
+                        opportunity=[PickSuggestionResponse(**p.__dict__) for p in value.opportunity],
                         alerts=value.alerts,
                         model=value.model,
                         strategy=value.strategy,

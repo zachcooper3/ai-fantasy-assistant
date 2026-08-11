@@ -504,6 +504,7 @@ export function useDraft(): DraftHook {
           best_available: [],
           needs: [],
           depth: [],
+          opportunity: [],
           alerts: [],
           model: "",
           strategy: "",

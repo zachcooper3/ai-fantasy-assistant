@@ -253,30 +253,34 @@ class RecommendationResult:
     Three short lists instead of one pick plus a pile of alternatives —
     replaces the old `recommendation`/`alternatives` shape entirely.
 
-    Only `main` is written by the model. `best_available`, `needs`, and
-    `depth` are computed deterministically in this module from the same
-    board/gap data the prompt is built from (see _best_available, _needs,
-    _depth_pick) — "who's cheapest by ADP" or "who fills the open TE slot"
-    is a lookup, not a judgement call, and every extra field the model has
-    to author is output tokens paid on every single pick of every draft.
-    The model still gets the last word on how to WEIGH all that (`main`),
-    it just isn't asked to re-derive facts this module already knows.
+    `main` and `opportunity` are written by the model. `best_available`,
+    `needs`, and `depth` are computed deterministically in this module from
+    the same board/gap data the prompt is built from (see _best_available,
+    _needs, _depth_pick) — "who's cheapest by ADP" or "who fills the open TE
+    slot" is a lookup, not a judgement call, and every extra field the model
+    has to author is output tokens paid on every single pick of every draft.
+    `opportunity` is the one exception, by design: "whose role is trending
+    up more than his ADP reflects" genuinely has no formula, so it costs
+    tokens the other three don't — see opportunity's field comment. The
+    model still gets the last word on how to WEIGH all the deterministic
+    data too (`main`), it just isn't asked to re-derive facts this module
+    already knows.
 
-    Capped at 6 players total across all sections (main counts as 1):
+    Capped at 7 players total across all sections (main counts as 1):
     best_available up to 2, needs up to 2, depth 0-2 (one per
-    _DEPTH_POSITIONS: QB and TE). needs and depth CAN both be non-empty at
-    once — once the skill lineup (QB/RB/WR/TE/FLEX) is filled, needs starts
-    recommending DST/K (see _needs) while depth keeps offering its QB/TE
-    stash, deliberately not gated behind each other (see _depth_pick). In
-    practice the two rarely both max out: DST/K never have PlayerMetrics,
-    so _needs' best-VOR second entry never fires for them and needs
-    contributes at most 1 entry during that phase, not 2 — but depth alone
-    can legitimately fill both of its slots (a QB stash AND a TE stash) any
-    time both positions have eligible players on the board, so 6 is a real
-    ceiling, not just a nominal one. Overlap between sections is expected,
-    not an error: the main pick is routinely also the cheapest available or
-    the neediest-position fill, and PickSuggestion.tags is how the UI shows
-    that rather than hiding it.
+    _DEPTH_POSITIONS: QB and TE), opportunity 0-1. needs and depth CAN both
+    be non-empty at once — once the skill lineup (QB/RB/WR/TE/FLEX) is
+    filled, needs starts recommending DST/K (see _needs) while depth keeps
+    offering its QB/TE stash, deliberately not gated behind each other (see
+    _depth_pick). In practice the two rarely both max out: DST/K never have
+    PlayerMetrics, so _needs' best-VOR second entry never fires for them and
+    needs contributes at most 1 entry during that phase, not 2 — but depth
+    alone can legitimately fill both of its slots (a QB stash AND a TE
+    stash) any time both positions have eligible players on the board, so 7
+    is a real ceiling, not just a nominal one. Overlap between sections is
+    expected, not an error: the main pick is routinely also the cheapest
+    available or the neediest-position fill, and PickSuggestion.tags is how
+    the UI shows that rather than hiding it.
     """
     main: PickSuggestion
     best_available: list[PickSuggestion]
@@ -285,6 +289,17 @@ class RecommendationResult:
     # the two is cheaper by ADP overall. Can be non-empty at the same time
     # as `needs` — see _depth_pick.
     depth: list[PickSuggestion]
+    # 0-1 entries: an RB/WR/TE whose role looks bigger than his ADP/tier
+    # reflects — see _opportunity_pick_from and _build_prompt's Opportunity
+    # Pick instructions. Unlike best_available/needs/depth, this IS model
+    # output (there's no deterministic formula for "role trending up" the
+    # way "cheapest by ADP" is a lookup) — Claude names it in the same JSON
+    # response `main` comes from, no second API call. Empty whenever Claude
+    # is unavailable (the ADP fallback has nothing to substitute this with,
+    # unlike the other three sections) or names someone invalid — see
+    # _opportunity_pick_from's docstring for why that never invalidates the
+    # rest of the recommendation the way an invalid `main` does.
+    opportunity: list[PickSuggestion]
     alerts: list[str]
     model: str
     # One-sentence read on the shape of the roster and what this pick is doing
@@ -398,6 +413,21 @@ class RecommendationContext:
     # in this league, not of who happens to be left. Empty means the VOR
     # column is omitted rather than guessed.
     replacement_ppg: dict[str, float] = field(default_factory=dict)
+
+    # {team: [{week, opponent, is_home}, ...]} — the real published schedule
+    # (see backend/db/models.py::Game), NOT the model's own recollection of
+    # it. Exists specifically for the Opportunity pick's matchup reasoning:
+    # the schedule for the season being drafted is published (~mid-May)
+    # after Claude's reliable knowledge cutoff for that season, so an
+    # unaided model has no real way to know it. Keyed by team, not by
+    # player_id — see Game's docstring for why that's the stable key here.
+    # Empty means fetch_schedule.py hasn't been run for this season yet
+    # (or, before this field existed, any caller/test that predates it) —
+    # the schedule section is simply omitted, same "missing means omitted,
+    # never guessed" convention every other optional context field here
+    # follows. Populated in recommendations.py::_build_context via
+    # game_repo.get_schedules_bulk().
+    team_schedules: dict[str, list[dict]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1134,72 @@ def _format_roster_changes(
     ])
 
 
+# How many weeks of the real schedule to show per team for the Opportunity
+# pick. Full season would be 17+ weeks repeated for every team on the board
+# — real prompt bloat for marginal value, since a role-trajectory read cares
+# about the near-term stretch, not October. Weeks 1-6 covers roughly the
+# first quarter of the season, which is what a draft-day "opportunity" read
+# is actually about.
+_OPPORTUNITY_SCHEDULE_FROM_WEEK = 1
+_OPPORTUNITY_SCHEDULE_THROUGH_WEEK = 6
+
+
+def _format_schedule_section(
+    board: list[dict], team_schedules: dict[str, list[dict]],
+) -> str:
+    """
+    Real upcoming opponents (see _OPPORTUNITY_SCHEDULE_THROUGH_WEEK) for
+    teams represented on the board, from the Game table (see
+    backend/db/models.py and game_repo.py).
+
+    Exists specifically so the Opportunity pick's matchup reasoning is
+    grounded in the actual published schedule rather than Claude's own
+    recollection of it — the schedule for the season being drafted is
+    published (~mid-May) after Claude's reliable knowledge cutoff for that
+    season, so an unaided model has no real way to know it and risks a
+    confident, wrong answer instead of an honest "I don't know." See RULE
+    10 in _build_system_prompt and the Opportunity Pick instructions below
+    for how this table's ground-truth facts are meant to be used
+    differently from an opponent's actual defensive quality, which is
+    still Claude's own judgment, not something this table states.
+
+    Keyed by team, not repeated per player — same reasoning as
+    _format_roster_changes. Omitted entirely if fetch_schedule.py has never
+    been run for this season (ctx.team_schedules is empty) — a missing
+    section reads as "no data," never as a bye week or an easy schedule.
+    """
+    if not team_schedules:
+        return ""
+    teams = sorted({p["team"] for p in board if p.get("team")})
+    lines: list[str] = []
+    for team in teams:
+        games = team_schedules.get(team)
+        if not games:
+            continue
+        matchup_str = ", ".join(
+            f"wk{g['week']} {'vs' if g['is_home'] else '@'} {g['opponent']}"
+            for g in sorted(games, key=lambda g: g["week"])
+        )
+        lines.append(f"- {team}: {matchup_str}")
+
+    if not lines:
+        return ""
+
+    return "\n".join([
+        f"## Upcoming Schedule (Weeks {_OPPORTUNITY_SCHEDULE_FROM_WEEK}-"
+        f"{_OPPORTUNITY_SCHEDULE_THROUGH_WEEK}, real opponents)",
+        "These are the actual published matchups — trust them as fact, the same "
+        "as any other figure in this prompt. Whether a specific opponent's "
+        "defense is actually tough is a DIFFERENT claim this table does not make "
+        "— that's your own judgment from general knowledge, not something shown "
+        "here, so present it as a read, not a fact, and don't invent specifics "
+        "(a defensive scheme change, an injury to a specific opposing player) "
+        "you aren't genuinely confident about.",
+        *lines,
+        "",
+    ])
+
+
 # ---------------------------------------------------------------------------
 # Opportunity cost — which players actually survive to my next turn
 #
@@ -1355,6 +1451,7 @@ _TAG_MAIN = "main"
 _TAG_BEST_AVAILABLE = "best_available"
 _TAG_NEEDS = "needs"
 _TAG_DEPTH = "depth"
+_TAG_OPPORTUNITY = "opportunity"
 
 # Slot budget. `main` is always exactly 1 and isn't counted here. `needs`
 # and `depth` CAN both be non-empty at once (depth fires once the skill
@@ -1603,22 +1700,26 @@ def _tag_overlaps(
     best_available: list[PickSuggestion],
     needs: list[PickSuggestion],
     depth: list[PickSuggestion],
+    opportunity: list[PickSuggestion],
 ) -> None:
     """
     Cross-tags every PickSuggestion (including `main`) with every section
     it appears in, in place.
 
-    The four section builders above run independently and don't know about
-    each other's output, so the same player can legitimately come back as
-    both `main` and the top `best_available` entry — see
-    RecommendationResult's docstring for why that's kept visible rather
-    than deduplicated away. This is the one place that reconciles it: every
-    occurrence of a given player_id ends up with the same, complete tag
-    list, regardless of which section(s) found him.
+    The section builders above run independently and don't know about each
+    other's output, so the same player can legitimately come back as both
+    `main` and the top `best_available` entry — see RecommendationResult's
+    docstring for why that's kept visible rather than deduplicated away.
+    This is the one place that reconciles it: every occurrence of a given
+    player_id ends up with the same, complete tag list, regardless of which
+    section(s) found him. `opportunity` is folded in here even though it's
+    model output, not a deterministic section, for exactly this reason —
+    a player Claude names in `opportunity` who ALSO happens to be `main`
+    should read as both, the same as any other overlap.
     """
     groups: dict[str, list[PickSuggestion]] = {
         _TAG_MAIN: [main], _TAG_BEST_AVAILABLE: best_available,
-        _TAG_NEEDS: needs, _TAG_DEPTH: depth,
+        _TAG_NEEDS: needs, _TAG_DEPTH: depth, _TAG_OPPORTUNITY: opportunity,
     }
     tags_by_id: dict[int, list[str]] = {}
     for tag, items in groups.items():
@@ -1630,12 +1731,18 @@ def _tag_overlaps(
 
 
 def _build_sections(
-    ctx: RecommendationContext, main: PickSuggestion,
+    ctx: RecommendationContext, main: PickSuggestion, opportunity: list[PickSuggestion],
 ) -> tuple[list[PickSuggestion], list[PickSuggestion], list[PickSuggestion]]:
     """
     Computes best_available/needs/depth for a RecommendationResult and
-    cross-tags every entry (including `main`, mutated in place via
-    _tag_overlaps) with every section it qualifies for.
+    cross-tags every entry (including `main` and `opportunity`, mutated in
+    place via _tag_overlaps) with every section it qualifies for.
+
+    `opportunity` is passed in rather than computed here, unlike the other
+    three — it's Claude's own output (or [] from the ADP fallback, which has
+    no formula to substitute), already extracted and validated by the
+    caller before this runs. It's threaded through anyway so all five
+    sections get tagged in one pass instead of two.
 
     Called from both _parse_response and _fallback so a live recommendation
     and the ADP-fallback path can never disagree about what "needs" or
@@ -1649,7 +1756,7 @@ def _build_sections(
     # and depth should still be able to show alongside it, not wait for DST
     # to be drafted too.
     depth = _depth_pick(ctx, gap_info.skill_gaps)
-    _tag_overlaps(main, best_available, needs, depth)
+    _tag_overlaps(main, best_available, needs, depth, opportunity)
     return best_available, needs, depth
 
 
@@ -2920,6 +3027,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
     if retrieved:
         lines.append(retrieved)
 
+    # Real upcoming schedule — feeds the Opportunity Pick instructions
+    # below (best-effort; omitted if fetch_schedule.py hasn't been run for
+    # this season). See _format_schedule_section.
+    schedule_section = _format_schedule_section(board, ctx.team_schedules)
+    if schedule_section:
+        lines.append(schedule_section)
+
     # Output schema
     lines += [
         "## Task",
@@ -2958,13 +3072,33 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "section shows an URGENT line. Filling every base slot is not a finished "
         "roster; do not call a position secure just because its minimum is met.",
         "",
-        # `main` is the only player object asked of the model. The other
-        # recommendation sections shown to the user — best available, needs,
-        # depth — are computed separately from this same board data (see
-        # RecommendationResult's docstring in ai_service.py) rather than
-        # generated here: "who's cheapest by ADP" doesn't need a model call,
-        # and every extra field asked for is output tokens spent on every
-        # single pick of every draft for no analytical gain.
+        "OPPORTUNITY PICK (separate task, does not affect `main` above). From the "
+        "RB/WR/TE candidates on the board — not necessarily anyone from your "
+        "shortlist — name ONE whose real role this season looks bigger than his "
+        "ADP/tier reflects: not raw talent, where his playing time is actually "
+        "trending. Ground this in what's shown elsewhere in this prompt wherever it "
+        "exists: usage trend and experience/draft-capital context from Opportunity & "
+        "Performance Signals, departures/arrivals from Roster Changes Since Last "
+        "Season, and his real upcoming opponents from Upcoming Schedule. "
+        "IMPORTANT EXCEPTION TO RULE 10: unlike `main`, this pick may also draw on "
+        "general football knowledge for depth-chart competition, a new starting QB "
+        "or offensive coordinator, offensive line changes, contract/roster-crunch "
+        "situations, and game-script tendencies (a team's win total or point spread "
+        "implying more passing or more rushing) — none of that is shown in this "
+        "prompt, so say plainly when a reason comes from general knowledge rather "
+        "than from something stated above, and never invent a specific unconfirmed "
+        "fact (a named coach, an exact injury, a specific transaction) you aren't "
+        "genuinely confident about — a general, hedged read beats a fabricated "
+        "specific. Always name someone: if nothing clearly stands out, say so in "
+        "`opportunity.reasoning` and give your best case anyway.",
+        "",
+        # `main` and `opportunity` are the only player objects asked of the
+        # model. The other recommendation sections shown to the user — best
+        # available, needs, depth — are computed separately from this same
+        # board data (see RecommendationResult's docstring in ai_service.py)
+        # rather than generated here: "who's cheapest by ADP" doesn't need a
+        # model call, and every extra field asked for is output tokens spent
+        # on every single pick of every draft for no analytical gain.
         "Respond with ONLY valid JSON — no markdown, no commentary:",
         json.dumps({
             "strategy": "<1 sentence: what this pick does about the roster's shape, and what you are deliberately deferring to your next turn because it will still be there>",
@@ -2976,6 +3110,13 @@ def _build_prompt(ctx: RecommendationContext) -> str:
                 "adp": "<float>",
                 "reasoning": "<1-2 sentences explaining why this is the best pick>",
             },
+            "opportunity": {
+                "player_id": "<int, RB/WR/TE only, from the tiers above>",
+                "player_name": "<string>",
+                "position": "<string>",
+                "adp": "<float>",
+                "reasoning": "<1-2 sentences: what specifically makes his role bigger than his ADP/tier reflects — flag anything drawn from general knowledge rather than this prompt>",
+            },
             "considered": ["<one line per MUST EVALUATE player: 'Name — taken' or 'Name — passed because <specific reason>'. One entry for every id in that section, no exceptions.>"],
             "alerts": ["<brief warning — scarcity, tier drop-off, breakout/value call, or 'won't survive to your next turn'. One short sentence, 15 words or fewer.>"],
         }, indent=2),
@@ -2986,12 +3127,15 @@ def _build_prompt(ctx: RecommendationContext) -> str:
         "",
         "`main.player_id` must be one of the ids listed above: anything else is "
         "dropped, and the whole recommendation falls back to a plain ADP pick — you "
-        "will have spent the tokens for nothing. Keep `main.reasoning` to 1-2 "
-        "sentences. Keep `alerts` to at most 3 entries, each one short sentence (15 "
-        "words or fewer) — they are warnings, not analysis, and the reasoning above "
-        "already carries the analysis; do not restate it here. The whole response "
-        "must be complete, valid JSON — one that runs long gets cut off mid-object "
-        "and thrown away entirely.",
+        "will have spent the tokens for nothing. `opportunity.player_id` must be an "
+        "RB/WR/TE from the ids listed above; anything else (wrong position, unknown "
+        "id, or omitted) just drops that one bonus section — it never affects `main` "
+        "or triggers the ADP fallback. Keep `main.reasoning` and "
+        "`opportunity.reasoning` to 1-2 sentences each. Keep `alerts` to at most 3 "
+        "entries, each one short sentence (15 words or fewer) — they are warnings, "
+        "not analysis, and the reasoning above already carries the analysis; do not "
+        "restate it here. The whole response must be complete, valid JSON — one "
+        "that runs long gets cut off mid-object and thrown away entirely.",
     ]
 
     return "\n".join(lines)
@@ -3192,7 +3336,13 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "what appears in Player News & Analysis — so do not reason about bye-week "
         "conflicts, stacking, coaching changes, training-camp reports, or contract "
         "situations. If the deciding factor genuinely isn't in the prompt, say the "
-        "call is close and set `confidence` to low."
+        "call is close and set `confidence` to low. ONE NAMED EXCEPTION: the "
+        "`opportunity` field asked for in the Task section below is explicitly "
+        "allowed to reason about coaching/scheme changes, contract/depth-chart "
+        "situations, and general football knowledge this rule otherwise forbids — "
+        "see its instructions for the guardrails that apply there instead. This "
+        "exception is scoped to that one field; `main` and everything else in your "
+        "response still follow RULE 10 as written."
     )
 
 
@@ -3466,6 +3616,51 @@ def _pick_from(d: dict, ctx: RecommendationContext) -> PickSuggestion | None:
     )
 
 
+# RB/WR/TE only — see _build_prompt's Opportunity Pick instructions for why:
+# QB role/opportunity swings less week to week, and DST/K have no matchup or
+# usage data in this app at all (RULE 9) for an "opportunity" claim to rest
+# on.
+_OPPORTUNITY_POSITIONS = ("RB", "WR", "TE")
+
+
+def _opportunity_pick_from(d: dict | None, ctx: RecommendationContext) -> PickSuggestion | None:
+    """
+    Builds the `opportunity` PickSuggestion from Claude's object, if any.
+
+    Same id-only trust as _pick_from (see its docstring) — every factual
+    field comes from the canonical board row, never from Claude's JSON —
+    plus one more check _pick_from doesn't need: position. Trusting the
+    CANONICAL row's position rather than whatever Claude wrote in the
+    `position` field means a model that mislabels or ignores the RB/WR/TE
+    restriction gets silently dropped rather than let through with a wrong
+    label.
+
+    Unlike _pick_from/`main`, a bad object here (missing, malformed, wrong
+    position, or an id not on the board) returns None and the caller simply
+    treats `opportunity` as empty — it does NOT invalidate the rest of the
+    recommendation the way an invalid `main.player_id` does (see
+    _parse_response). `main` is the pick the whole response exists to make;
+    `opportunity` is a bonus section layered on top of it, and throwing away
+    an otherwise-good `main` because the bonus section came back malformed
+    would be a strictly worse outcome for a draft-day tool than just
+    quietly showing one fewer card.
+    """
+    if not isinstance(d, dict):
+        return None
+    canonical = {p["id"]: p for p in ctx.top_available}.get(_as_player_id(d.get("player_id")))
+    if canonical is None or canonical["position"] not in _OPPORTUNITY_POSITIONS:
+        return None
+    return PickSuggestion(
+        player_id=canonical["id"],
+        player_name=canonical["name"],
+        position=canonical["position"],
+        adp=canonical["adp"],
+        reasoning=str(d.get("reasoning", "")),
+        tags=[_TAG_OPPORTUNITY],
+        survival=_survival_code(canonical["adp"], ctx.my_following_pick_number),
+    )
+
+
 def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResult | None:
     """
     Parses Claude's JSON response into a RecommendationResult.
@@ -3556,15 +3751,23 @@ def _parse_response(raw: str, ctx: RecommendationContext) -> RecommendationResul
     if confidence not in _CONFIDENCE_LEVELS:
         confidence = "medium"
 
+    # Extracted separately from `main` above, and deliberately NOT allowed
+    # to fail the whole recommendation the way an invalid main.player_id
+    # does — see _opportunity_pick_from's docstring. A malformed or missing
+    # `opportunity` object just means that one bonus section is empty.
+    opportunity_pick = _opportunity_pick_from(data.get("opportunity"), ctx)
+    opportunity = [opportunity_pick] if opportunity_pick else []
+
     # best_available/needs/depth are never asked of the model — see
     # RecommendationResult's and _build_sections' docstrings.
-    best_available, needs, depth = _build_sections(ctx, main)
+    best_available, needs, depth = _build_sections(ctx, main, opportunity)
 
     return RecommendationResult(
         main=main,
         best_available=best_available,
         needs=needs,
         depth=depth,
+        opportunity=opportunity,
         alerts=alerts,
         model=_DEFAULT_MODEL,
         strategy=strategy,
@@ -3614,13 +3817,20 @@ def _fallback(
     # `best_available[0]` (both are "cheapest by ADP" here), which is
     # correct and expected: without the model, that IS the best available
     # information, and the overlap tag says so honestly rather than hiding it.
-    best_available, needs, depth = _build_sections(ctx, main)
+    #
+    # opportunity is always [] here — unlike best_available/needs/depth, it
+    # has no deterministic formula to fall back to (see RecommendationResult
+    # .opportunity's field comment). "Whose role is trending up" without a
+    # model to weigh it is just a guess, and the ADP fallback's whole point
+    # is to never present a guess as a section.
+    best_available, needs, depth = _build_sections(ctx, main, [])
 
     return RecommendationResult(
         main=main,
         best_available=best_available,
         needs=needs,
         depth=depth,
+        opportunity=[],
         alerts=[f"{reason} — showing best available by ADP only."],
         model=f"{model}:fallback",
         strategy="",

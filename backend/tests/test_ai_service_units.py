@@ -65,6 +65,8 @@ from backend.app.services.ai_service import (
     _TAG_BEST_AVAILABLE,
     _TAG_NEEDS,
     _TAG_DEPTH,
+    _TAG_OPPORTUNITY,
+    _opportunity_pick_from,
 )
 
 
@@ -170,6 +172,97 @@ def test_string_player_id_is_coerced_not_rejected():
     result = _parse_response(json.dumps(payload), ctx_with_available(1, 2, 3))
     assert result is not None
     assert result.main.player_id == 1
+
+
+# ---------------------------------------------------------------------------
+# _opportunity_pick_from / _parse_response — the `opportunity` field
+#
+# Unlike `main`, a bad opportunity object must NOT invalidate the rest of
+# the recommendation — see _opportunity_pick_from's docstring. Every test
+# below that gives it something invalid still expects a real `main`.
+# ---------------------------------------------------------------------------
+
+def _mixed_position_ctx() -> RecommendationContext:
+    return RecommendationContext(
+        pick_number=1, round_number=1, my_slot=1, league_size=12,
+        is_my_turn=True, picks_until_my_turn=0, my_next_pick_number=1,
+        top_available=[
+            {"id": 1, "rank": 1, "name": "RB1", "position": "RB", "team": "X", "adp": 10.0, "sleeper_id": None},
+            {"id": 2, "rank": 2, "name": "WR1", "position": "WR", "team": "X", "adp": 20.0, "sleeper_id": None},
+            {"id": 3, "rank": 3, "name": "QB1", "position": "QB", "team": "X", "adp": 30.0, "sleeper_id": None},
+            {"id": 4, "rank": 4, "name": "DST1", "position": "DST", "team": "X", "adp": 200.0, "sleeper_id": None},
+            # Deliberately pricier than the RB/WR above, so it never wins
+            # best_available's cheapest-two on its own — see
+            # test_parse_response_includes_valid_opportunity, which needs an
+            # opportunity pick that ISN'T also tagged best_available to test
+            # extraction cleanly (overlap itself is covered separately by
+            # test_tag_overlaps_folds_in_opportunity_too).
+            {"id": 5, "rank": 5, "name": "TE1", "position": "TE", "team": "X", "adp": 40.0, "sleeper_id": None},
+        ],
+    )
+
+
+def test_opportunity_pick_accepts_rb_wr_te():
+    ctx = _mixed_position_ctx()
+    pick = _opportunity_pick_from({"player_id": 2, "reasoning": "role trending up"}, ctx)
+    assert pick is not None
+    assert pick.player_id == 2
+    assert pick.position == "WR"
+    assert pick.tags == [_TAG_OPPORTUNITY]
+
+
+def test_opportunity_pick_rejects_qb_and_dst_even_if_claude_names_them():
+    ctx = _mixed_position_ctx()
+    assert _opportunity_pick_from({"player_id": 3, "reasoning": "x"}, ctx) is None
+    assert _opportunity_pick_from({"player_id": 4, "reasoning": "x"}, ctx) is None
+
+
+def test_opportunity_pick_trusts_canonical_position_not_claudes_label():
+    # Claude mislabeling position must not let a QB through under a fake
+    # RB/WR/TE tag — same "id is the only trusted field" rule _pick_from
+    # uses for main, extended to the one extra check opportunity needs.
+    ctx = _mixed_position_ctx()
+    pick = _opportunity_pick_from({"player_id": 3, "position": "WR", "reasoning": "x"}, ctx)
+    assert pick is None
+
+
+def test_opportunity_pick_rejects_unavailable_or_malformed():
+    ctx = _mixed_position_ctx()
+    assert _opportunity_pick_from({"player_id": 999}, ctx) is None
+    assert _opportunity_pick_from({}, ctx) is None
+    assert _opportunity_pick_from(None, ctx) is None
+    assert _opportunity_pick_from("not a dict", ctx) is None
+
+
+def test_parse_response_includes_valid_opportunity():
+    payload = valid_payload()
+    payload["opportunity"] = {"player_id": 5, "reasoning": "target share climbing"}
+    ctx = _mixed_position_ctx()
+    payload["main"]["player_id"] = 1
+    result = _parse_response(json.dumps(payload), ctx)
+    assert result is not None
+    assert [p.player_id for p in result.opportunity] == [5]
+    assert result.opportunity[0].tags == [_TAG_OPPORTUNITY]
+
+
+def test_parse_response_survives_a_bad_opportunity_object():
+    # A malformed/invalid opportunity must not take main down with it.
+    payload = valid_payload()
+    payload["opportunity"] = {"player_id": 3, "reasoning": "x"}  # QB — invalid position
+    ctx = _mixed_position_ctx()
+    payload["main"]["player_id"] = 1
+    result = _parse_response(json.dumps(payload), ctx)
+    assert result is not None
+    assert result.main.player_id == 1
+    assert result.opportunity == []
+
+
+def test_parse_response_handles_missing_opportunity_entirely():
+    # valid_payload() has no "opportunity" key at all — the shape Claude
+    # would produce if it just omitted the field despite instructions.
+    result = _parse_response(json.dumps(valid_payload()), ctx_with_available(1, 2, 3))
+    assert result is not None
+    assert result.opportunity == []
 
 
 # ---------------------------------------------------------------------------
@@ -2139,6 +2232,52 @@ def test_movers_are_ordered_by_share_not_by_label_text():
 
 
 # ---------------------------------------------------------------------------
+# _format_schedule_section — real upcoming opponents for the Opportunity pick
+# ---------------------------------------------------------------------------
+
+def _sched_board():
+    return [{"id": 1, "rank": 1, "name": "Josh Downs", "position": "WR",
+             "team": "IND", "adp": 91.9, "sleeper_id": None}]
+
+
+def test_schedule_section_lists_real_matchups():
+    from backend.app.services.ai_service import _format_schedule_section
+    out = _format_schedule_section(_sched_board(), {
+        "IND": [{"week": 1, "opponent": "HOU", "is_home": True},
+                {"week": 2, "opponent": "GB", "is_home": False}],
+    })
+    assert "IND: wk1 vs HOU, wk2 @ GB" in out
+
+
+def test_schedule_section_omitted_when_no_data_ingested():
+    from backend.app.services.ai_service import _format_schedule_section
+    assert _format_schedule_section(_sched_board(), {}) == ""
+
+
+def test_schedule_section_only_teams_on_the_board_are_shown():
+    from backend.app.services.ai_service import _format_schedule_section
+    out = _format_schedule_section(_sched_board(), {
+        "IND": [{"week": 1, "opponent": "HOU", "is_home": True}],
+        "KC": [{"week": 1, "opponent": "BAL", "is_home": True}],
+    })
+    assert "IND:" in out and "KC:" not in out
+
+
+def test_schedule_section_caveats_opponent_quality_separately_from_the_facts():
+    # The matchup facts (who/when/home-away) are real data and should be
+    # trusted; whether that opponent's defense is actually tough is a
+    # DIFFERENT claim this table doesn't make — see the function's
+    # docstring and the live concern that motivated it (Claude's knowledge
+    # cutoff predates the season's real schedule release).
+    from backend.app.services.ai_service import _format_schedule_section
+    out = _format_schedule_section(_sched_board(), {
+        "IND": [{"week": 1, "opponent": "HOU", "is_home": True}],
+    })
+    assert "trust them as fact" in out
+    assert "your own judgment" in out
+
+
+# ---------------------------------------------------------------------------
 # Team abbreviation normalisation
 #
 # PlayerMetrics.team comes from nflverse, Player.team from the ADP feed.
@@ -2883,7 +3022,7 @@ def test_tag_overlaps_merges_tags_for_the_same_player():
         PickSuggestion(2, "Other", "WR", 20.0, "value", tags=[_TAG_BEST_AVAILABLE]),
     ]
     needs = [PickSuggestion(1, "Shared", "RB", 10.0, "need", tags=[_TAG_NEEDS])]
-    _tag_overlaps(main, best_available, needs, [])
+    _tag_overlaps(main, best_available, needs, [], [])
     assert main.tags == [_TAG_MAIN, _TAG_BEST_AVAILABLE, _TAG_NEEDS]
     assert best_available[0].tags == [_TAG_MAIN, _TAG_BEST_AVAILABLE, _TAG_NEEDS]
     assert best_available[1].tags == [_TAG_BEST_AVAILABLE]
@@ -2894,7 +3033,18 @@ def test_tag_overlaps_merges_tags_for_the_same_player():
     assert "mutated" not in best_available[0].tags
 
 
-def test_build_sections_never_exceeds_the_five_slot_budget():
+def test_tag_overlaps_folds_in_opportunity_too():
+    # opportunity is model output, extracted separately from the other
+    # three, but still needs to end up in the same reconciled tag list when
+    # it overlaps with one of them — see _tag_overlaps' docstring.
+    main = PickSuggestion(1, "Shared", "RB", 10.0, "reason")
+    opportunity = [PickSuggestion(1, "Shared", "RB", 10.0, "role", tags=[_TAG_OPPORTUNITY])]
+    _tag_overlaps(main, [], [], [], opportunity)
+    assert main.tags == [_TAG_MAIN, _TAG_OPPORTUNITY]
+    assert opportunity[0].tags == [_TAG_MAIN, _TAG_OPPORTUNITY]
+
+
+def test_build_sections_never_exceeds_the_deterministic_slot_budget():
     board = (
         [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
           "adp": float(i), "sleeper_id": None} for i in range(1, 10)]
@@ -2903,13 +3053,19 @@ def test_build_sections_never_exceeds_the_five_slot_budget():
     )
     ctx = _sections_ctx(board, my_roster=[])
     main = PickSuggestion(1, "WR1", "WR", 1.0, "top pick")
-    best_available, needs, depth = _build_sections(ctx, main)
+    # opportunity passed empty here — this test is about the three
+    # DETERMINISTIC sections' own budget (best_available/needs/depth),
+    # which _build_sections computes regardless of what opportunity holds.
+    best_available, needs, depth = _build_sections(ctx, main, [])
     total = 1 + len(best_available) + len(needs) + len(depth)
     assert total <= 5
     assert len(best_available) <= 2
     assert len(needs) <= 2
-    assert len(depth) <= 1
-    assert not (needs and depth)   # mutually exclusive by construction
+    assert len(depth) <= 2
+    # This board's my_roster=[] means skill_gaps is never empty, so depth
+    # never fires here — needs and depth CAN coexist in general (see
+    # _depth_pick's docstring), just not on this particular board/roster.
+    assert depth == []
 
 
 def test_parse_response_populates_the_deterministic_sections():

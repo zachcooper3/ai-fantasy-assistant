@@ -79,3 +79,41 @@ def test_has_season_distinguishes_never_ingested_from_a_real_bye(db):
     # from the season never having been ingested at all.
     assert game_repo.get_opponent(db, "NOTATEAM", 2026, 1) is None
     assert game_repo.has_season(db, 2026) is True
+
+
+# ---------------------------------------------------------------------------
+# get_schedules_bulk — feeds RecommendationContext.team_schedules
+# ---------------------------------------------------------------------------
+
+def test_get_schedules_bulk_returns_one_entry_per_requested_team(db):
+    game_repo.replace_season(db, 2026, _games(2026))
+    out = game_repo.get_schedules_bulk(db, ["DET", "GB", "KC"], 2026, from_week=1, through_week=3)
+    assert set(out.keys()) == {"DET", "GB", "KC"}
+    assert {g["week"] for g in out["DET"]} == {1, 2, 3}
+
+
+def test_get_schedules_bulk_excludes_postseason(db):
+    game_repo.replace_season(db, 2026, _games(2026))
+    out = game_repo.get_schedules_bulk(db, ["DET"], 2026, from_week=1, through_week=1)
+    # _games(2026) has both a REG and a POST game for DET in week 1 —
+    # only the REG one should come back.
+    assert len(out["DET"]) == 1
+    assert out["DET"][0]["opponent"] == "GB"
+
+
+def test_get_schedules_bulk_respects_the_week_window(db):
+    game_repo.replace_season(db, 2026, _games(2026))
+    out = game_repo.get_schedules_bulk(db, ["DET"], 2026, from_week=2, through_week=2)
+    assert [g["week"] for g in out["DET"]] == [2]
+
+
+def test_get_schedules_bulk_omits_teams_with_no_games_in_range(db):
+    game_repo.replace_season(db, 2026, _games(2026))
+    out = game_repo.get_schedules_bulk(db, ["DET", "NOTATEAM"], 2026, from_week=1, through_week=3)
+    assert "NOTATEAM" not in out
+    assert "DET" in out
+
+
+def test_get_schedules_bulk_empty_team_list_returns_empty_dict(db):
+    game_repo.replace_season(db, 2026, _games(2026))
+    assert game_repo.get_schedules_bulk(db, [], 2026, from_week=1, through_week=6) == {}

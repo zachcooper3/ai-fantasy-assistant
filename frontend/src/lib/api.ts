@@ -107,7 +107,7 @@ export interface Board {
  * docstring. A player can carry more than one tag; overlap is meaningful
  * (e.g. "this is both the main pick and your best value on the board") and
  * is never deduplicated away. */
-export type SectionTag = "main" | "best_available" | "needs" | "depth";
+export type SectionTag = "main" | "best_available" | "needs" | "depth" | "opportunity";
 
 export interface PickSuggestion {
   player_id: number;
@@ -135,12 +135,13 @@ export type Confidence = "high" | "medium" | "low";
 
 export interface Recommendation {
   /**
-   * The model's single synthesized pick — the only entry backed by real
+   * The model's single synthesized pick — the primary entry backed by real
    * reasoning (tiers, opportunity cost, VOR, news). best_available/needs/
    * depth below are NOT model output: they're computed server-side straight
    * from the same board data ("cheapest by ADP" / "fills your open slot" is
    * a lookup, not a judgement call), specifically to keep generation cost
-   * down. See the backend's RecommendationResult docstring.
+   * down. `opportunity` below is the one other model-authored field. See
+   * the backend's RecommendationResult docstring.
    */
   main: PickSuggestion;
   /** Up to 2, cheapest by ADP regardless of roster need. */
@@ -159,6 +160,17 @@ export interface Recommendation {
    * second QB/TE. Can be non-empty alongside `needs`.
    */
   depth: PickSuggestion[];
+  /**
+   * 0-1: an RB/WR/TE whose real role this season looks bigger than his
+   * ADP/tier reflects — usage trend, roster departures/arrivals, real
+   * upcoming schedule, plus general football knowledge (depth-chart
+   * competition, scheme/coaching changes, contract situations) `main` is
+   * NOT allowed to use. Unlike best_available/needs/depth, this IS model
+   * output — there's no formula for it — so it's empty whenever the AI is
+   * unavailable or names someone invalid. See the backend's
+   * RecommendationResult.opportunity docstring.
+   */
+  opportunity: PickSuggestion[];
   alerts: string[];
   model: string;
   /** One sentence on the roster's shape and what this pick does about it. */

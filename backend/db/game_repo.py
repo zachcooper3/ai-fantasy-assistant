@@ -104,6 +104,49 @@ def get_remaining_schedule(
     ]
 
 
+def get_schedules_bulk(
+    session: Session, teams: list[str], season: int, from_week: int, through_week: int,
+) -> dict[str, list[dict]]:
+    """
+    Returns {team: [{week, opponent, is_home}, ...]} for every team in
+    `teams`, one query instead of one per team — this is what
+    RecommendationContext.team_schedules is populated from (see
+    recommendations.py::_build_context), and the board can have a couple
+    dozen distinct teams on it, so a per-team round trip would be the same
+    N+1 shape player_id relinking was built to avoid elsewhere in this app.
+
+    Regular season only, `from_week` through `through_week` inclusive.
+    Teams with no rows in range (bye week inside the window, team not
+    found, or schedule never ingested for this season) are simply absent
+    from the result — same "missing means unknown" convention
+    get_opponent's docstring describes, just bulk.
+    """
+    if not teams:
+        return {}
+    games = session.exec(
+        select(Game).where(
+            Game.season == season,
+            Game.week >= from_week,
+            Game.week <= through_week,
+            Game.game_type == "REG",
+            (Game.home_team.in_(teams)) | (Game.away_team.in_(teams)),
+        ).order_by(Game.week)
+    ).all()
+
+    out: dict[str, list[dict]] = {}
+    team_set = set(teams)
+    for g in games:
+        for team, opponent, is_home in (
+            (g.home_team, g.away_team, True),
+            (g.away_team, g.home_team, False),
+        ):
+            if team in team_set:
+                out.setdefault(team, []).append(
+                    {"week": g.week, "opponent": opponent, "is_home": is_home}
+                )
+    return out
+
+
 def has_season(session: Session, season: int) -> bool:
     """Whether any schedule data has been ingested for `season` at all —
     lets callers distinguish "no game this week" (bye) from "schedule was

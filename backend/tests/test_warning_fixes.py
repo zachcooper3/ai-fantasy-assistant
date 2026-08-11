@@ -138,6 +138,10 @@ def test_no_client_uses_fallback_with_best_available():
     # best_available is deterministic, not model output — see _best_available
     # — so the fallback path computes it identically to a live recommendation.
     assert [p.player_id for p in result.best_available] == [1, 2]
+    # opportunity has no formula to fall back to — unlike best_available,
+    # there's no substitute for "whose role is trending up" without a model
+    # to weigh it, so the ADP fallback never guesses at it.
+    assert result.opportunity == []
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +161,7 @@ def test_recommend_route_returns_fallback(client, seeded_players):
     body = r.json()
     assert body["model"].endswith(":fallback")
     assert body["main"]["player_id"] == 1  # best ADP on the board
+    assert body["opportunity"] == []  # no formula to fall back to
 
 
 def test_recommend_route_404_when_board_empty(client):
