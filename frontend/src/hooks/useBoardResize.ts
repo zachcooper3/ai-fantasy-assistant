@@ -9,11 +9,17 @@
  * a drag handle lets you park the board (and therefore the AI panel) at
  * whatever width actually suits the screen, instead of only choosing between
  * "full board" and "thin strip."
+ *
+ * The drag range bottoms out at the DraftRoom column's own width, not at the
+ * rail: below that the board is narrower than the cards beside it and stops
+ * being a readable table, and every width between there and the rail is
+ * worse than either end. Collapsing is a deliberate action (toggle / "b" /
+ * Home), not somewhere you can end up by overshooting a drag.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-/** Absolute minimum drag width — matches the collapsed rail's rendered width. */
+/** Width of the collapsed rail. Reachable by toggle/Home, not by dragging. */
 export const RAIL_WIDTH = 56;
 
 /** At or below this, BigBoard renders its rail — a real table doesn't fit. */
@@ -37,7 +43,16 @@ const DEFAULT_WIDTH = 640;
 const AI_MIN_WIDTH_MD = 300;
 const AI_MIN_WIDTH_XL = 340;
 
-/** DraftRoom's fixed width — mirrors the md:/xl: breakpoint it used to use. */
+/**
+ * DraftRoom's fixed width — mirrors the md:/xl: breakpoint it used to use.
+ *
+ * Doubles as the Big Board's minimum drag width (see minDragWidth). The
+ * board narrower than the column of cards beside it is the point where it
+ * stops being a table you can read, and pinning the two together means the
+ * floor is a described relationship rather than a tuned magic number — if
+ * DraftRoom's width ever changes, the floor follows it instead of quietly
+ * becoming wrong.
+ */
 const DRAFT_ROOM_WIDTH_MD = 320;
 const DRAFT_ROOM_WIDTH_XL = 380;
 const XL_BREAKPOINT = "(min-width: 1280px)";
@@ -125,6 +140,24 @@ export function useBoardResize(): BoardResize {
     [aiMinWidth]
   );
 
+  /**
+   * The drag floor: match the DraftRoom column beside it, but never exceed
+   * the ceiling.
+   *
+   * That second clause matters on a narrow desktop, where the whole range
+   * collapses. At the md breakpoint DraftRoom (320) + the AI panel's floor
+   * (300) + gaps already leave the board under 100px, so a hard 320 floor
+   * would sit *above* the maximum — and clamp() resolves min-over-max ties
+   * in favour of min, which would force the board wider than the grid can
+   * hold and push the AI panel off screen. Yielding to the ceiling means
+   * those screens behave exactly as they did before: draggable down to, and
+   * through, the rail.
+   */
+  const minDragWidth = useCallback(
+    (max: number) => Math.min(draftRoomWidth, max),
+    [draftRoomWidth]
+  );
+
   const [boardWidth, setBoardWidthState] = useState(DEFAULT_WIDTH);
   // Mirrors boardWidth for reads inside callbacks that must stay dep-free
   // (the drag handlers) or that fire from a stale closure (pointerup after
@@ -168,14 +201,21 @@ export function useBoardResize(): BoardResize {
   }, []);
 
   const setWidth = useCallback(
-    (width: number, opts: { persist?: boolean } = {}) => {
-      const clamped = clamp(width, RAIL_WIDTH, maxWidth(containerWidth, draftRoomWidth));
+    /**
+     * `allowRail` opts out of the drag floor. Only the two deliberate
+     * collapse paths pass it — toggleCollapse and the Home key — so the
+     * handle itself can never leave the board at an unreadable width.
+     */
+    (width: number, opts: { persist?: boolean; allowRail?: boolean } = {}) => {
+      const max = maxWidth(containerWidth, draftRoomWidth);
+      const floor = opts.allowRail ? RAIL_WIDTH : minDragWidth(max);
+      const clamped = clamp(width, floor, max);
       boardWidthRef.current = clamped;
       setBoardWidthState(clamped);
       if (clamped > COLLAPSE_THRESHOLD) expandedWidthRef.current = clamped;
       if (opts.persist !== false) persist(clamped);
     },
-    [containerWidth, draftRoomWidth, maxWidth, persist]
+    [containerWidth, draftRoomWidth, maxWidth, minDragWidth, persist]
   );
 
   // Re-clamp whenever the available space shrinks (window resize, DraftRoom
@@ -185,11 +225,17 @@ export function useBoardResize(): BoardResize {
   useEffect(() => {
     if (containerWidth === 0) return;
     setBoardWidthState((w) => {
-      const clamped = clamp(w, RAIL_WIDTH, maxWidth(containerWidth, draftRoomWidth));
+      const max = maxWidth(containerWidth, draftRoomWidth);
+      // A collapsed board keeps the rail as its floor. Applying the drag
+      // floor here instead would spring it open on any window resize — or
+      // on the md/xl breakpoint crossing — which is not something the user
+      // asked for by dragging the window.
+      const floor = w <= COLLAPSE_THRESHOLD ? RAIL_WIDTH : minDragWidth(max);
+      const clamped = clamp(w, floor, max);
       boardWidthRef.current = clamped;
       return clamped === w ? w : clamped;
     });
-  }, [containerWidth, draftRoomWidth, maxWidth]);
+  }, [containerWidth, draftRoomWidth, maxWidth, minDragWidth]);
 
   const collapsed = boardWidth <= COLLAPSE_THRESHOLD;
 
@@ -197,7 +243,7 @@ export function useBoardResize(): BoardResize {
     if (boardWidthRef.current <= COLLAPSE_THRESHOLD) {
       setWidth(expandedWidthRef.current || DEFAULT_WIDTH);
     } else {
-      setWidth(RAIL_WIDTH);
+      setWidth(RAIL_WIDTH, { allowRail: true });
     }
   }, [setWidth]);
 
@@ -251,7 +297,9 @@ export function useBoardResize(): BoardResize {
         setWidth(boardWidthRef.current + KEYBOARD_STEP);
       } else if (e.key === "Home") {
         e.preventDefault();
-        setWidth(RAIL_WIDTH);
+        // Home collapses outright rather than going to the drag floor —
+        // it's the keyboard equivalent of the collapse button.
+        setWidth(RAIL_WIDTH, { allowRail: true });
       } else if (e.key === "End") {
         e.preventDefault();
         setWidth(maxWidth(containerWidth, draftRoomWidth));
