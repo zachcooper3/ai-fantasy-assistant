@@ -10,10 +10,11 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
  *
  * This means "56 / 56" for QB at the start, dropping to "55 / 56" after a QB is drafted.
  *
- * Keyboard (see the shortcut list in the header tooltip):
+ * Keyboard (the canonical list users see is the ? overlay — see
+ * ShortcutsOverlay; keep the two in step):
  *   /        focus search        ↑ ↓   move selection
  *   Enter    draft selected      Esc   clear search / selection
- *   1–6      position filter
+ *   1–7      position filter (indexes into POSITIONS below)
  */
 
 import { ChevronLeft, ChevronRight } from "lucide-react";
@@ -21,8 +22,14 @@ import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Player } from "@/lib/api";
 import { matchesQuery } from "@/lib/search";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
+import InjuryBadge from "@/components/InjuryBadge";
 
-const POSITIONS = ["All", "QB", "RB", "WR", "TE", "DST"] as const;
+// K is here even though there's no kicker roster slot (DraftConfigRequest has
+// no k_slots — see rosterSlots in lib/draft.ts). The board is the pool, not
+// the lineup: there are 51 kickers in the ADP data and the recommendation
+// engine now surfaces one in the final rounds, so a filter that can't reach
+// them left the last pick of every draft to name-search only.
+const POSITIONS = ["All", "QB", "RB", "WR", "TE", "DST", "K"] as const;
 type PosFilter = (typeof POSITIONS)[number];
 
 const INITIAL_LIMIT = 50;
@@ -66,6 +73,12 @@ interface Props {
    */
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  /**
+   * Opens the player detail drawer. Optional so the board still renders
+   * standalone (and in tests) without one — when omitted the name is plain
+   * text rather than a button that does nothing.
+   */
+  onShowDetail?: (playerId: number) => void;
 }
 
 export default function BigBoard({
@@ -77,6 +90,7 @@ export default function BigBoard({
   sessionKey = "",
   collapsed = false,
   onToggleCollapse,
+  onShowDetail,
 }: Props) {
   const [posFilter, setPosFilter] = useState<PosFilter>("All");
   const [search, setSearch] = useState("");
@@ -213,7 +227,18 @@ export default function BigBoard({
         return;
       }
 
-      // 1-6 pick a position filter, in the order they're shown.
+      // "i" opens the detail drawer for the selected player, so the whole
+      // arrow-to-a-name / inspect / draft loop stays on the keyboard.
+      if (e.key === "i") {
+        const player = visible[selectedIndex];
+        if (player && onShowDetail) {
+          e.preventDefault();
+          onShowDetail(player.id);
+        }
+        return;
+      }
+
+      // 1-N pick a position filter, in the order they're shown.
       const digit = Number(e.key);
       if (Number.isInteger(digit) && digit >= 1 && digit <= POSITIONS.length) {
         e.preventDefault();
@@ -223,7 +248,7 @@ export default function BigBoard({
 
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [visible.length, selectedIndex, search, draftSelected, collapsed]);
+  }, [visible, selectedIndex, search, draftSelected, collapsed, onShowDetail]);
 
   // Keep the selected row on screen when arrowing past the fold.
   useEffect(() => {
@@ -317,7 +342,7 @@ export default function BigBoard({
         </div>
 
         {/* Position filter */}
-        <div className="flex gap-1 mb-2">
+        <div className="flex flex-wrap gap-1 mb-2">
           {POSITIONS.map((pos, i) => (
             <button
               key={pos}
@@ -403,9 +428,31 @@ export default function BigBoard({
                               title="AI recommendation"
                             />
                           )}
-                          <div>
-                            <span className="text-slate-100 font-medium">{player.name}</span>
+                          <div className="min-w-0">
+                            {/* The name is the affordance for the detail
+                                drawer — a separate icon button would need
+                                its own column in a table that's already
+                                fighting for width at the rail end of the
+                                resize range. */}
+                            {onShowDetail ? (
+                              <button
+                                type="button"
+                                onClick={() => onShowDetail(player.id)}
+                                aria-label={`Details for ${player.name}`}
+                                className="text-slate-100 font-medium text-left hover:text-emerald-300 hover:underline decoration-dotted underline-offset-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded"
+                              >
+                                {player.name}
+                              </button>
+                            ) : (
+                              <span className="text-slate-100 font-medium">{player.name}</span>
+                            )}
                             <span className="ml-1.5 text-xs text-slate-400">{player.team}</span>
+                            {player.bye != null && (
+                              <span className="ml-1.5 text-xs text-slate-500">
+                                bye {player.bye}
+                              </span>
+                            )}
+                            <InjuryBadge status={player.injury_status} className="ml-1.5" />
                           </div>
                         </div>
                       </td>

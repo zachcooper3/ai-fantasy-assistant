@@ -4,7 +4,7 @@
  * Highlights in green when it's the user's turn.
  */
 
-import { Undo2, Wifi, WifiOff, RefreshCw, RotateCcw, LogOut } from "lucide-react";
+import { Undo2, Wifi, WifiOff, RefreshCw, RotateCcw, LogOut, Keyboard } from "lucide-react";
 import { DraftState, SyncStatus } from "@/lib/api";
 import ConfirmButton from "@/components/ConfirmButton";
 
@@ -13,6 +13,9 @@ interface Props {
   isConnected: boolean;
   syncStatus: SyncStatus | null;
   onUndo: () => void;
+  /** Opens the keyboard shortcut reference — the only pointer to it, since
+   *  every shortcut in the app is a bare keypress with no visible affordance. */
+  onShowShortcuts: () => void;
   /** Clears the picks but keeps this league's settings. */
   onReset: () => void;
   /**
@@ -41,6 +44,7 @@ export default function StatusBar({
   isConnected,
   syncStatus,
   onUndo,
+  onShowShortcuts,
   onReset,
   onNewDraft,
 }: Props) {
@@ -57,7 +61,13 @@ export default function StatusBar({
 
   return (
     <div
-      className={`flex items-center gap-4 px-4 py-3 border-b text-sm font-medium transition-colors ${
+      /* flex-wrap: eleven inline items in one row with no wrap meant the
+         controls at the end — Undo, Reset, New draft, and both connection
+         indicators — were simply clipped off the right edge below roughly
+         1300px, with nothing to suggest they existed. The spacer below is
+         `basis-0 grow` so it still pushes the controls right on one line but
+         collapses instead of forcing the wrap by itself. */
+      className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 border-b text-sm font-medium transition-colors ${
         myTurn
           ? "bg-emerald-950 border-emerald-700"
           : "bg-slate-900 border-slate-700"
@@ -134,9 +144,19 @@ export default function StatusBar({
       )}
 
       {/* Spacer */}
-      <span className="flex-1" />
+      <span className="grow basis-0" />
 
       {/* Controls */}
+      <button
+        type="button"
+        onClick={onShowShortcuts}
+        aria-label="Keyboard shortcuts"
+        title="Keyboard shortcuts (?)"
+        className="flex items-center justify-center w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+      >
+        <Keyboard size={14} aria-hidden="true" />
+      </button>
+
       <button
         onClick={onUndo}
         disabled={undoDisabled}

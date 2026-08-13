@@ -29,6 +29,133 @@ class PlayerResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PlayerMetricsResponse(BaseModel):
+    """
+    A player's PlayerMetrics row, verbatim — see backend/db/models.py.
+
+    Every metric stays Optional here for the same reason it is on the model:
+    nflverse coverage is sparse for some players and positions, and a missing
+    metric must read as "unknown" rather than becoming a misleading 0 on the
+    way through the API. The client is expected to omit rather than zero-fill.
+
+    `season`, `through_week` and `games_played` are not decoration — they are
+    how a caller judges whether the rest of the row is a real signal or three
+    games of noise. They're required for that reason.
+    """
+
+    season: int
+    through_week: int
+    games_played: int
+    team: str | None = None
+
+    # Opportunity / volume
+    targets_per_game: float | None = None
+    carries_per_game: float | None = None
+    red_zone_touches_per_game: float | None = None
+    snap_pct: float | None = None
+    target_share: float | None = None
+    carry_share: float | None = None
+
+    # Efficiency
+    yards_per_target: float | None = None
+    yards_per_carry: float | None = None
+    yac_per_reception: float | None = None
+    racr: float | None = None
+    catch_rate: float | None = None
+
+    # Team context
+    team_pass_rate: float | None = None
+    depth_chart_rank: int | None = None
+
+    # Consistency & risk
+    fantasy_points_avg: float | None = None
+    fantasy_points_stdev: float | None = None
+    injury_report_appearances: int = 0
+    games_missed: int = 0
+
+    # Forward-looking
+    target_share_trend: float | None = None
+    snap_pct_trend: float | None = None
+    depth_chart_trend: int | None = None
+    is_rookie_or_second_year: bool = False
+
+    model_config = {"from_attributes": True}
+
+
+class DraftProfileResponse(BaseModel):
+    """
+    A player's DraftProfile row — draft capital plus final-college-season
+    production. See backend/db/models.py.
+
+    Populated by two independent ingestion scripts that upsert different
+    field subsets, so a row can legitimately carry draft capital with no
+    college stats (or, for a position, college stats that are all None
+    because they don't apply — a WR has no passing yards). Clients should
+    render only what's present.
+    """
+
+    draft_year: int
+    draft_round: int | None = None
+    draft_pick: int | None = None
+    draft_team: str | None = None
+    college: str | None = None
+
+    college_season: int | None = None
+    passing_yards: int | None = None
+    passing_td: int | None = None
+    interceptions_thrown: int | None = None
+    rushing_yards: int | None = None
+    rushing_td: int | None = None
+    carries: int | None = None
+    receiving_yards: int | None = None
+    receiving_td: int | None = None
+    receptions: int | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class ScheduleGameResponse(BaseModel):
+    """One regular-season game from the player's team's schedule."""
+
+    week: int
+    opponent: str
+    is_home: bool
+
+
+class PlayerDetailResponse(BaseModel):
+    """
+    Everything this app knows about one player, for the detail drawer.
+
+    Exists because all of it was already being ingested and fed to Claude and
+    none of it was reachable from the UI: PlayerMetrics and DraftProfile went
+    straight into the prompt, so the only way to see a player's target share
+    or draft capital was to hope the model mentioned it in prose. That makes
+    the recommendation unauditable — you cannot check a pick you cannot see
+    the inputs for.
+
+    Deliberately one round trip rather than three: the drawer opens on a
+    click during a live draft, and three sequential fetches to render one
+    panel is latency the user pays for at exactly the wrong moment.
+
+    `metrics` is None for anyone with no NFL snaps yet (rookies, by
+    construction) and `draft_profile` is None for undrafted players — these
+    are the ordinary cases, not errors. `season` is None when neither table
+    has enough to infer one, in which case `schedule` is empty too.
+    """
+
+    player: PlayerResponse
+    metrics: PlayerMetricsResponse | None = None
+    draft_profile: DraftProfileResponse | None = None
+    # Regular-season games from week 1 of the season being drafted. Empty
+    # when fetch_schedule.py hasn't been run for that season — the same
+    # "missing means unknown, not confirmed bye" convention game_repo uses.
+    schedule: list[ScheduleGameResponse] = []
+    # The season being drafted for, inferred from the data rather than the
+    # clock — same rule as ai_service._infer_current_season. See the
+    # endpoint in backend/app/api/players.py.
+    season: int | None = None
+
+
 class ScarcityResponse(BaseModel):
     """Available player counts per position — used to drive scarcity alerts."""
     QB: int = 0

@@ -34,6 +34,111 @@ export interface Player {
   pos_rank: string;
   adp: number;
   is_available: boolean;
+  /**
+   * Sleeper's designation — "IR", "Out", "PUP", "Suspended", "Questionable",
+   * "Doubtful", "NA" — or null when healthy. Populated by
+   * scripts/sync_sleeper_ids.py; see Player.injury_status in
+   * backend/db/models.py. Optional here because the field post-dates this
+   * client and a cached older response won't carry it.
+   */
+  injury_status?: string | null;
+}
+
+/**
+ * One player's PlayerMetrics row — see backend/db/models.py.
+ *
+ * Every metric is optional and a missing one means "not known", never zero:
+ * nflverse coverage is sparse by position and by player, so the drawer omits
+ * rows it has no value for rather than rendering a confident 0.
+ *
+ * `season` / `through_week` / `games_played` are required because they're how
+ * you judge whether the rest is signal — a 17-game row and a 3-game row look
+ * identical otherwise.
+ */
+export interface PlayerMetrics {
+  season: number;
+  through_week: number;
+  games_played: number;
+  /** The team these numbers were earned with — not necessarily today's team. */
+  team: string | null;
+
+  targets_per_game: number | null;
+  carries_per_game: number | null;
+  red_zone_touches_per_game: number | null;
+  /** 0-1 */
+  snap_pct: number | null;
+  /** 0-1 */
+  target_share: number | null;
+  /** 0-1 */
+  carry_share: number | null;
+
+  yards_per_target: number | null;
+  yards_per_carry: number | null;
+  yac_per_reception: number | null;
+  racr: number | null;
+  /** 0-1 */
+  catch_rate: number | null;
+
+  /** 0-1 */
+  team_pass_rate: number | null;
+  /** 1 = starter at the position */
+  depth_chart_rank: number | null;
+
+  /** PPR, per game */
+  fantasy_points_avg: number | null;
+  /** Week-to-week PPR standard deviation — the boom/bust measure. */
+  fantasy_points_stdev: number | null;
+  injury_report_appearances: number;
+  games_missed: number;
+
+  /** Last 3 weeks minus season average; positive = rising role. */
+  target_share_trend: number | null;
+  snap_pct_trend: number | null;
+  /** Rank change over the last 3 weeks; NEGATIVE = moving up the chart. */
+  depth_chart_trend: number | null;
+  is_rookie_or_second_year: boolean;
+}
+
+/** Draft capital plus final-college-season production — see DraftProfile. */
+export interface DraftProfile {
+  draft_year: number;
+  draft_round: number | null;
+  draft_pick: number | null;
+  draft_team: string | null;
+  college: string | null;
+
+  college_season: number | null;
+  passing_yards: number | null;
+  passing_td: number | null;
+  interceptions_thrown: number | null;
+  rushing_yards: number | null;
+  rushing_td: number | null;
+  carries: number | null;
+  receiving_yards: number | null;
+  receiving_td: number | null;
+  receptions: number | null;
+}
+
+export interface ScheduleGame {
+  week: number;
+  opponent: string;
+  is_home: boolean;
+}
+
+/**
+ * Everything the app knows about one player, for the detail drawer.
+ *
+ * `metrics` is null for anyone with no NFL snaps (rookies, by construction);
+ * `draft_profile` is null for undrafted players. Both are ordinary states, not
+ * errors. `schedule` is empty when the schedule hasn't been ingested for the
+ * inferred season — treat that as unknown, not as a bye.
+ */
+export interface PlayerDetail {
+  player: Player;
+  metrics: PlayerMetrics | null;
+  draft_profile: DraftProfile | null;
+  schedule: ScheduleGame[];
+  season: number | null;
 }
 
 export interface Scarcity {
@@ -295,6 +400,14 @@ export const api = {
       `/api/players?available_only=${availableOnly}&limit=${limit}` +
       (position ? `&position=${position}` : "")
     ),
+
+  /**
+   * Everything known about one player, in one round trip — see the backend's
+   * PlayerDetailResponse. Backs the detail drawer, which opens on a click
+   * mid-draft, so this deliberately isn't three separate fetches.
+   */
+  playerDetail: (playerId: number) =>
+    get<PlayerDetail>(`/api/players/${playerId}/detail`),
 
   // Draft session
   startSession: (config: {

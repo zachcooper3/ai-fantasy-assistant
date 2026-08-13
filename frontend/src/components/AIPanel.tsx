@@ -44,6 +44,7 @@ import { api, Confidence, Player, PickSuggestion, Recommendation, Scarcity, Sect
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
 import ConfirmButton from "@/components/ConfirmButton";
+import InjuryBadge from "@/components/InjuryBadge";
 
 const POS_COLORS: Record<string, string> = {
   QB:  "text-red-400",
@@ -184,6 +185,13 @@ interface Props {
   /** Toggles the Big Board's collapsed state. Omitted (e.g. on mobile, where
    *  each section is already full-width) hides the header toggle button. */
   onToggleBoardCollapse?: () => void;
+  /**
+   * Opens the player detail drawer. This matters most here: the metrics and
+   * draft capital behind a recommendation are exactly the numbers the model
+   * reasoned over, and being able to open them is the difference between
+   * taking the pick on faith and checking it.
+   */
+  onShowDetail?: (playerId: number) => void;
 }
 
 /** ADP + value/reach delta + team/bye, the numbers you compare picks on. */
@@ -203,6 +211,10 @@ function PlayerMeta({
       {/* First, ahead of ADP: whether you can still have him later decides
           more picks than any other figure on this row. */}
       <SurvivalBadge survival={suggestion.survival} />
+      {/* An injury designation outranks every number here: a player who
+          cannot play is not a pick to weigh. The AI service excludes them,
+          but this panel is also how you check its work. */}
+      <InjuryBadge status={player?.injury_status} />
       <span className="tabular-nums">ADP {suggestion.adp}</span>
       <span className={`font-medium ${VALUE_STYLES[value.label]}`}>
         <span className="tabular-nums">{value.text}</span>
@@ -330,6 +342,7 @@ function SuggestionCard({
   player,
   canDraft,
   onDraft,
+  onShowDetail,
   variant = "subtle",
 }: {
   suggestion: PickSuggestion;
@@ -338,16 +351,30 @@ function SuggestionCard({
   player?: Player;
   canDraft: boolean;
   onDraft: () => void;
+  onShowDetail?: (playerId: number) => void;
   variant?: "primary" | "subtle";
 }) {
   const isPrimary = variant === "primary";
+  const nameClass = isPrimary
+    ? "text-lg font-bold text-white break-words"
+    : "text-slate-100 text-sm font-semibold break-words";
+
   return (
     <div className={isPrimary ? "bg-slate-800 rounded-xl p-4" : "bg-slate-800/60 rounded-xl p-3"}>
       <div className="flex items-start justify-between gap-2 mb-1">
         <div className="min-w-0">
-          <span className={isPrimary ? "text-lg font-bold text-white break-words" : "text-slate-100 text-sm font-semibold break-words"}>
-            {suggestion.player_name}
-          </span>
+          {onShowDetail ? (
+            <button
+              type="button"
+              onClick={() => onShowDetail(suggestion.player_id)}
+              aria-label={`Details for ${suggestion.player_name}`}
+              className={`${nameClass} text-left hover:text-emerald-300 hover:underline decoration-dotted underline-offset-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded`}
+            >
+              {suggestion.player_name}
+            </button>
+          ) : (
+            <span className={nameClass}>{suggestion.player_name}</span>
+          )}
           <span
             className={`${isPrimary ? "ml-2 text-sm" : "ml-1.5 text-xs"} font-semibold ${
               POS_COLORS[suggestion.position] ?? "text-slate-300"
@@ -393,6 +420,7 @@ export default function AIPanel({
   isSyncing = false,
   boardCollapsed = false,
   onToggleBoardCollapse,
+  onShowDetail,
 }: Props) {
   const [showHistory, setShowHistory] = useState(false);
 
@@ -593,6 +621,7 @@ export default function AIPanel({
                 player={playersById.get(recommendation.main.player_id)}
                 canDraft={canDraft}
                 onDraft={() => onDraftRecommended(recommendation.main.player_id)}
+                onShowDetail={onShowDetail}
                 variant="primary"
               />
               <div className="flex items-center justify-between gap-2 mt-2 px-1">
@@ -637,6 +666,7 @@ export default function AIPanel({
                       player={playersById.get(p.player_id)}
                       canDraft={canDraft}
                       onDraft={() => onDraftRecommended(p.player_id)}
+                      onShowDetail={onShowDetail}
                     />
                   ))}
                 </div>
@@ -664,6 +694,7 @@ export default function AIPanel({
                       player={playersById.get(p.player_id)}
                       canDraft={canDraft}
                       onDraft={() => onDraftRecommended(p.player_id)}
+                      onShowDetail={onShowDetail}
                     />
                   ))}
                 </div>
@@ -689,6 +720,7 @@ export default function AIPanel({
                       player={playersById.get(p.player_id)}
                       canDraft={canDraft}
                       onDraft={() => onDraftRecommended(p.player_id)}
+                      onShowDetail={onShowDetail}
                     />
                   ))}
                 </div>
@@ -716,6 +748,7 @@ export default function AIPanel({
                       player={playersById.get(p.player_id)}
                       canDraft={canDraft}
                       onDraft={() => onDraftRecommended(p.player_id)}
+                      onShowDetail={onShowDetail}
                     />
                   ))}
                 </div>

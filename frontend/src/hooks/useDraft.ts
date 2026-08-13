@@ -88,6 +88,16 @@ export interface DraftHook {
    */
   isSyncing: boolean;
   isConnected: boolean;
+  /**
+   * True until the first GET /api/draft/session has settled.
+   *
+   * Nothing about the session is known before that, and "unknown" must not
+   * be rendered as "no draft": the setup screen's primary button POSTs a new
+   * session, which clears the picks of a draft already in progress. Callers
+   * must show a neutral loading state while this is true rather than falling
+   * through to setup. See the hydration effect below.
+   */
+  isHydrating: boolean;
   isLoadingRec: boolean;
   /**
    * When on, the recommendation is fetched automatically as your turn comes
@@ -122,6 +132,7 @@ export function useDraft(): DraftHook {
   const [recHistory, setRecHistory] = useState<PastRecommendation[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [isHydrating, setIsHydrating] = useState(true);
   const [isLoadingRec, setIsLoadingRec] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -234,6 +245,47 @@ export function useDraft(): DraftHook {
       };
     });
   }, []);
+
+  // ------------------------------------------------------------------
+  // Initial hydration
+  //
+  // Session state used to arrive ONLY on the WebSocket's "connected" frame,
+  // which means `session` was null for as long as the handshake took. The
+  // page renders the setup modal whenever there's no active session, so
+  // every load of a draft in progress flashed the setup screen first — and
+  // its Start Draft button POSTs a new session, which resets availability
+  // and clears the pick journal. A slow socket therefore put a
+  // draft-destroying button under the cursor for a few hundred milliseconds.
+  //
+  // The socket still hydrates too (it's the path that survives a reconnect);
+  // this just means the answer no longer depends on the handshake. Whichever
+  // arrives first wins, and they carry the same payload.
+  // ------------------------------------------------------------------
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const state = await api.getSession();
+        if (cancelled) return;
+        if (state.is_active) {
+          setSession(state);
+          await refreshBoard();
+        }
+      } catch {
+        // A 404 is the ordinary "no draft yet" answer, and an unreachable
+        // backend lands here too. Both end at the setup screen, which warns
+        // about the latter via isConnected rather than by throwing here.
+      } finally {
+        if (!cancelled) setIsHydrating(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshBoard]);
 
   // ------------------------------------------------------------------
   // WebSocket — connects once on mount, reconnects on drop
@@ -587,6 +639,7 @@ export function useDraft(): DraftHook {
     syncStatus,
     isSyncing: syncStatus?.status === "syncing",
     isConnected,
+    isHydrating,
     isLoadingRec,
     autoRecommend,
     setAutoRecommend,

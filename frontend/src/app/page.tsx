@@ -15,12 +15,14 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { LayoutGrid, Users, Lightbulb, RotateCcw } from "lucide-react";
+import { LayoutGrid, Users, Lightbulb, RotateCcw, RefreshCw } from "lucide-react";
 
 import { useDraft } from "@/hooks/useDraft";
 import { useBoardResize, HANDLE_WIDTH } from "@/hooks/useBoardResize";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
 import SetupModal from "@/components/SetupModal";
+import ShortcutsOverlay from "@/components/ShortcutsOverlay";
+import PlayerDetailDrawer from "@/components/PlayerDetailDrawer";
 import StatusBar from "@/components/StatusBar";
 import BigBoard from "@/components/BigBoard";
 import DraftRoom from "@/components/DraftRoom";
@@ -51,6 +53,7 @@ export default function DraftPage() {
     syncStatus,
     isSyncing,
     isConnected,
+    isHydrating,
     isLoadingRec,
     autoRecommend,
     setAutoRecommend,
@@ -64,6 +67,16 @@ export default function DraftPage() {
   } = useDraft();
 
   const [mobileTab, setMobileTab] = useState<MobileTab>("board");
+
+  // Keyboard shortcut reference. Every shortcut here is document-level and
+  // had no user-facing list anywhere in the app — see ShortcutsOverlay.
+  const [showShortcuts, setShowShortcuts] = useState(false);
+
+  // Player detail drawer. Held here rather than in BigBoard or AIPanel
+  // because both open it and only one can be open at a time — and it
+  // outlives the Big Board's collapse, which unmounts nothing but would
+  // otherwise scope the state to a panel that's currently a 56px rail.
+  const [detailPlayerId, setDetailPlayerId] = useState<number | null>(null);
 
   // Big Board column width — drag-resizable "focus mode". See
   // useBoardResize for the persistence, clamping, and drag-handle logic.
@@ -110,6 +123,12 @@ export default function DraftPage() {
       } else if (e.key === "b") {
         e.preventDefault();
         toggleBoardCollapse();
+      } else if (e.key === "?") {
+        // Shift+/ on most layouts. hasModifier above deliberately doesn't
+        // count Shift, so this is reachable; BigBoard's "/" handler doesn't
+        // match "?" and so doesn't steal it.
+        e.preventDefault();
+        setShowShortcuts((s) => !s);
       }
     }
     document.addEventListener("keydown", onKeyDown);
@@ -125,9 +144,26 @@ export default function DraftPage() {
     [board]
   );
 
+  // Nothing is known about the session until the first GET settles. Rendering
+  // the setup modal here would put its draft-clearing Start button under the
+  // cursor while a draft in progress was still loading — see useDraft's
+  // hydration effect.
+  if (isHydrating) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="fixed inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950"
+      >
+        <RefreshCw size={20} className="text-emerald-400 animate-spin" aria-hidden="true" />
+        <p className="text-slate-400 text-sm">Loading your draft…</p>
+      </div>
+    );
+  }
+
   // Show setup modal until a session is active
   if (!session?.is_active) {
-    return <SetupModal onStart={startSession} />;
+    return <SetupModal onStart={startSession} isConnected={isConnected} />;
   }
 
   const recommendedId = recommendation?.main?.player_id;
@@ -142,6 +178,7 @@ export default function DraftPage() {
         isConnected={isConnected}
         syncStatus={syncStatus}
         onUndo={undoPick}
+        onShowShortcuts={() => setShowShortcuts(true)}
         onNewDraft={endSession}
         onReset={() => startSession({
           league_size: session.league_size,
@@ -229,6 +266,7 @@ export default function DraftPage() {
               sessionKey={session.started_at ?? ""}
               collapsed={boardCollapsed}
               onToggleCollapse={toggleBoardCollapse}
+              onShowDetail={setDetailPlayerId}
             />
           </div>
 
@@ -263,6 +301,7 @@ export default function DraftPage() {
           isSyncing={isSyncing}
           boardCollapsed={boardCollapsed}
           onToggleBoardCollapse={toggleBoardCollapse}
+          onShowDetail={setDetailPlayerId}
         />
       </div>
 
@@ -276,6 +315,7 @@ export default function DraftPage() {
             onPick={recordPick}
             isSyncing={isSyncing}
             sessionKey={session.started_at ?? ""}
+            onShowDetail={setDetailPlayerId}
           />
         )}
         {mobileTab === "room" && <DraftRoom session={session} />}
@@ -289,10 +329,11 @@ export default function DraftPage() {
             onFetch={fetchRecommendation}
             onDraftRecommended={recordPick}
             playersById={playersById}
-          currentPickNumber={session.current_pick_number}
-          autoRecommend={autoRecommend}
-          onAutoRecommendChange={setAutoRecommend}
+            currentPickNumber={session.current_pick_number}
+            autoRecommend={autoRecommend}
+            onAutoRecommendChange={setAutoRecommend}
             isSyncing={isSyncing}
+            onShowDetail={setDetailPlayerId}
           />
         )}
       </div>
@@ -329,6 +370,15 @@ export default function DraftPage() {
           </button>
         ))}
       </nav>
+
+      {showShortcuts && <ShortcutsOverlay onClose={() => setShowShortcuts(false)} />}
+
+      {detailPlayerId != null && (
+        <PlayerDetailDrawer
+          playerId={detailPlayerId}
+          onClose={() => setDetailPlayerId(null)}
+        />
+      )}
 
       {/* Draft complete banner */}
       {session.draft_complete && !completeDismissed && (

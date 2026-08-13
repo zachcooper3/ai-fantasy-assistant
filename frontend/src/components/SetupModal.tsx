@@ -5,6 +5,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
+import { WifiOff } from "lucide-react";
 import { api, SleeperPrefill } from "@/lib/api";
 
 /** Elements that can hold focus inside the dialog, for the Tab trap below. */
@@ -24,6 +25,17 @@ interface Props {
     dst_slots: number;
     sleeper_draft_id?: string;
   }) => void;
+  /**
+   * Whether the draft-server WebSocket is up.
+   *
+   * A backend that isn't running is indistinguishable from "no draft yet"
+   * from in here — both land on this screen — so the failure used to present
+   * as a perfectly normal setup form whose Start button then errored. The
+   * button stays enabled: the socket and the HTTP API can fail
+   * independently, and refusing to let someone try is worse than warning
+   * them.
+   */
+  isConnected?: boolean;
 }
 
 // Today's implicit standard 1-QB PPR lineup — matches DraftConfig's own
@@ -84,7 +96,7 @@ function Stepper({
   );
 }
 
-export default function SetupModal({ onStart }: Props) {
+export default function SetupModal({ onStart, isConnected = true }: Props) {
   const [leagueSize, setLeagueSize] = useState(12);
   const [draftPos, setDraftPos] = useState(1);
   const [rounds, setRounds] = useState(15);
@@ -214,6 +226,20 @@ export default function SetupModal({ onStart }: Props) {
         <p id="setup-description" className="text-slate-300 text-sm mb-8">
           Configure your draft settings to get started.
         </p>
+
+        {!isConnected && (
+          <div
+            role="alert"
+            className="mb-6 flex items-start gap-2 px-3 py-2.5 rounded-lg bg-amber-900/25 border border-amber-800/50 text-xs text-amber-200"
+          >
+            <WifiOff size={13} className="shrink-0 mt-0.5" aria-hidden="true" />
+            <span>
+              Can&apos;t reach the draft server. If you have a draft in progress it may
+              just be loading — check the backend is running before starting a new one,
+              since that clears any existing picks.
+            </span>
+          </div>
+        )}
 
         <div className="space-y-5">
           {/* League size */}
