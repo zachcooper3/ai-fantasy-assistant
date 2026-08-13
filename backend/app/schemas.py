@@ -77,7 +77,9 @@ class PlayerMetricsResponse(BaseModel):
     target_share_trend: float | None = None
     snap_pct_trend: float | None = None
     depth_chart_trend: int | None = None
-    is_rookie_or_second_year: bool = False
+    # is_rookie_or_second_year was removed here — it shipped a hardcoded
+    # False to every client because nothing ever wrote the column. See
+    # PlayerMetrics in backend/db/models.py.
 
     model_config = {"from_attributes": True}
 

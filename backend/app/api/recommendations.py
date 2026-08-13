@@ -181,7 +181,6 @@ def _metrics_dict(m) -> dict:
         "target_share_trend": m.target_share_trend,
         "snap_pct_trend": m.snap_pct_trend,
         "depth_chart_trend": m.depth_chart_trend,
-        "is_rookie_or_second_year": m.is_rookie_or_second_year,
     }
 
 

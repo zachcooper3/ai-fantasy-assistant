@@ -143,7 +143,11 @@ def format_metrics_prompt(player: Player, m: PlayerMetrics) -> str:
             f"{m.snap_pct_trend:+.1%}" if m.snap_pct_trend is not None else None
         )),
         _fmt("Depth chart trend (negative = moving up)", m.depth_chart_trend),
-        _fmt("Rookie or second-year", "Yes" if m.is_rookie_or_second_year else None),
+        # A "Rookie or second-year" line used to sit here, reading a column
+        # no ingestion script wrote — so it was False for all 185 rows and
+        # never rendered once. Rookies get their own grounding data via
+        # fetch_rookie_synthesis.py (draft capital + college production),
+        # which is a far better signal than a bare boolean anyway.
     ]))
     if forward:
         lines += ["Forward-Looking / Prospect Signals:"] + forward + [""]

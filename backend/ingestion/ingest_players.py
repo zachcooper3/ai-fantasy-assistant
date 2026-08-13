@@ -22,6 +22,19 @@ from backend.db.database import create_db_and_tables, engine
 from backend.db.models import Player
 
 
+# The only positions this app models. Everything downstream — the scarcity
+# thresholds in recommendations.py, the roster slots on DraftSession, the
+# frontend's position filter and badge colours — is written against exactly
+# this set, and a row outside it has no meaningful home in any of them.
+#
+# FantasyPros' full 600-row export includes the occasional defensive player
+# (confirmed on the 2026 export: Ben VanSumeren, LB, rank 574), presumably
+# because someone in an IDP league drafted him. He isn't draftable in this
+# app's format, and admitting him means an unknown position string flowing
+# into code that assumes one of these six.
+VALID_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DST"}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -100,13 +113,31 @@ def ingest_csv(csv_path: str) -> int:
         sys.exit(1)
 
     players: list[Player] = []
+    skipped_positions: list[str] = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                players.append(_row_to_player(row))
+                player = _row_to_player(row)
             except Exception as e:
                 print(f"[WARN] Skipping row {row}: {e}", file=sys.stderr)
+                continue
+            # Dropped rather than imported-and-ignored: an unmodelled
+            # position silently becomes a board entry that no scarcity
+            # calculation, roster slot or filter knows what to do with.
+            if player.position not in VALID_POSITIONS:
+                skipped_positions.append(f"{player.name} ({player.position})")
+                continue
+            players.append(player)
+
+    if skipped_positions:
+        print(
+            f"[INFO] Skipped {len(skipped_positions)} row(s) at a position this "
+            f"app doesn't model ({', '.join(sorted(VALID_POSITIONS))}): "
+            + ", ".join(skipped_positions[:10])
+            + (", ..." if len(skipped_positions) > 10 else ""),
+            file=sys.stderr,
+        )
 
     create_db_and_tables()
 

@@ -96,7 +96,9 @@ export interface PlayerMetrics {
   snap_pct_trend: number | null;
   /** Rank change over the last 3 weeks; NEGATIVE = moving up the chart. */
   depth_chart_trend: number | null;
-  is_rookie_or_second_year: boolean;
+  // is_rookie_or_second_year was removed from the API — the backend column
+  // behind it was never populated, so it was always false. Rookie context
+  // comes from DraftProfile instead.
 }
 
 /** Draft capital plus final-college-season production — see DraftProfile. */

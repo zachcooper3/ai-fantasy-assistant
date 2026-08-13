@@ -214,7 +214,20 @@ class PlayerMetrics(SQLModel, table=True):
     target_share_trend: Optional[float] = None    # last 3 wks minus season avg; + = rising role
     snap_pct_trend: Optional[float] = None        # same idea, snap share
     depth_chart_trend: Optional[int] = None       # rank change over last 3 wks; negative = moving up
-    is_rookie_or_second_year: bool = False
+
+    # NOTE: `is_rookie_or_second_year` was declared here and read in three
+    # places, but no ingestion script ever wrote it — 0 of 185 rows were ever
+    # populated, so every reader silently saw False for everyone, including a
+    # "Rookie or second-year: Yes" line in fetch_synthesis.py's prompt that
+    # could never fire. Experience now comes from DraftProfile.draft_year,
+    # which IS populated and has exactly one source of truth (see
+    # ai_service._format_metrics_section).
+    #
+    # Dropped from the model rather than backfilled, but NOT dropped from
+    # existing databases: migrations.py is additive-only on purpose (see its
+    # docstring), and an unmapped leftover column is inert — SQLAlchemy names
+    # the columns it selects, so it's simply never read. Fresh databases
+    # won't have it at all.
 
     # --- Metadata ---
     source: str = Field(default="nflreadpy")

@@ -209,7 +209,17 @@ def refresh_college_stats(sleeper_id: str | None = None) -> tuple[int, int]:
         return 0, 0
 
     with Session(engine) as session:
-        query = select(DraftProfile, Player).where(DraftProfile.player_id == Player.id)
+        # Joined on sleeper_id, not the player_id FK. player_id is reassigned
+        # wholesale on every ADP reingest (see metrics_repo.py's docstring for
+        # the Gibbs/Robinson incident), so a join on it can pair a draft
+        # profile with a different real player and write one prospect's
+        # college production onto another's row. This was the last module
+        # still using player_id for a cross-table join; everything else —
+        # fetch_synthesis, fetch_rookie_synthesis, both relink helpers —
+        # already keys off sleeper_id for exactly this reason.
+        query = select(DraftProfile, Player).where(
+            DraftProfile.sleeper_id == Player.sleeper_id
+        )
         if sleeper_id:
             query = query.where(DraftProfile.sleeper_id == sleeper_id)
         rows = session.exec(query).all()
@@ -272,7 +282,10 @@ def main() -> None:
 
     if args.dry_run:
         with Session(engine) as session:
-            query = select(DraftProfile, Player).where(DraftProfile.player_id == Player.id)
+            # Same sleeper_id join as refresh_college_stats — see its comment.
+            query = select(DraftProfile, Player).where(
+                DraftProfile.sleeper_id == Player.sleeper_id
+            )
             if args.sleeper_id:
                 query = query.where(DraftProfile.sleeper_id == args.sleeper_id)
             rows = session.exec(query).all()

@@ -31,10 +31,20 @@ off the Player table `adp` last wrote, whenever that was:
          │    draft ─┴→ college
          └→ news  ──────→ rookies   [Claude]
 
+    schedule (independent — keyed by team abbreviation, not player)
+
 `ids` is critical: if it fails the run stops, because everything else keys
 off the sleeper_id crosswalk it produces, and continuing would just write
 mismatched rows on top of a broken foundation. Everything else is
 best-effort and the run continues without it.
+
+`schedule` hangs off nothing and nothing hangs off it — Game is keyed by
+team abbreviation, which doesn't churn across refreshes the way player_id
+does (see models.py::Game). It's here because this module promises to
+refresh every data source the app draws on, and it was missing from that
+promise until 2026-08-13: the schedule rarely changes, so its absence was
+invisible rather than harmless. Cheap to include, and a re-run is a plain
+per-season delete-and-reinsert.
 
 Author: Zach Cooper
 """
@@ -84,6 +94,9 @@ _STEPS: list[Step] = [
          "Draft capital for the last two classes", critical=False, uses_claude=False),
     Step("college", "backend.ingestion.fetch_college_stats",
          "Final-college-season production (needs CFBD_API_KEY)",
+         critical=False, uses_claude=False),
+    Step("schedule", "backend.ingestion.fetch_schedule",
+         "This season's published NFL schedule (opponent by week)",
          critical=False, uses_claude=False),
     Step("news", "backend.ingestion.chunker",
          "Injury status + RotoWire news chunks", critical=False, uses_claude=False),

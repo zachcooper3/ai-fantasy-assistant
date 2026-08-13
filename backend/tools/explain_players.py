@@ -42,7 +42,6 @@ from backend.db.models import DraftProfile, Player, PlayerMetrics
 _KEY_METRIC_FIELDS = [
     "snap_pct", "target_share", "carry_share", "depth_chart_rank",
     "target_share_trend", "snap_pct_trend", "depth_chart_trend",
-    "is_rookie_or_second_year",
 ]
 
 

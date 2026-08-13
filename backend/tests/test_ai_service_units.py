@@ -607,9 +607,11 @@ def test_player_without_metrics_still_gets_the_full_draft_profile_fallback():
 
 
 def test_dead_rookie_flag_column_is_no_longer_read():
-    # is_rookie_or_second_year is written by no ingestion script (0/182 rows).
-    # Even if it were set, experience must come from draft_year alone so the
-    # fact has exactly one source of truth.
+    # is_rookie_or_second_year was written by no ingestion script (0/185
+    # rows) and has since been removed from the model entirely. Experience
+    # comes from draft_year alone so the fact has one source of truth. An
+    # unmapped leftover column survives in pre-existing databases, so a stray
+    # key must still not resurrect the tag.
     player = [{"id": 1, "name": "Someone", "position": "WR", "team": "TB",
                "adp": 50.0, "rank": 50, "sleeper_id": "q"}]
     m = {**_metrics(), "is_rookie_or_second_year": True}
