@@ -20,6 +20,11 @@ Author: Zach Cooper
 
 from sqlmodel import Session, select
 
+from backend.db.metrics_repo import (
+    MAX_ORPHAN_FRACTION,
+    MIN_ROWS_FOR_ORPHAN_GUARD,
+    RelinkAborted,
+)
 from backend.db.models import DraftProfile, Player
 
 
@@ -103,24 +108,47 @@ def relink_player_ids(session: Session) -> tuple[int, int]:
       relinked — rows whose player_id was updated to the current match
       orphaned — rows deleted because their sleeper_id no longer matches
                  any current Player (dropped out of the ADP pool entirely)
+
+    Raises metrics_repo.RelinkAborted, deleting nothing, when the Player
+    table's sleeper_id coverage looks broken rather than merely changed —
+    same guard, same reasoning, same threshold as metrics_repo (see that
+    docstring for the Sleeper-outage path that makes it reachable).
     """
-    sleeper_to_player_id = {
-        p.sleeper_id: p.id
-        for p in session.exec(select(Player)).all()
-        if p.sleeper_id
-    }
+    all_players = session.exec(select(Player)).all()
+    sleeper_to_player_id = {p.sleeper_id: p.id for p in all_players if p.sleeper_id}
+
+    rows = session.exec(select(DraftProfile)).all()
+    linkable = [dp for dp in rows if dp.sleeper_id]
+
+    if linkable and not sleeper_to_player_id:
+        raise RelinkAborted(
+            f"No Player row carries a sleeper_id ({len(all_players)} players "
+            f"checked), but {len(linkable)} DraftProfile row(s) do. That means "
+            "sync_sleeper_ids has not run (or failed) since the last reingest — "
+            "relinking now would orphan and delete every draft profile. Re-run "
+            "`py -m backend.ingestion.sync_sleeper_ids`, then this."
+        )
 
     to_delete: list[DraftProfile] = []
     to_update: list[tuple[DraftProfile, int]] = []
-    for profile in session.exec(select(DraftProfile)).all():
-        if not profile.sleeper_id:
-            continue
-
+    for profile in linkable:
         current_player_id = sleeper_to_player_id.get(profile.sleeper_id)
         if current_player_id is None:
             to_delete.append(profile)
         elif profile.player_id != current_player_id:
             to_update.append((profile, current_player_id))
+
+    if (
+        len(linkable) >= MIN_ROWS_FOR_ORPHAN_GUARD
+        and len(to_delete) / len(linkable) > MAX_ORPHAN_FRACTION
+    ):
+        raise RelinkAborted(
+            f"{len(to_delete)}/{len(linkable)} DraftProfile rows would be "
+            f"orphaned, above the {MAX_ORPHAN_FRACTION:.0%} ceiling. This looks "
+            "like a partial Sleeper player database rather than a real roster "
+            "change. Nothing was deleted; re-run sync_sleeper_ids and check its "
+            "matched/unmatched counts before retrying."
+        )
 
     for profile in to_delete:
         session.delete(profile)

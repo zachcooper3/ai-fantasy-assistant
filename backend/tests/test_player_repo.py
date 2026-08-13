@@ -13,7 +13,7 @@ so no caller (board, scarcity, handcuff) can forget to check it.
 """
 
 from backend.db import player_repo as repo
-from tests.conftest import make_player
+from backend.tests.conftest import make_player
 
 
 def _seed(db, *players):

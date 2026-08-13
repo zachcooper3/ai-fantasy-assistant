@@ -110,6 +110,28 @@ def get_metrics_bulk(session: Session, player_ids: list[int]) -> dict[int, Playe
     return {row.player_id: row for row in rows}
 
 
+class RelinkAborted(RuntimeError):
+    """Raised when the Player table's sleeper_id coverage looks too degraded
+    to safely treat a non-match as "this player left the pool." See
+    relink_player_ids' MAX_ORPHAN_FRACTION guard."""
+
+
+# Above this share of rows failing to find a current Player, relink refuses
+# to delete anything. A real ADP refresh churns the pool at the margins —
+# a handful of veterans fall out of the top 600, a handful of rookies come
+# in — so a few percent orphaned is normal and expected. Half the table
+# orphaning at once is not a roster change, it's a broken sleeper_id
+# crosswalk, and the correct response is to stop rather than to act on it.
+MAX_ORPHAN_FRACTION = 0.5
+
+# ...but a fraction computed over a handful of rows carries no information:
+# one orphan out of two is 50% and means nothing. Below this many linkable
+# rows the fraction guard is skipped entirely and only the "no sleeper_ids
+# at all" check applies. A real refresh has ~185 metrics rows and ~50 draft
+# profiles, so this only ever exempts fixtures and first-run states.
+MIN_ROWS_FOR_ORPHAN_GUARD = 10
+
+
 def relink_player_ids(session: Session) -> tuple[int, int]:
     """
     Repairs PlayerMetrics.player_id to match each row's durable sleeper_id,
@@ -128,24 +150,55 @@ def relink_player_ids(session: Session) -> tuple[int, int]:
     but possible from an old row predating this column, or an ad-hoc
     upsert_metrics call that didn't pass one) are left untouched — there's
     nothing durable to repair them against, so player_id is all they have.
+
+    Raises RelinkAborted, deleting nothing, if the Player table carries no
+    sleeper_ids at all or if more than MAX_ORPHAN_FRACTION of rows would be
+    orphaned in one pass. The orphan branch reads a missing sleeper_id as
+    "this player left the ADP pool," which is only a sound inference when
+    the crosswalk it's reading is intact. ingest_players.ingest_csv() wipes
+    sleeper_id on every row, and sync_sleeper_ids() repopulates it over the
+    network — so a Sleeper outage between those two steps leaves a Player
+    table where NOTHING matches, and an unguarded relink would read that as
+    "every player in the league retired" and delete the entire table.
+    fetch_adp.auto_refresh already logs a sync failure as a warning and
+    carries on, which is exactly the path that made this reachable.
     """
-    sleeper_to_player_id = {
-        p.sleeper_id: p.id
-        for p in session.exec(select(Player)).all()
-        if p.sleeper_id
-    }
+    all_players = session.exec(select(Player)).all()
+    sleeper_to_player_id = {p.sleeper_id: p.id for p in all_players if p.sleeper_id}
+
+    rows = session.exec(select(PlayerMetrics)).all()
+    linkable = [m for m in rows if m.sleeper_id]
+
+    if linkable and not sleeper_to_player_id:
+        raise RelinkAborted(
+            f"No Player row carries a sleeper_id ({len(all_players)} players "
+            f"checked), but {len(linkable)} PlayerMetrics row(s) do. That means "
+            "sync_sleeper_ids has not run (or failed) since the last reingest — "
+            "relinking now would orphan and delete every metrics row. Re-run "
+            "`py -m backend.ingestion.sync_sleeper_ids`, then this."
+        )
 
     to_delete: list[PlayerMetrics] = []
     to_update: list[tuple[PlayerMetrics, int]] = []
-    for metrics in session.exec(select(PlayerMetrics)).all():
-        if not metrics.sleeper_id:
-            continue
-
+    for metrics in linkable:
         current_player_id = sleeper_to_player_id.get(metrics.sleeper_id)
         if current_player_id is None:
             to_delete.append(metrics)
         elif metrics.player_id != current_player_id:
             to_update.append((metrics, current_player_id))
+
+    if (
+        len(linkable) >= MIN_ROWS_FOR_ORPHAN_GUARD
+        and len(to_delete) / len(linkable) > MAX_ORPHAN_FRACTION
+    ):
+        raise RelinkAborted(
+            f"{len(to_delete)}/{len(linkable)} PlayerMetrics rows would be "
+            f"orphaned, above the {MAX_ORPHAN_FRACTION:.0%} ceiling. A normal "
+            "ADP refresh churns the pool at the margins, not wholesale — this "
+            "looks like a partial Sleeper player database rather than a real "
+            "roster change. Nothing was deleted; re-run sync_sleeper_ids and "
+            "check its matched/unmatched counts before retrying."
+        )
 
     for metrics in to_delete:
         session.delete(metrics)

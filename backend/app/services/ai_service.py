@@ -2028,6 +2028,56 @@ def _format_run_risk(
 _MAX_CONTEXT_PLAYERS = _LISTED_PLAYERS
 _MAX_CHUNKS_PER_PLAYER = 3
 
+# When a player has more chunks than the cap, which ones survive. Chroma's
+# `get` returns rows in an order derived from the md5 of each chunk's ID —
+# arbitrary, but stable, so an unlucky player could have his synthesized
+# scouting note silently outranked by two RotoWire headlines on every single
+# pick of a draft, with nothing in the logs to say so.
+#
+# Order of preference:
+#   1. injury status — a player who cannot play is a hard exclusion, and
+#      RULE 0 reads it out of exactly this section. Never droppable.
+#   2. synthesis — the one piece of actual analysis about the player, and
+#      the most expensive to produce (a Claude call each).
+#   3. news — genuinely useful, but the most numerous and the most
+#      redundant, so it's what should give way at the margin.
+_CHUNK_SOURCE_PRIORITY = {
+    "sleeper_injury_status": 0,
+    "claude_synthesis": 1,
+    "claude_synthesis_rookie": 1,
+    "rotowire_rss": 2,
+}
+_UNKNOWN_SOURCE_PRIORITY = 3
+
+
+def _rank_chunks(entries: list[tuple[dict, str]]) -> list[str]:
+    """Orders one player's retrieved chunks best-first, for the
+    _MAX_CHUNKS_PER_PLAYER cut.
+
+    Two stable passes rather than one composite key, because the two
+    criteria sort in opposite directions and a tuple key can only express
+    one: newest-first within a tier, lowest-tier-first overall.
+
+    "Newest" reads `generated_at` (synthesis, ISO-8601) or `pub_date`
+    (RotoWire, RFC-822). Only the former sorts correctly as a string;
+    RFC-822 does not. That's tolerated deliberately — the tier already
+    decides everything that matters, so this tie-break just has to be
+    deterministic, which beats the md5 ordering it replaces either way.
+    Chunks with neither field sort last within their tier.
+    """
+    by_recency = sorted(
+        entries,
+        key=lambda e: str((e[0] or {}).get("generated_at") or (e[0] or {}).get("pub_date") or ""),
+        reverse=True,
+    )
+    ranked = sorted(
+        by_recency,
+        key=lambda e: _CHUNK_SOURCE_PRIORITY.get(
+            (e[0] or {}).get("source"), _UNKNOWN_SOURCE_PRIORITY
+        ),
+    )
+    return [doc for _, doc in ranked]
+
 # Chroma content is only ever updated by the offline ingestion scripts
 # (chunker.py / fetch_synthesis.py), never by anything a live draft session
 # does — so it's safe to cache a player's retrieved chunks for the lifetime
@@ -2104,11 +2154,11 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
             rows = None
 
         if rows is not None:
-            grouped: dict[str, list[str]] = {}
+            grouped: dict[str, list[tuple[dict, str]]] = {}
             for meta, doc in rows:
                 sid = str((meta or {}).get("sleeper_id") or "")
                 if sid and doc:
-                    grouped.setdefault(sid, []).append(doc)
+                    grouped.setdefault(sid, []).append((meta or {}, doc))
             # Cache every player asked for, including the ones with nothing:
             # a genuine negative is worth remembering, and without it an
             # empty player is re-fetched on every pick for the whole draft.
@@ -2120,8 +2170,13 @@ def _retrieve_player_context(top_available: list[dict]) -> str:
             # retrieval for an entire draft. RULE 0 reads IR status out of
             # that retrieval, so the cost of the shortcut is a player on
             # injured reserve looking exactly like a healthy one.
+            #
+            # Rank before truncating — see _rank_chunks. Slicing Chroma's
+            # own `get` order was dropping whichever chunks happened to hash
+            # late, with no regard for whether the thing being dropped was a
+            # stale headline or the player's injury status.
             for sid in wanted:
-                _retrieval_cache[sid] = grouped.get(sid, [])[:_MAX_CHUNKS_PER_PLAYER]
+                _retrieval_cache[sid] = _rank_chunks(grouped.get(sid, []))[:_MAX_CHUNKS_PER_PLAYER]
 
     outcomes = [(p, _retrieval_cache.get(str(p["sleeper_id"]), [])) for p in candidates]
 

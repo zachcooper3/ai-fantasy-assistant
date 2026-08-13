@@ -18,7 +18,7 @@ from sqlmodel import Session
 
 from backend.db import player_repo as repo
 from backend.db.models import Player
-from tests.conftest import make_player
+from backend.tests.conftest import make_player
 
 
 @pytest.fixture

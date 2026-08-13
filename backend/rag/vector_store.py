@@ -139,6 +139,50 @@ def add_chunks(chunks: list[str], metadatas: list[dict] | None = None) -> None:
         kwargs["metadatas"] = [v[1] for v in by_id.values()]
     get_collection().upsert(**kwargs)
 
+def prune_source(source: str, keep_dedupe_keys: set[str]) -> int:
+    """
+    Deletes every chunk from `source` whose dedupe_key isn't in
+    `keep_dedupe_keys`. Returns how many were removed.
+
+    Exists because add_chunks() can only ever express "this fact is true
+    now" — it has no way to say "this fact STOPPED being true." For an
+    event-log source (RotoWire) that's fine, since a past event stays true
+    forever. For a SNAPSHOT source it's a correctness hole: chunker.py only
+    emits a chunk for players who currently carry an injury designation, so
+    when a player is cleared, nothing overwrites his old chunk and it sits
+    here permanently. Confirmed live 2026-08-13: 55 players on the board had
+    a chunk asserting an injury Sleeper no longer reported — Bucky Irving,
+    Dak Prescott and Ladd McConkey among them — and no number of refresh
+    runs could have cleared them, because the fix is structurally a delete,
+    not an upsert.
+
+    Caller passes the dedupe_keys of the batch it just wrote. Note the
+    asymmetry with reset_collection(): that one is a blunt "throw away
+    everything and rebuild" for schema changes, this is the routine
+    per-refresh reconciliation of one source.
+
+    CALLERS MUST NOT invoke this after a failed or partial fetch. An empty
+    keep-set is a legitimate instruction to delete every chunk from the
+    source, and is indistinguishable here from "the upstream API timed out."
+    chunker.build_what_happened_chunks reports which sources are safe to
+    prune for exactly this reason.
+    """
+    collection = get_collection()
+    existing = collection.get(where={"source": source}, include=["metadatas"])
+    ids = existing.get("ids") or []
+    metas = existing.get("metadatas") or []
+
+    keep_ids = {_chunk_id("", {"dedupe_key": k}) for k in keep_dedupe_keys}
+    stale = [
+        cid for cid, meta in zip(ids, metas)
+        if cid not in keep_ids and (meta or {}).get("dedupe_key") not in keep_dedupe_keys
+    ]
+    if stale:
+        collection.delete(ids=stale)
+        logger.info(f"Pruned {len(stale)} stale chunk(s) from source '{source}'.")
+    return len(stale)
+
+
 def fetch_by_metadata(where: dict) -> list[tuple[dict, str]]:
     """
     Returns [(metadata, document)] for every chunk matching a metadata
@@ -183,7 +227,7 @@ def query(question: str, n_results: int = 5, where: dict | None = None) -> list[
 def main():
     import argparse
 
-    from backend.ingestion.chunker import build_what_happened_chunks
+    from backend.ingestion.chunker import build_what_happened_chunks, prune_stale_snapshots
 
     parser = argparse.ArgumentParser(
         description="Ingest 'what happened' chunks and interactively query the ChromaDB collection."
@@ -200,9 +244,12 @@ def main():
         reset_collection()
         print("Collection reset.")
 
-    chunks, metadatas = build_what_happened_chunks()
+    chunks, metadatas, prunable = build_what_happened_chunks()
     add_chunks(chunks, metadatas)
+    removed = prune_stale_snapshots(metadatas, prunable)
     print(f"Added {len(chunks)} chunks to the collection")
+    if removed:
+        print(f"Removed {removed} stale snapshot chunk(s) whose condition no longer applies.")
     print(
         "\nNote: this collection holds factual 'what happened' snippets (and, once "
         "you've run fetch_synthesis.py, short 'what it means' notes) — not player "

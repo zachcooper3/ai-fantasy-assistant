@@ -18,7 +18,7 @@ import pytest
 from sqlmodel import Session
 
 from backend.db.models import DraftProfile, Game, PlayerMetrics
-from tests.conftest import make_player
+from backend.tests.conftest import make_player
 
 
 @pytest.fixture

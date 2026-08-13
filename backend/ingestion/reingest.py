@@ -46,19 +46,43 @@ async def reingest(csv_path: str = _DEFAULT_CSV) -> None:
     matched, unmatched = await sync_sleeper_ids()
     print(f"Done. {matched} matched, {unmatched} unmatched.")
 
-    print("Relinking PlayerMetrics to the reassigned Player IDs ...")
-    from backend.db import metrics_repo
+    # A sync that returns but matches almost nobody is the dangerous case:
+    # it doesn't raise, so the relinks below would run against a crosswalk
+    # that's mostly empty and read the gap as "these players left the pool."
+    # The repos' own MAX_ORPHAN_FRACTION guard is the real backstop (it
+    # refuses to delete and raises RelinkAborted), but say so up front too —
+    # the number is right here and worth seeing before the relink output.
+    if matched == 0:
+        print(
+            "\n!! Sleeper matched 0 players. Not relinking — every metrics and "
+            "draft-profile row would look orphaned. Check Sleeper's API, then "
+            "re-run this command.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    from backend.db import draft_profile_repo, metrics_repo
     from backend.db.database import engine
+    from backend.db.metrics_repo import RelinkAborted
     from sqlmodel import Session
-    with Session(engine) as session:
-        relinked, orphaned = metrics_repo.relink_player_ids(session)
-    print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+
+    print("Relinking PlayerMetrics to the reassigned Player IDs ...")
+    try:
+        with Session(engine) as session:
+            relinked, orphaned = metrics_repo.relink_player_ids(session)
+        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+    except RelinkAborted as e:
+        print(f"\n!! PlayerMetrics relink aborted, nothing deleted: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
     print("Relinking DraftProfile to the reassigned Player IDs ...")
-    from backend.db import draft_profile_repo
-    with Session(engine) as session:
-        relinked, orphaned = draft_profile_repo.relink_player_ids(session)
-    print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+    try:
+        with Session(engine) as session:
+            relinked, orphaned = draft_profile_repo.relink_player_ids(session)
+        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+    except RelinkAborted as e:
+        print(f"\n!! DraftProfile relink aborted, nothing deleted: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def main() -> None:

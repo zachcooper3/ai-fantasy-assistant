@@ -259,9 +259,11 @@ async def auto_refresh(year: int = CURRENT_YEAR, teams: int = 12) -> None:
         # table, which wipes sleeper_id on every row. Re-sync immediately so
         # live Sleeper draft sync doesn't silently degrade to name-matching
         # until someone remembers to run this by hand.
+        synced = False
         try:
             from backend.ingestion.sync_sleeper_ids import sync_sleeper_ids
             matched, unmatched = await sync_sleeper_ids()
+            synced = True
             print(f"Sleeper ID sync complete: {matched} matched, {unmatched} unmatched.")
         except Exception as e:
             print(
@@ -270,6 +272,23 @@ async def auto_refresh(year: int = CURRENT_YEAR, teams: int = 12) -> None:
                 "fall back to name-matching until this is re-run.",
                 file=sys.stderr,
             )
+
+        # Both relinks below read Player.sleeper_id to decide which rows
+        # still have a valid owner and which to delete as orphans. The sync
+        # that populates that column just failed, so every row would look
+        # orphaned and both tables would be wiped. The repos raise
+        # RelinkAborted on exactly this, but don't even ask — a skipped
+        # relink leaves stale-but-recoverable FKs, which is strictly better
+        # than an empty table.
+        if not synced:
+            print(
+                "[WARN] Skipping the PlayerMetrics/DraftProfile relinks — they key "
+                "off the sleeper_id crosswalk the failed sync above was meant to "
+                "rebuild. Run `py -m backend.ingestion.reingest` once Sleeper is "
+                "reachable; until then metrics may be attributed to the wrong player.",
+                file=sys.stderr,
+            )
+            return
 
         # The same reingest above also reassigns every Player.id (delete +
         # reinsert), which silently invalidates PlayerMetrics.player_id —
@@ -374,19 +393,38 @@ def main() -> None:
         matched, unmatched = asyncio.run(sync_sleeper_ids())
         print(f"Done. {matched} matched, {unmatched} unmatched.")
 
-        print("Relinking PlayerMetrics to the reassigned Player IDs ...")
-        from backend.db import metrics_repo
-        from backend.db.database import engine
-        from sqlmodel import Session
-        with Session(engine) as session:
-            relinked, orphaned = metrics_repo.relink_player_ids(session)
-        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+        # Both relinks read Player.sleeper_id to decide which rows still
+        # have an owner. A sync that matched nobody makes every row look
+        # orphaned; the repos refuse to act on that (RelinkAborted), but
+        # stopping here gives a clearer message than letting them.
+        if matched == 0:
+            print(
+                "\nSleeper matched 0 players — not relinking, since every "
+                "PlayerMetrics and DraftProfile row would look orphaned. "
+                "Check Sleeper's API, then re-run "
+                "`py -m backend.ingestion.reingest`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-        print("Relinking DraftProfile to the reassigned Player IDs ...")
-        from backend.db import draft_profile_repo
-        with Session(engine) as session:
-            relinked, orphaned = draft_profile_repo.relink_player_ids(session)
-        print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+        from backend.db import draft_profile_repo, metrics_repo
+        from backend.db.database import engine
+        from backend.db.metrics_repo import RelinkAborted
+        from sqlmodel import Session
+
+        try:
+            print("Relinking PlayerMetrics to the reassigned Player IDs ...")
+            with Session(engine) as session:
+                relinked, orphaned = metrics_repo.relink_player_ids(session)
+            print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+
+            print("Relinking DraftProfile to the reassigned Player IDs ...")
+            with Session(engine) as session:
+                relinked, orphaned = draft_profile_repo.relink_player_ids(session)
+            print(f"Done. {relinked} relinked, {orphaned} orphaned.")
+        except RelinkAborted as e:
+            print(f"\nRelink aborted, nothing deleted: {e}", file=sys.stderr)
+            sys.exit(1)
 
     except httpx.HTTPStatusError as e:
         print(f"\nHTTP error: {e.response.status_code} {e.request.url}", file=sys.stderr)

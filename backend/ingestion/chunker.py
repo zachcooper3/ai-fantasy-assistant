@@ -192,16 +192,36 @@ def chunk_sleeper_injuries(sleeper_players: dict[str, dict]) -> tuple[list[str],
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def build_what_happened_chunks() -> tuple[list[str], list[dict]]:
+# Sources whose chunks are a SNAPSHOT of current state rather than a log of
+# past events, and therefore have to be reconciled by deletion as well as by
+# upsert on every refresh. An injury designation that disappears from
+# Sleeper's payload means the player was cleared — the absence IS the update,
+# and add_chunks alone can't express it (see vector_store.prune_source).
+#
+# RotoWire is deliberately NOT in here: a news item is a past event, still
+# true after the fact, and the feed only carries a rolling ~40 items, so
+# pruning to the current feed would delete every story older than a few days.
+_SNAPSHOT_SOURCES = {"sleeper_injury_status"}
+
+
+def build_what_happened_chunks() -> tuple[list[str], list[dict], set[str]]:
     """
-    Pulls both sources and returns combined (chunks, metadatas) ready for
-    backend/rag/vector_store.add_chunks(). Each source is isolated — a
-    RotoWire outage shouldn't prevent Sleeper injury chunks (or vice versa)
-    from still being ingested, same "one flaky source shouldn't take down
-    the whole refresh" principle as fetch_metrics.py.
+    Pulls both sources and returns (chunks, metadatas, prunable_sources)
+    ready for backend/rag/vector_store.add_chunks(). Each source is isolated
+    — a RotoWire outage shouldn't prevent Sleeper injury chunks (or vice
+    versa) from still being ingested, same "one flaky source shouldn't take
+    down the whole refresh" principle as fetch_metrics.py.
+
+    `prunable_sources` names the snapshot sources (see _SNAPSHOT_SOURCES)
+    that fetched cleanly this run, so the caller knows whose stale chunks
+    are safe to delete. A source that raised is absent from the set, and
+    must NOT be pruned: an empty chunk list from a timed-out API is
+    indistinguishable from "nobody is injured any more," and acting on the
+    second reading would wipe every real injury chunk in the store.
     """
     all_chunks: list[str] = []
     all_metadatas: list[dict] = []
+    prunable: set[str] = set()
 
     try:
         news_items = fetch_rotowire_news()
@@ -225,11 +245,33 @@ def build_what_happened_chunks() -> tuple[list[str], list[dict]]:
         injury_chunks, injury_meta = chunk_sleeper_injuries(sleeper_players)
         all_chunks += injury_chunks
         all_metadatas += injury_meta
+        prunable.add("sleeper_injury_status")
         logger.info(f"Sleeper: {len(injury_chunks)} injury-status chunks")
     except Exception as e:
         logger.warning(f"Could not fetch Sleeper player data — injury chunks skipped: {e}")
 
-    return all_chunks, all_metadatas
+    return all_chunks, all_metadatas, prunable
+
+
+def prune_stale_snapshots(metadatas: list[dict], prunable_sources: set[str]) -> int:
+    """
+    Deletes snapshot chunks that this run did NOT re-emit — i.e. the players
+    whose injury designation has since cleared. Returns the number removed.
+
+    Only touches sources named in `prunable_sources` (see
+    build_what_happened_chunks), so a failed upstream fetch can never be
+    mistaken for "this condition no longer applies to anyone."
+    """
+    from backend.rag.vector_store import prune_source
+
+    removed = 0
+    for source in _SNAPSHOT_SOURCES & prunable_sources:
+        keep = {
+            m["dedupe_key"] for m in metadatas
+            if m.get("source") == source and m.get("dedupe_key")
+        }
+        removed += prune_source(source, keep)
+    return removed
 
 
 def main() -> None:
@@ -237,9 +279,16 @@ def main() -> None:
 
     from backend.rag.vector_store import add_chunks
 
-    chunks, metadatas = build_what_happened_chunks()
+    chunks, metadatas, prunable = build_what_happened_chunks()
     add_chunks(chunks, metadatas)
+    # Order matters: write first, then prune. Doing it the other way round
+    # leaves a window where a player who is still injured has no chunk at
+    # all, and a crash in between would make a healthy-looking board out of
+    # an injured one.
+    removed = prune_stale_snapshots(metadatas, prunable)
     print(f"Added {len(chunks)} 'what happened' chunks to the collection.")
+    if removed:
+        print(f"Removed {removed} stale chunk(s) for players whose status has since cleared.")
 
 
 if __name__ == "__main__":

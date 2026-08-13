@@ -485,36 +485,51 @@ def _compute_forward_looking(
     return result
 
 
-def _compute_red_zone_touches(pbp_rows: list[dict]) -> dict[str, float]:
+def _compute_red_zone_touches(pbp_rows: list[dict]) -> dict[str, int]:
     """
-    Red zone touches per game, keyed by gsis_id. Requires play-by-play data
-    (the one heavy pull in this module — see --no-redzone to skip it).
-    Standard definition: yardline_100 <= 20 (i.e. inside the opponent's
-    20-yard line).
+    Total red zone touches for the season, keyed by gsis_id. Requires
+    play-by-play data (the one heavy pull in this module — see --no-redzone
+    to skip it). Standard definition: yardline_100 <= 20 (i.e. inside the
+    opponent's 20-yard line).
+
+    Returns raw COUNTS, not a per-game rate. The caller divides by the
+    player's games played from player_stats (see refresh_metrics) because
+    that is the only denominator available here that means what the field
+    name claims.
+
+    This used to divide by len({game_id for games in which this player had a
+    red zone touch}), which is a different and much smaller number: a back
+    with four red zone touches in one game and none in his other sixteen
+    scored 4.0 "per game," identical to a genuine every-week goal-line back.
+    Confirmed live on the 2025 data — Jaydon Blue (5 games, 4.1 PPR ppg),
+    RJ Harvey and Kimani Vidal all landed on exactly 4.00, tied with Josh
+    Jacobs and Jahmyr Gibbs, and Tank Bigsby showed 2.71 red zone touches a
+    game on 3.6 PPR points, which is arithmetically impossible. The bug
+    inflated precisely the low-usage players, and red zone volume is the
+    signal the recommendation prompt leans on hardest for upside reasoning,
+    so it was manufacturing fake breakout candidates.
     """
-    touches_by_player: dict[str, list[int]] = defaultdict(list)
-    games_by_player: dict[str, set] = defaultdict(set)
+    touches_by_player: dict[str, int] = defaultdict(int)
 
     for play in pbp_rows:
         yardline = _first(play, "yardline_100")
-        if yardline is None or float(yardline) > 20:
+        if yardline is None:
+            continue
+        try:
+            if float(yardline) > 20:
+                continue
+        except (TypeError, ValueError):
             continue
 
-        game_id = _first(play, "game_id")
         rusher = _first(play, "rusher_player_id", "rusher_id")
         receiver = _first(play, "receiver_player_id", "receiver_id")
 
         if rusher:
-            touches_by_player[str(rusher)].append(1)
-            games_by_player[str(rusher)].add(game_id)
+            touches_by_player[str(rusher)] += 1
         if receiver and _first(play, "pass_attempt"):
-            touches_by_player[str(receiver)].append(1)
-            games_by_player[str(receiver)].add(game_id)
+            touches_by_player[str(receiver)] += 1
 
-    return {
-        pid: len(touches) / max(len(games_by_player[pid]), 1)
-        for pid, touches in touches_by_player.items()
-    }
+    return dict(touches_by_player)
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +556,13 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
     snaps_by_player: dict[str, list[dict]] = {}
     injuries_by_player: dict[str, list[dict]] = {}
     depth_by_player: dict[str, list[dict]] = {}
-    redzone_by_player: dict[str, float] = {}
+    redzone_by_player: dict[str, int] = {}
+    # Distinguishes "play-by-play loaded and this player had zero red zone
+    # touches" (a real 0.0) from "we never got play-by-play at all" (None,
+    # meaning unknown). Without this flag a skipped/failed pbp pull would
+    # write 0.0 for every player, which reads as a confident "no red zone
+    # role" in the prompt rather than as a coverage gap.
+    redzone_available = False
     team_pass_rate: dict[str, float] = {}
     team_totals: dict[tuple[str, int], dict[str, float]] = {}
 
@@ -614,6 +635,7 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
             pbp_rows = _load_dicts("load_pbp", seasons=season)
             pbp_rows = _filter_regular_season(pbp_rows)
             redzone_by_player = _compute_red_zone_touches(pbp_rows)
+            redzone_available = True
             logger.info(f"Red zone touches computed for {len(redzone_by_player):,} players")
         except Exception as e:
             logger.warning(f"Could not load play-by-play — red_zone_touches_per_game will be unavailable: {e}")
@@ -659,8 +681,14 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                 pcts = [_num(w, "offense_pct", "snap_pct") for w in snap_weeks]
                 fields["snap_pct"] = sum(pcts) / len(pcts) if pcts else None
 
-            if gsis_id in redzone_by_player:
-                fields["red_zone_touches_per_game"] = redzone_by_player[gsis_id]
+            # Divide the season's raw touch count by games played — the same
+            # denominator every other per-game field in this row uses. Only
+            # written when play-by-play actually loaded; see
+            # `redzone_available` above for why a 0.0 has to be earned.
+            if redzone_available and weeks:
+                fields["red_zone_touches_per_game"] = (
+                    redzone_by_player.get(gsis_id, 0) / len(weeks)
+                )
 
             if player.team in team_pass_rate:
                 fields["team_pass_rate"] = team_pass_rate[player.team]
