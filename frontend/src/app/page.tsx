@@ -20,6 +20,7 @@ import { LayoutGrid, Users, Lightbulb, RotateCcw, RefreshCw } from "lucide-react
 import { useDraft } from "@/hooks/useDraft";
 import { useBoardResize, HANDLE_WIDTH } from "@/hooks/useBoardResize";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
+import { draftedCountsByPosition } from "@/lib/draft";
 import SetupModal from "@/components/SetupModal";
 import ShortcutsOverlay from "@/components/ShortcutsOverlay";
 import PlayerDetailDrawer from "@/components/PlayerDetailDrawer";
@@ -145,6 +146,15 @@ export default function DraftPage() {
     [board]
   );
 
+  // Drafted-so-far per position, which the Big Board adds to the live
+  // available count to get its denominator — see draftedCountsByPosition
+  // for why that's derived rather than captured on load.
+  // Declared before the early return below: hooks can't run conditionally.
+  const draftedByPosition = useMemo(
+    () => (session ? draftedCountsByPosition(session) : null),
+    [session]
+  );
+
   // Nothing is known about the session until the first GET settles. Rendering
   // the setup modal here would put its draft-clearing Start button under the
   // cursor while a draft in progress was still loading — see useDraft's
@@ -266,7 +276,7 @@ export default function DraftPage() {
               recommendedId={recommendedId}
               onPick={recordPick}
               isSyncing={isSyncing}
-              sessionKey={session.started_at ?? ""}
+              drafted={draftedByPosition}
               draftComplete={draftComplete}
               collapsed={boardCollapsed}
               onToggleCollapse={toggleBoardCollapse}
@@ -321,7 +331,7 @@ export default function DraftPage() {
             recommendedId={recommendedId}
             onPick={recordPick}
             isSyncing={isSyncing}
-            sessionKey={session.started_at ?? ""}
+            drafted={draftedByPosition}
             draftComplete={draftComplete}
             onShowDetail={setDetailPlayerId}
           />

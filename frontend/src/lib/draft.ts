@@ -107,6 +107,37 @@ export function adpValue(adp: number, pickNumber: number, neutralBand = 3): AdpV
   return { delta, label, text: `${sign}${delta} vs pick ${pickNumber}`, word };
 }
 
+/**
+ * How many players have been drafted at each position so far, plus an
+ * `All` total.
+ *
+ * Exists to give the Big Board's counter a denominator that is a property
+ * of the DRAFT rather than of the browser tab. The denominator used to be
+ * captured from the first board response — "the pool as it looked when this
+ * page loaded" — which is only the starting pool if you never reload. Open
+ * the app mid-draft, or after it finishes, and it captured the *current*
+ * count, so the counter collapsed to "414 / 414" and claimed nothing had
+ * been drafted. Adding this to the live available count reconstructs the
+ * original pool from data that's on every session payload, so a reload
+ * can't change it.
+ *
+ * KNOWN OVERCOUNT: available counts exclude IR/PUP/Suspended/Out players
+ * (see the board route), but the pick journal doesn't record whether a
+ * drafted player was one of them — PickResponse carries no injury_status.
+ * So drafting an IR stash inflates that position's denominator by one, for
+ * the rest of the draft. It's bounded by the handful of such players who
+ * ever get taken, and it only ever moves the total, never the "available"
+ * figure people actually read.
+ */
+export function draftedCountsByPosition(session: DraftState): Record<string, number> {
+  const counts: Record<string, number> = { All: 0 };
+  for (const pick of session.picks) {
+    counts[pick.position] = (counts[pick.position] ?? 0) + 1;
+    counts.All += 1;
+  }
+  return counts;
+}
+
 export function rosterSlots(session: DraftState): string[] {
   const starters: string[] = [
     ...Array<string>(session.qb_slots).fill("QB"),

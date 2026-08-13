@@ -9,7 +9,13 @@
 import { describe, expect, it } from "vitest";
 
 import { DraftState } from "@/lib/api";
-import { adpValue, rosterSlots, slotForPick, slotsBeforeMyNextPick } from "@/lib/draft";
+import {
+  adpValue,
+  draftedCountsByPosition,
+  rosterSlots,
+  slotForPick,
+  slotsBeforeMyNextPick,
+} from "@/lib/draft";
 
 // ---------------------------------------------------------------------------
 // adpValue
@@ -182,5 +188,61 @@ describe("rosterSlots", () => {
     const slots = rosterSlots(state({ total_rounds: 2 }));
     expect(slots.filter((s) => s === "BN")).toHaveLength(0);
     expect(slots.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// draftedCountsByPosition
+// ---------------------------------------------------------------------------
+
+/** A pick journal entry — only `position` matters to this function. */
+function pick(n: number, position: string) {
+  return {
+    pick_number: n,
+    round_number: Math.ceil(n / 12),
+    team_slot: ((n - 1) % 12) + 1,
+    player_id: n,
+    player_name: `Player ${n}`,
+    position,
+    nfl_team: "DET",
+    is_mine: false,
+  };
+}
+
+describe("draftedCountsByPosition", () => {
+  it("counts per position and keeps a running total", () => {
+    const counts = draftedCountsByPosition(
+      state({ picks: [pick(1, "RB"), pick(2, "RB"), pick(3, "WR"), pick(4, "QB")] })
+    );
+    expect(counts).toEqual({ All: 4, RB: 2, WR: 1, QB: 1 });
+  });
+
+  it("is all-zero before anything is drafted", () => {
+    // Only `All`. A position with no picks is absent, and callers read it
+    // with `?? 0` — there's no list of positions to enumerate here.
+    expect(draftedCountsByPosition(state())).toEqual({ All: 0 });
+  });
+
+  it("counts every team's picks, not just yours", () => {
+    // The denominator is the size of the whole player pool, so it has to
+    // account for players other teams took. Reading my_roster instead would
+    // undercount by a factor of league_size.
+    const counts = draftedCountsByPosition(
+      state({ picks: [pick(1, "RB"), { ...pick(2, "RB"), is_mine: true }] })
+    );
+    expect(counts.RB).toBe(2);
+  });
+
+  it("gives a denominator that survives a reload", () => {
+    // The whole point. available + drafted reconstructs the starting pool
+    // from the session payload, so it reads the same on a fresh page load
+    // as it does mid-session — unlike a value captured on first render,
+    // which recorded whatever was left at the moment the tab opened and
+    // made the counter claim nothing had been drafted.
+    const available = 414;
+    const counts = draftedCountsByPosition(
+      state({ picks: Array.from({ length: 180 }, (_, i) => pick(i + 1, "RB")) })
+    );
+    expect(available + counts.All).toBe(594);
   });
 });

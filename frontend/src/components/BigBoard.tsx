@@ -22,6 +22,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
  * aren't startable supply, which is why a row can exist without being
  * counted.
  *
+ * The denominator is reconstructed as available + already drafted, NOT
+ * captured on first load. Capturing it meant recording the pool as it
+ * looked when the tab opened, so any reload mid-draft reset it to the
+ * current count and the counter read "N / N" — claiming nothing had been
+ * drafted. See draftedCountsByPosition for the one caveat.
+ *
  * Keyboard (the canonical list users see is the ? overlay — see
  * ShortcutsOverlay; keep the two in step):
  *   /        focus search        ↑ ↓   move selection
@@ -88,12 +94,11 @@ interface Props {
    */
   draftComplete?: boolean;
   /**
-   * Changes when a new draft session starts. Resets the fixed "total players"
-   * denominators, which are captured once on first load — without this they
-   * survived a reset-to-new-session and showed stale counts until a full page
-   * reload.
+   * Players drafted so far per position, plus `All` — see
+   * draftedCountsByPosition. Added to the live available count to give the
+   * counter its denominator. Null before the session loads.
    */
-  sessionKey?: string;
+  drafted: Record<string, number> | null;
   /**
    * Collapsed to a thin rail so the AI panel can take the freed grid column
    * (the "focus mode" toggle). The component stays mounted rather than being
@@ -118,7 +123,7 @@ export default function BigBoard({
   onPick,
   isSyncing = false,
   draftComplete = false,
-  sessionKey = "",
+  drafted,
   collapsed = false,
   onToggleCollapse,
   onShowDetail,
@@ -146,24 +151,6 @@ export default function BigBoard({
     return counts;
   }, [scarcity]);
 
-  // Denominators, captured from the first non-empty scarcity payload —
-  // i.e. the size of the pool before anything was drafted. Held in a ref
-  // rather than state: this is write-once-per-session bookkeeping, and
-  // making it state would re-render the whole table when it settles.
-  const initialTotals = useRef<Record<string, number> | null>(null);
-
-  // Clear the captured totals when the session changes so the next load
-  // recaptures them for the new draft.
-  useEffect(() => {
-    initialTotals.current = null;
-  }, [sessionKey]);
-
-  useEffect(() => {
-    if (availableByFilter && availableByFilter.All > 0 && initialTotals.current === null) {
-      initialTotals.current = availableByFilter;
-    }
-  }, [availableByFilter]);
-
   // Reset paging and selection when the view changes underneath them.
   useEffect(() => {
     setDisplayLimit(INITIAL_LIMIT);
@@ -180,11 +167,14 @@ export default function BigBoard({
     [players, posFilter, search]
   );
 
-  // Numerator and denominator for the header counter. Both null until the
-  // first board response lands — the counter is hidden rather than showing
-  // a placeholder that looks like a real number.
+  // Numerator and denominator for the header counter. Null until the first
+  // board response lands — the counter is hidden rather than showing a
+  // placeholder that looks like a real number. Nothing is captured or
+  // reset: both figures are derived fresh every render, so a mid-draft
+  // reload reads exactly the same as an uninterrupted session.
   const availableCount = availableByFilter?.[posFilter] ?? null;
-  const totalCount = initialTotals.current?.[posFilter] ?? availableCount;
+  const totalCount =
+    availableCount === null ? null : availableCount + (drafted?.[posFilter] ?? 0);
 
   // Paginate every view, not just unfiltered "All". Filtering to WR used to
   // render the entire filtered set — 100+ rows — in one go.
@@ -368,12 +358,15 @@ export default function BigBoard({
               Big Board
             </h2>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {/* Explains the missing Draft column — without this the controls
                 just silently vanish, which reads as a bug. */}
             {draftComplete && (
-              <span className="px-2 py-0.5 rounded-full bg-slate-800 border border-slate-600 text-xs font-medium text-slate-300">
-                Draft complete — review only
+              <span
+                title="The draft is over — the board is read-only."
+                className="shrink-0 whitespace-nowrap px-2 py-0.5 rounded-full bg-slate-800 border border-slate-600 text-xs font-medium text-slate-300"
+              >
+                Review only
               </span>
             )}
             {isSyncing && !draftComplete && (
@@ -480,44 +473,62 @@ export default function BigBoard({
                     >
                       <td className="pl-4 py-2.5 text-slate-400 text-xs">{player.rank}</td>
 
+                      {/* One flex row, name truncating and everything else
+                          shrink-0. The name and its metadata used to share a
+                          block that wrapped as a unit, so a long name gave
+                          that row double the height of its neighbours and the
+                          list lost its rhythm exactly when it's being scanned
+                          fastest. Truncating keeps every row one line; the
+                          full name is on hover and in the detail drawer. */}
                       <td className="py-2.5 pr-2">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
                           {isRec && (
                             <span
                               className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0"
                               title="AI recommendation"
                             />
                           )}
-                          <div className="min-w-0">
-                            {/* The name is the affordance for the detail
-                                drawer — a separate icon button would need
-                                its own column in a table that's already
-                                fighting for width at the rail end of the
-                                resize range. */}
-                            {onShowDetail ? (
-                              <button
-                                type="button"
-                                onClick={() => onShowDetail(player.id)}
-                                aria-label={`Details for ${player.name}`}
-                                className="text-slate-100 font-medium text-left hover:text-emerald-300 hover:underline decoration-dotted underline-offset-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded"
-                              >
-                                {player.name}
-                              </button>
-                            ) : (
-                              <span className="text-slate-100 font-medium">{player.name}</span>
-                            )}
-                            <span className="ml-1.5 text-xs text-slate-400">{player.team}</span>
-                            {/* whitespace-nowrap: this is two words to the
-                                layout engine, and in a narrow board column it
-                                broke between them — a row reading "DET bye"
-                                with a bare "6" on the next line. */}
-                            {player.bye != null && (
-                              <span className="ml-1.5 text-xs text-slate-500 whitespace-nowrap">
-                                bye {player.bye}
-                              </span>
-                            )}
-                            <InjuryBadge status={player.injury_status} className="ml-1.5" />
-                          </div>
+
+                          {/* The name is the affordance for the detail
+                              drawer — a separate icon button would need its
+                              own column in a table that's already fighting
+                              for width at the rail end of the resize range. */}
+                          {onShowDetail ? (
+                            <button
+                              type="button"
+                              onClick={() => onShowDetail(player.id)}
+                              title={player.name}
+                              aria-label={`Details for ${player.name}`}
+                              className="min-w-0 truncate text-slate-100 font-medium text-left hover:text-emerald-300 hover:underline decoration-dotted underline-offset-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded"
+                            >
+                              {player.name}
+                            </button>
+                          ) : (
+                            <span
+                              title={player.name}
+                              className="min-w-0 truncate text-slate-100 font-medium"
+                            >
+                              {player.name}
+                            </span>
+                          )}
+
+                          <span className="shrink-0 text-xs text-slate-400">{player.team}</span>
+
+                          {/* Bare parenthesised number rather than "bye 7":
+                              the label costs three characters on every row of
+                              a column that's short of them, and the position
+                              right after the team reads as a bye week without
+                              being told. Spelled out in the tooltip. */}
+                          {player.bye != null && (
+                            <span
+                              title={`Bye week ${player.bye}`}
+                              className="shrink-0 text-xs text-slate-500"
+                            >
+                              ({player.bye})
+                            </span>
+                          )}
+
+                          <InjuryBadge status={player.injury_status} />
                         </div>
                       </td>
 
