@@ -253,7 +253,17 @@ def get_board(
     if not svc.is_active:
         raise HTTPException(status_code=400, detail="No active draft session.")
 
-    players = repo.get_top_available(db, n=limit)
+    # The board is the human's view, so it lists players who cannot currently
+    # play (IR/PUP/Suspended/Out) rather than silently omitting them — see
+    # get_top_available's include_undraftable docstring. The frontend marks
+    # them; stashing one late is a legitimate move.
+    #
+    # `counts` deliberately does NOT opt in. Scarcity means *startable
+    # supply* — an IR running back is not one of the RBs left to fill your
+    # flex — and these counts feed the same compute_position_scarcity the
+    # recommendation prompt uses, so they must keep meaning what the AI
+    # thinks they mean.
+    players = repo.get_top_available(db, n=limit, include_undraftable=True)
     counts = repo.count_available_by_position(db)
 
     return BoardResponse(

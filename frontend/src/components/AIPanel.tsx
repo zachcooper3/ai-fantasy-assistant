@@ -244,6 +244,10 @@ interface Props {
   onAutoRecommendChange: (on: boolean) => void;
   /** See the isSyncing docs in useDraft: sync-active means no manual picks. */
   isSyncing?: boolean;
+  /** Every pick is in. There is no next pick to advise on, so Get pick and
+   *  Auto are both disabled rather than spending a Claude call on a board
+   *  nobody can act against. */
+  draftComplete?: boolean;
   /** Whether the Big Board is currently collapsed to its rail ("focus mode"). */
   boardCollapsed?: boolean;
   /** Toggles the Big Board's collapsed state. Omitted (e.g. on mobile, where
@@ -483,6 +487,7 @@ export default function AIPanel({
   autoRecommend,
   onAutoRecommendChange,
   isSyncing = false,
+  draftComplete = false,
   boardCollapsed = false,
   onToggleBoardCollapse,
   onShowDetail,
@@ -526,7 +531,7 @@ export default function AIPanel({
 
   // Drafting off stale advice is exactly the mistake the staleness check
   // exists to prevent.
-  const canDraft = !isSyncing && !isStale;
+  const canDraft = !isSyncing && !isStale && !draftComplete;
 
   // The fallback alert (whatever the specific reason — see FALLBACK_REASON_RE
   // below) is already communicated by the badge on the card itself; repeating
@@ -622,12 +627,13 @@ export default function AIPanel({
               role="switch"
               aria-checked={autoRecommend}
               onClick={() => onAutoRecommendChange(!autoRecommend)}
+              disabled={draftComplete}
               title={
                 autoRecommend
                   ? "Auto-recommend on — fetches as your turn comes up"
                   : "Auto-recommend off — fetch manually with Get pick or g"
               }
-              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+              className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
                 autoRecommend
                   ? "bg-emerald-950 border-emerald-800/60 text-emerald-300"
                   : "bg-slate-800 border-slate-600 text-slate-300"
@@ -640,7 +646,8 @@ export default function AIPanel({
             <button
               type="button"
               onClick={onFetch}
-              disabled={isLoading}
+              disabled={isLoading || draftComplete}
+              title={draftComplete ? "The draft is over — there's no pick to advise on." : undefined}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs transition-colors disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
             >
               <RefreshCw size={12} className={isLoading ? "animate-spin" : ""} aria-hidden="true" />
@@ -649,7 +656,14 @@ export default function AIPanel({
           </div>
         </div>
 
-        {!recommendation ? (
+        {draftComplete && !recommendation ? (
+          <div className="text-center py-6 text-slate-400 text-sm">
+            <p>Your draft is finished — nothing left to recommend.</p>
+            <p className="mt-1 text-xs">
+              Earlier advice is still below, if you kept any.
+            </p>
+          </div>
+        ) : !recommendation ? (
           <div className="text-center py-6 text-slate-400 text-sm">
             <p>
               Click <span className="text-slate-200 font-medium">&quot;Get pick&quot;</span> for a

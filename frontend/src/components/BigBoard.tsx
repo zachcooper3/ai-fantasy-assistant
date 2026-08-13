@@ -3,12 +3,24 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 /**
  * BigBoard — the main player list, ordered by ADP.
  *
- * Counter display: "available / total" where:
- *   - numerator   = players still available matching the current filter
- *   - denominator = total players that exist for that filter (fixed on first load,
- *                   before any picks are made — captured in initialTotals ref)
+ * Counter display: "available / total" for the current position filter,
+ * where BOTH numbers come from the board's scarcity counts, not from the
+ * rendered player list.
  *
- * This means "56 / 56" for QB at the start, dropping to "55 / 56" after a QB is drafted.
+ * That distinction is the whole fix. The list is capped by the board's fetch
+ * limit (400), and the pool is larger than that, so counting rows made the
+ * numerator max out at the cap — and the denominator, captured on first
+ * load, maxed out at the same 400. The counter therefore read "400 / 400
+ * available" at the START of a draft and still read "400 / 400" at the END
+ * of one, having been incapable of showing anything else. It also
+ * contradicted the Position Depth panel directly beneath it, which counts
+ * the real pool.
+ *
+ * Scarcity counts come from an uncapped server-side query, so "412 / 592"
+ * now means what it says. They exclude IR/PUP/Suspended/Out — those players
+ * ARE listed on the board (see the board route's include_undraftable) but
+ * aren't startable supply, which is why a row can exist without being
+ * counted.
  *
  * Keyboard (the canonical list users see is the ? overlay — see
  * ShortcutsOverlay; keep the two in step):
@@ -19,9 +31,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
-import { Player } from "@/lib/api";
+import { Player, Scarcity } from "@/lib/api";
 import { matchesQuery } from "@/lib/search";
 import { hasModifier, isTypingTarget } from "@/lib/keyboard";
+import { isUndraftable } from "@/lib/injury";
 import InjuryBadge from "@/components/InjuryBadge";
 
 // K is here even though there's no kicker roster slot (DraftConfigRequest has
@@ -30,6 +43,9 @@ import InjuryBadge from "@/components/InjuryBadge";
 // engine now surfaces one in the final rounds, so a filter that can't reach
 // them left the last pick of every draft to name-search only.
 const POSITIONS = ["All", "QB", "RB", "WR", "TE", "DST", "K"] as const;
+
+/** The positions Scarcity actually carries — POSITIONS minus the "All" pseudo-filter. */
+const SCARCITY_POSITIONS = ["QB", "RB", "WR", "TE", "DST", "K"] as const;
 type PosFilter = (typeof POSITIONS)[number];
 
 const INITIAL_LIMIT = 50;
@@ -46,6 +62,12 @@ const POS_BADGE: Record<string, string> = {
 
 interface Props {
   players: Player[];
+  /**
+   * Uncapped available-player counts per position, from the board response.
+   * Drives the header counter — see the module docstring on why the
+   * rendered list can't. Null before the first board load.
+   */
+  scarcity: Scarcity | null;
   isMyTurn: boolean;
   recommendedId?: number;
   onPick: (playerId: number) => void;
@@ -58,6 +80,13 @@ interface Props {
    * ~64px more room.
    */
   isSyncing?: boolean;
+  /**
+   * Every pick is in. Suppresses the Draft column for the same reason
+   * isSyncing does — the action isn't available, and the backend rejects it
+   * with a 400 ("Draft is already complete") — but says so with its own
+   * chip, since "syncing from Sleeper" would be a lie.
+   */
+  draftComplete?: boolean;
   /**
    * Changes when a new draft session starts. Resets the fixed "total players"
    * denominators, which are captured once on first load — without this they
@@ -83,10 +112,12 @@ interface Props {
 
 export default function BigBoard({
   players,
+  scarcity,
   isMyTurn,
   recommendedId,
   onPick,
   isSyncing = false,
+  draftComplete = false,
   sessionKey = "",
   collapsed = false,
   onToggleCollapse,
@@ -102,8 +133,23 @@ export default function BigBoard({
   const searchRef = useRef<HTMLInputElement>(null);
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
 
-  // Capture total counts per position on first non-empty load.
-  // These become the fixed denominators — they don't change as players are drafted.
+  // Available counts for the current filter, straight from scarcity.
+  // `All` is the sum rather than a separate figure so the six position
+  // tallies and the total can never disagree.
+  const availableByFilter = useMemo(() => {
+    if (!scarcity) return null;
+    const counts: Record<string, number> = { All: 0 };
+    for (const pos of SCARCITY_POSITIONS) {
+      counts[pos] = scarcity[pos];
+      counts.All += scarcity[pos];
+    }
+    return counts;
+  }, [scarcity]);
+
+  // Denominators, captured from the first non-empty scarcity payload —
+  // i.e. the size of the pool before anything was drafted. Held in a ref
+  // rather than state: this is write-once-per-session bookkeeping, and
+  // making it state would re-render the whole table when it settles.
   const initialTotals = useRef<Record<string, number> | null>(null);
 
   // Clear the captured totals when the session changes so the next load
@@ -113,14 +159,10 @@ export default function BigBoard({
   }, [sessionKey]);
 
   useEffect(() => {
-    if (players.length > 0 && initialTotals.current === null) {
-      const totals: Record<string, number> = { All: players.length };
-      players.forEach((p) => {
-        totals[p.position] = (totals[p.position] ?? 0) + 1;
-      });
-      initialTotals.current = totals;
+    if (availableByFilter && availableByFilter.All > 0 && initialTotals.current === null) {
+      initialTotals.current = availableByFilter;
     }
-  }, [players]);
+  }, [availableByFilter]);
 
   // Reset paging and selection when the view changes underneath them.
   useEffect(() => {
@@ -138,12 +180,11 @@ export default function BigBoard({
     [players, posFilter, search]
   );
 
-  // Numerator: available players matching the current filter
-  const availableCount = filtered.length;
-
-  // Denominator: total that exist for this filter (fixed at first load)
-  const totalCount =
-    initialTotals.current?.[posFilter === "All" ? "All" : posFilter] ?? availableCount;
+  // Numerator and denominator for the header counter. Both null until the
+  // first board response lands — the counter is hidden rather than showing
+  // a placeholder that looks like a real number.
+  const availableCount = availableByFilter?.[posFilter] ?? null;
+  const totalCount = initialTotals.current?.[posFilter] ?? availableCount;
 
   // Paginate every view, not just unfiltered "All". Filtering to WR used to
   // render the entire filtered set — 100+ rows — in one go.
@@ -157,13 +198,15 @@ export default function BigBoard({
   );
   const hasMore = filtered.length > displayLimit;
 
-  const columnCount = isSyncing ? 4 : 5;
+  // Both reasons the pick controls go away collapse to one question here.
+  const canPick = !isSyncing && !draftComplete;
+  const columnCount = canPick ? 5 : 4;
 
   const draftSelected = useCallback(() => {
-    if (isSyncing) return;
+    if (!canPick) return;
     const player = visible[selectedIndex];
     if (player) onPick(player.id);
-  }, [isSyncing, visible, selectedIndex, onPick]);
+  }, [canPick, visible, selectedIndex, onPick]);
 
   // ------------------------------------------------------------------
   // Keyboard shortcuts
@@ -292,12 +335,14 @@ export default function BigBoard({
             Big Board
           </span>
         </button>
-        <span
-          className="text-[10px] text-slate-500 tabular-nums pb-1"
-          style={{ writingMode: "vertical-rl" }}
-        >
-          {availableCount}/{totalCount}
-        </span>
+        {availableCount !== null && (
+          <span
+            className="text-[10px] text-slate-500 tabular-nums pb-1"
+            style={{ writingMode: "vertical-rl" }}
+          >
+            {availableCount}/{totalCount}
+          </span>
+        )}
       </div>
     );
   }
@@ -326,7 +371,12 @@ export default function BigBoard({
           <div className="flex items-center gap-2">
             {/* Explains the missing Draft column — without this the controls
                 just silently vanish, which reads as a bug. */}
-            {isSyncing && (
+            {draftComplete && (
+              <span className="px-2 py-0.5 rounded-full bg-slate-800 border border-slate-600 text-xs font-medium text-slate-300">
+                Draft complete — review only
+              </span>
+            )}
+            {isSyncing && !draftComplete && (
               <span className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-800/60 text-xs font-medium text-emerald-300">
                 <span className="relative flex h-1.5 w-1.5" aria-hidden="true">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
@@ -335,9 +385,14 @@ export default function BigBoard({
                 Picks syncing from Sleeper
               </span>
             )}
-            <span className="text-xs text-slate-400 tabular-nums">
-              {availableCount} / {totalCount} available
-            </span>
+            {availableCount !== null && (
+              <span
+                className="text-xs text-slate-400 tabular-nums"
+                title="Undrafted players who can currently play. IR/PUP/Suspended players are listed below but not counted."
+              >
+                {availableCount} / {totalCount} available
+              </span>
+            )}
           </div>
         </div>
 
@@ -387,7 +442,7 @@ export default function BigBoard({
                 <th scope="col" className="text-left py-2">Player</th>
                 <th scope="col" className="text-center py-2 w-12">Pos</th>
                 <th scope="col" className="text-center py-2 w-12">ADP</th>
-                {!isSyncing && <th scope="col" className="py-2 w-16"><span className="sr-only">Draft</span></th>}
+                {canPick && <th scope="col" className="py-2 w-16"><span className="sr-only">Draft</span></th>}
               </tr>
             </thead>
             <tbody>
@@ -396,6 +451,11 @@ export default function BigBoard({
                 const tierBreak = prev && player.adp - prev.adp > 5;
                 const isRec = player.id === recommendedId;
                 const isSelected = idx === selectedIndex;
+                // Listed, but not part of the available count and never
+                // suggested by the AI. Dimmed so the discrepancy between
+                // "rows on screen" and "N available" reads as deliberate
+                // rather than as an off-by-something.
+                const cannotPlay = isUndraftable(player.injury_status);
 
                 return (
                   <React.Fragment key={player.id}>
@@ -416,7 +476,7 @@ export default function BigBoard({
                           : isRec
                           ? "bg-emerald-950/40 hover:bg-slate-800/50"
                           : "hover:bg-slate-800/50"
-                      }`}
+                      } ${cannotPlay && !isSelected ? "opacity-55" : ""}`}
                     >
                       <td className="pl-4 py-2.5 text-slate-400 text-xs">{player.rank}</td>
 
@@ -447,8 +507,12 @@ export default function BigBoard({
                               <span className="text-slate-100 font-medium">{player.name}</span>
                             )}
                             <span className="ml-1.5 text-xs text-slate-400">{player.team}</span>
+                            {/* whitespace-nowrap: this is two words to the
+                                layout engine, and in a narrow board column it
+                                broke between them — a row reading "DET bye"
+                                with a bare "6" on the next line. */}
                             {player.bye != null && (
-                              <span className="ml-1.5 text-xs text-slate-500">
+                              <span className="ml-1.5 text-xs text-slate-500 whitespace-nowrap">
                                 bye {player.bye}
                               </span>
                             )}
@@ -471,7 +535,7 @@ export default function BigBoard({
                         {player.adp}
                       </td>
 
-                      {!isSyncing && (
+                      {canPick && (
                         <td className="py-2.5 pr-3 text-right">
                           <button
                             type="button"

@@ -180,6 +180,7 @@ export default function DraftPage() {
         syncStatus={syncStatus}
         onUndo={undoPick}
         onShowShortcuts={() => setShowShortcuts(true)}
+        onShowSummary={() => setCompleteDismissed(false)}
         onNewDraft={endSession}
         onReset={() => startSession({
           league_size: session.league_size,
@@ -260,11 +261,13 @@ export default function DraftPage() {
           <div className="h-full min-h-0 min-w-0 shrink-0" style={{ width: boardWidth }}>
             <BigBoard
               players={board?.players ?? []}
+              scarcity={scarcity}
               isMyTurn={session.is_my_turn}
               recommendedId={recommendedId}
               onPick={recordPick}
               isSyncing={isSyncing}
               sessionKey={session.started_at ?? ""}
+              draftComplete={draftComplete}
               collapsed={boardCollapsed}
               onToggleCollapse={toggleBoardCollapse}
               onShowDetail={setDetailPlayerId}
@@ -301,6 +304,7 @@ export default function DraftPage() {
           autoRecommend={autoRecommend}
           onAutoRecommendChange={setAutoRecommend}
           isSyncing={isSyncing}
+          draftComplete={draftComplete}
           boardCollapsed={boardCollapsed}
           onToggleBoardCollapse={toggleBoardCollapse}
           onShowDetail={setDetailPlayerId}
@@ -312,11 +316,13 @@ export default function DraftPage() {
         {mobileTab === "board" && (
           <BigBoard
             players={board?.players ?? []}
+            scarcity={scarcity}
             isMyTurn={session.is_my_turn}
             recommendedId={recommendedId}
             onPick={recordPick}
             isSyncing={isSyncing}
             sessionKey={session.started_at ?? ""}
+            draftComplete={draftComplete}
             onShowDetail={setDetailPlayerId}
           />
         )}
@@ -336,6 +342,7 @@ export default function DraftPage() {
             autoRecommend={autoRecommend}
             onAutoRecommendChange={setAutoRecommend}
             isSyncing={isSyncing}
+            draftComplete={draftComplete}
             onShowDetail={setDetailPlayerId}
           />
         )}

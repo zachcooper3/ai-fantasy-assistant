@@ -2,31 +2,24 @@
 /**
  * InjuryBadge — Sleeper's injury designation for a player.
  *
- * This data has been on the wire since Player.injury_status was added
- * (PlayerResponse carries it on every board refresh) but was never rendered
- * anywhere: the frontend's Player interface didn't even declare the field.
- * The AI service treats "cannot play" as a hard exclusion rather than a risk
- * to weigh — a designation the human is expected to see too, since the Big
- * Board is also how you check the model's work.
+ * This data had been on the wire since Player.injury_status was added but
+ * was never rendered: the frontend's Player interface didn't even declare
+ * the field.
  *
- * Two severities, not five. The distinction that changes a draft-day decision
- * is "this player is unavailable" vs. "this player is dinged", so PUP/IR/
- * Suspended/DNR read as a hard red badge and Questionable/Doubtful as a soft
- * amber one. Unrecognised codes from a future Sleeper change fall through to
- * the soft style with their raw text, rather than being swallowed.
+ * Two severities, because the distinction that changes a draft-day decision
+ * is "cannot play at all" vs. "dinged". The split is NOT a local judgement
+ * call — it's `isUndraftable`, which mirrors the backend set that decides
+ * who the AI is allowed to recommend and who counts toward positional
+ * scarcity. So a red badge means something precise: the server has excluded
+ * this player from its own supply math, and he's on your board only because
+ * the board deliberately opts into showing him.
  *
- * Observed live values in this database: Questionable, PUP, IR, NA, DNR.
+ * Codes outside both sets (a future Sleeper value, "DNR", "NFI") render
+ * amber with their raw text rather than being swallowed — unknown is not
+ * the same as fine, but it also isn't a claim this component gets to make.
  */
 
-/** Designations meaning the player is not expected to play at all. */
-const OUT_CODES = new Set(["IR", "PUP", "OUT", "SUSPENDED", "NFI", "DNR"]);
-
-/**
- * Sleeper reports "NA" for a player it has no status for, which is
- * indistinguishable from healthy and would otherwise render a badge on
- * someone who has nothing wrong with them.
- */
-const NON_STATUSES = new Set(["", "NA", "ACTIVE", "HEALTHY"]);
+import { injuryCode, isUndraftable } from "@/lib/injury";
 
 const LABELS: Record<string, string> = {
   IR: "IR",
@@ -40,12 +33,12 @@ const LABELS: Record<string, string> = {
 };
 
 const TITLES: Record<string, string> = {
-  IR: "On injured reserve — will not play.",
-  PUP: "Physically unable to perform — will not play to start the season.",
+  IR: "On injured reserve — cannot play. Excluded from AI suggestions and from positional depth counts.",
+  PUP: "Physically unable to perform — cannot play to start the season. Excluded from AI suggestions and from positional depth counts.",
+  SUSPENDED: "Suspended — cannot play. Excluded from AI suggestions and from positional depth counts.",
+  OUT: "Ruled out. Excluded from AI suggestions and from positional depth counts.",
   DNR: "Did not report.",
-  NFI: "Non-football injury list — will not play to start the season.",
-  SUSPENDED: "Suspended — will not play.",
-  OUT: "Ruled out.",
+  NFI: "Non-football injury list — unlikely to play to start the season.",
   DOUBTFUL: "Doubtful — unlikely to play.",
   QUESTIONABLE: "Questionable — game-time decision.",
 };
@@ -57,18 +50,16 @@ export default function InjuryBadge({
   status?: string | null;
   className?: string;
 }) {
-  if (!status) return null;
+  const code = injuryCode(status);
+  if (!code) return null;
 
-  const code = status.trim().toUpperCase();
-  if (NON_STATUSES.has(code)) return null;
-
-  const isOut = OUT_CODES.has(code);
+  const cannotPlay = isUndraftable(status);
 
   return (
     <span
       title={TITLES[code] ?? `Injury designation: ${status}`}
-      className={`shrink-0 px-1 py-px rounded border text-[10px] font-bold leading-tight tracking-wide ${
-        isOut
+      className={`shrink-0 px-1 py-px rounded border text-[10px] font-bold leading-tight tracking-wide whitespace-nowrap ${
+        cannotPlay
           ? "bg-red-950 text-red-300 border-red-800/70"
           : "bg-amber-950/60 text-amber-300 border-amber-800/60"
       } ${className}`}

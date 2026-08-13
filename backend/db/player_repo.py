@@ -87,15 +87,29 @@ def get_top_available(
     session: Session,
     n: int = 10,
     position: str | None = None,
+    include_undraftable: bool = False,
 ) -> list[Player]:
     """
     Returns the top N available players by ADP, optionally filtered by
     position. Excludes players who cannot currently play at all (IR/PUP/
     Suspended/Out) — see UNDRAFTABLE_STATUSES.
+
+    `include_undraftable=True` keeps them in. This exists for the HUMAN big
+    board only, where hiding them is its own kind of wrong: stashing a stud
+    who'll return from IR is a real endgame move, and a player who silently
+    isn't in the list is indistinguishable from one who's already been
+    drafted. The AI candidate pool must NOT pass this — the exclusion was
+    added because a live recommendation went to an IR player with the
+    designation sitting unread in the prompt, and putting them back in the
+    model's slate would reintroduce exactly that.
+
+    Defaulting to False rather than True is the whole point of the flag's
+    shape: every existing caller keeps its current behaviour untouched, and
+    opting in is a deliberate, greppable act at one call site.
     """
-    query = _exclude_undraftable(
-        select(Player).where(Player.is_available == True)
-    )
+    query = select(Player).where(Player.is_available == True)
+    if not include_undraftable:
+        query = _exclude_undraftable(query)
     if position:
         query = query.where(Player.position == position.upper())
     return session.exec(query.order_by(Player.adp).limit(n)).all()

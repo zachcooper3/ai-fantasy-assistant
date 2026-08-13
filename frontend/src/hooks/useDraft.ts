@@ -21,6 +21,7 @@ import {
   SyncStatus,
   WsEvent,
 } from "@/lib/api";
+import { isUndraftable } from "@/lib/injury";
 
 // Browsers can't set an Authorization header on a WebSocket handshake, so
 // the shared token (if configured) rides a query param instead — checked
@@ -266,14 +267,25 @@ export function useDraft(): DraftHook {
       const drafted = prev.players.find((p) => p.id === playerId);
       if (!drafted) return prev;
 
+      // The board lists IR/PUP/Suspended/Out players; the scarcity counts
+      // deliberately don't count them (scarcity means startable supply —
+      // see the board route in backend/app/api/draft.py). So drafting one
+      // removes a row but must NOT decrement, or the count walks below the
+      // truth and stays there: the next reconcile corrects it, but every
+      // pick in between reads low, and near a tier boundary that's the
+      // difference between a red tile and a slate one.
+      const countsTowardScarcity = !isUndraftable(drafted.injury_status);
       const position = drafted.position as keyof typeof prev.scarcity;
+
       return {
         ...prev,
         players: prev.players.filter((p) => p.id !== playerId),
-        scarcity: {
-          ...prev.scarcity,
-          [position]: Math.max(0, (prev.scarcity[position] ?? 0) - 1),
-        },
+        scarcity: countsTowardScarcity
+          ? {
+              ...prev.scarcity,
+              [position]: Math.max(0, (prev.scarcity[position] ?? 0) - 1),
+            }
+          : prev.scarcity,
       };
     });
   }, []);

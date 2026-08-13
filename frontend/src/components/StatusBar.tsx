@@ -4,7 +4,7 @@
  * Highlights in green when it's the user's turn.
  */
 
-import { Undo2, Wifi, WifiOff, RefreshCw, RotateCcw, LogOut, Keyboard } from "lucide-react";
+import { Undo2, Wifi, WifiOff, RefreshCw, RotateCcw, LogOut, Keyboard, Flag } from "lucide-react";
 import { DraftState, SyncStatus } from "@/lib/api";
 import ConfirmButton from "@/components/ConfirmButton";
 
@@ -16,6 +16,9 @@ interface Props {
   /** Opens the keyboard shortcut reference — the only pointer to it, since
    *  every shortcut in the app is a bare keypress with no visible affordance. */
   onShowShortcuts: () => void;
+  /** Reopens the draft-complete summary. That overlay is dismissible so you
+   *  can review the board, which previously left no way back to it. */
+  onShowSummary: () => void;
   /** Clears the picks but keeps this league's settings. */
   onReset: () => void;
   /**
@@ -45,10 +48,21 @@ export default function StatusBar({
   syncStatus,
   onUndo,
   onShowShortcuts,
+  onShowSummary,
   onReset,
   onNewDraft,
 }: Props) {
   const myTurn = session.is_my_turn;
+
+  // Once every pick is in, the live-draft readout stops describing anything
+  // real: current_pick_number runs one past the end (#181 of 180), so
+  // current_round reads "16 / 15", current_team_slot names a team that will
+  // never pick, and picks_until_my_turn returns its -1 "no next turn"
+  // sentinel — which StatusBar rendered verbatim as "-1 picks away", plural
+  // and all. The completion overlay was the only thing that said the draft
+  // was over, and it's dismissible by design so you can review the board.
+  const isComplete = session.draft_complete;
+  const totalPicks = session.league_size * session.total_rounds;
 
   // Undoing a sync-recorded pick restores the player locally while Sleeper
   // still has the pick, and the backend's synced-pick counter isn't rewound —
@@ -68,7 +82,7 @@ export default function StatusBar({
          `basis-0 grow` so it still pushes the controls right on one line but
          collapses instead of forcing the wrap by itself. */
       className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 border-b text-sm font-medium transition-colors ${
-        myTurn
+        myTurn && !isComplete
           ? "bg-emerald-950 border-emerald-700"
           : "bg-slate-900 border-slate-700"
       }`}
@@ -80,7 +94,9 @@ export default function StatusBar({
         time-critical, so it's assertive; the pick feed below it is polite.
       */}
       <span aria-live="assertive" aria-atomic="true" className="sr-only">
-        {myTurn
+        {isComplete
+          ? "The draft is complete."
+          : myTurn
           ? "You are on the clock."
           : `${session.picks_until_my_turn} picks until your turn.`}
       </span>
@@ -91,44 +107,70 @@ export default function StatusBar({
           : ""}
       </span>
 
-      {/* On the clock indicator */}
-      {myTurn ? (
-        <span className="flex items-center gap-2 text-emerald-400 font-bold text-base">
-          <span className="relative flex h-2.5 w-2.5" aria-hidden="true">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+      {isComplete ? (
+        <>
+          <span className="flex items-center gap-2 text-slate-200 font-bold text-base">
+            <Flag size={15} className="text-emerald-400" aria-hidden="true" />
+            DRAFT COMPLETE
           </span>
-          ON THE CLOCK
-        </span>
+
+          <span className="text-slate-500" aria-hidden="true">|</span>
+
+          <span className="text-slate-300 tabular-nums">
+            {session.total_rounds} rounds
+            <span className="text-slate-400"> · {totalPicks} picks</span>
+          </span>
+
+          <button
+            type="button"
+            onClick={onShowSummary}
+            className="text-xs text-emerald-400 hover:text-emerald-300 underline underline-offset-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded"
+          >
+            View my team
+          </button>
+        </>
       ) : (
-        <span className="text-slate-300">
-          {session.picks_until_my_turn} pick{session.picks_until_my_turn !== 1 ? "s" : ""} away
-        </span>
-      )}
+        <>
+          {/* On the clock indicator */}
+          {myTurn ? (
+            <span className="flex items-center gap-2 text-emerald-400 font-bold text-base">
+              <span className="relative flex h-2.5 w-2.5" aria-hidden="true">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+              </span>
+              ON THE CLOCK
+            </span>
+          ) : (
+            <span className="text-slate-300">
+              {session.picks_until_my_turn} pick{session.picks_until_my_turn !== 1 ? "s" : ""} away
+            </span>
+          )}
 
-      <span className="text-slate-500" aria-hidden="true">|</span>
+          <span className="text-slate-500" aria-hidden="true">|</span>
 
-      {/* Pick / round info */}
-      <span className="text-slate-300">
-        Pick <span className="text-white font-bold">#{session.current_pick_number}</span>
-      </span>
-      <span className="text-slate-300">
-        Round <span className="text-white font-bold">{session.current_round}</span>
-        <span className="text-slate-400"> / {session.total_rounds}</span>
-      </span>
+          {/* Pick / round info */}
+          <span className="text-slate-300">
+            Pick <span className="text-white font-bold">#{session.current_pick_number}</span>
+          </span>
+          <span className="text-slate-300">
+            Round <span className="text-white font-bold">{session.current_round}</span>
+            <span className="text-slate-400"> / {session.total_rounds}</span>
+          </span>
 
-      {/* Current team on clock */}
-      {!myTurn && (
-        <span className="text-slate-300">
-          Slot <span className="text-slate-100">{session.current_team_slot}</span> picking
-        </span>
-      )}
+          {/* Current team on clock */}
+          {!myTurn && (
+            <span className="text-slate-300">
+              Slot <span className="text-slate-100">{session.current_team_slot}</span> picking
+            </span>
+          )}
 
-      {/* My next pick */}
-      {session.my_next_pick_number && !myTurn && (
-        <span className="text-slate-400 text-xs">
-          My next: #{session.my_next_pick_number} (Rd {Math.ceil(session.my_next_pick_number / session.league_size)})
-        </span>
+          {/* My next pick */}
+          {session.my_next_pick_number && !myTurn && (
+            <span className="text-slate-400 text-xs">
+              My next: #{session.my_next_pick_number} (Rd {Math.ceil(session.my_next_pick_number / session.league_size)})
+            </span>
+          )}
+        </>
       )}
 
       {/* Roster summary */}
