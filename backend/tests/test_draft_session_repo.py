@@ -125,3 +125,57 @@ def test_set_ai_model_is_a_noop_with_no_active_session(db):
 
 def test_get_ai_model_none_with_no_active_session(db):
     assert jrepo.get_ai_model(db) is None
+
+
+# ---------------------------------------------------------------------------
+# sleeper_draft_id — resuming live Sleeper sync across a backend restart
+# ---------------------------------------------------------------------------
+
+def test_sleeper_draft_id_defaults_to_unset(db):
+    jrepo.save_config(db, CFG)
+    assert jrepo.get_sleeper_draft_id(db) is None
+
+
+def test_set_sleeper_draft_id_updates_in_place_without_touching_picks(db):
+    jrepo.save_config(db, CFG)
+    svc = DraftStateService()
+    svc.start_session(CFG)
+    journal_picks(db, svc, [(1, "A", "RB", "X")])
+
+    jrepo.set_sleeper_draft_id(db, "123456789")
+
+    assert jrepo.get_sleeper_draft_id(db) == "123456789"
+    _, picks, _ = jrepo.load_state(db)
+    assert len(picks) == 1  # untouched — set_sleeper_draft_id must not be save_config
+
+
+def test_set_sleeper_draft_id_clears_a_previously_set_value(db):
+    # Mirrors DELETE /api/sync/stop: an explicit stop must be honored on the
+    # next restart, not silently reconnect to the old draft.
+    jrepo.save_config(db, CFG)
+    jrepo.set_sleeper_draft_id(db, "123456789")
+    assert jrepo.get_sleeper_draft_id(db) == "123456789"
+
+    jrepo.set_sleeper_draft_id(db, None)
+    assert jrepo.get_sleeper_draft_id(db) is None
+
+
+def test_set_sleeper_draft_id_is_a_noop_with_no_active_session(db):
+    jrepo.set_sleeper_draft_id(db, "123456789")
+    assert jrepo.load_state(db) is None
+
+
+def test_get_sleeper_draft_id_none_with_no_active_session(db):
+    assert jrepo.get_sleeper_draft_id(db) is None
+
+
+def test_save_config_does_not_carry_over_a_previous_sleeper_draft_id(db):
+    # A new session (save_config replaces the row wholesale) must start with
+    # no sync to resume — otherwise starting a fresh, unsynced draft after a
+    # previously-synced one would try to reconnect to the OLD draft on the
+    # next restart.
+    jrepo.save_config(db, CFG)
+    jrepo.set_sleeper_draft_id(db, "123456789")
+
+    jrepo.save_config(db, CFG)
+    assert jrepo.get_sleeper_draft_id(db) is None

@@ -10,7 +10,10 @@ Author: Zach Cooper
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlmodel import Session
 
+from backend.db.database import get_session
+from backend.db import draft_session_repo
 from backend.app.services.draft_sync import DraftSyncService
 from backend.app.services.draft_state import DraftStateService
 
@@ -56,6 +59,7 @@ async def start_sync(
     body: SyncStartRequest,
     sync: DraftSyncService = Depends(get_sync_service),
     draft: DraftStateService = Depends(get_draft_service),
+    db: Session = Depends(get_session),
 ):
     """
     Begin polling a Sleeper draft for live picks.
@@ -65,6 +69,10 @@ async def start_sync(
         raise HTTPException(status_code=400, detail="Start a draft session first.")
 
     await sync.start(body.draft_id)
+    # Persisted so a backend restart mid-draft can resume sync automatically
+    # instead of silently dropping to idle — see main.py's lifespan and
+    # DraftSession.sleeper_draft_id's docstring.
+    draft_session_repo.set_sleeper_draft_id(db, body.draft_id)
 
     return SyncStatusResponse(
         status=sync.status,
@@ -75,9 +83,18 @@ async def start_sync(
 
 
 @router.delete("/stop", status_code=204)
-async def stop_sync(sync: DraftSyncService = Depends(get_sync_service)):
-    """Stop the Sleeper polling task."""
+async def stop_sync(
+    sync: DraftSyncService = Depends(get_sync_service),
+    db: Session = Depends(get_session),
+):
+    """Stop the Sleeper polling task.
+
+    Also clears the persisted draft ID — an explicit stop means the user
+    wants manual control back, and a restart afterward must honor that
+    rather than silently reconnecting (see set_sleeper_draft_id's docstring).
+    """
     await sync.stop()
+    draft_session_repo.set_sleeper_draft_id(db, None)
 
 
 @router.get("/status", response_model=SyncStatusResponse)

@@ -52,6 +52,14 @@ _COLUMNS: list[tuple[str, str, str]] = [
     # whichever model you'd switched to instead of silently reverting to
     # the CLAUDE_MODEL env default.
     ("draftsession", "ai_model", "VARCHAR"),
+    # The Sleeper draft ID live sync was polling — persisted so a mid-draft
+    # backend restart can resume sync automatically instead of silently
+    # dropping to idle (see DraftSession.sleeper_draft_id's docstring and
+    # main.py's lifespan). Without this migration, a database created before
+    # 2026-08-13 hits "no such column" the first time set_sleeper_draft_id
+    # or get_sleeper_draft_id runs — exactly the failure mode this file
+    # exists to prevent.
+    ("draftsession", "sleeper_draft_id", "VARCHAR"),
 ]
 
 

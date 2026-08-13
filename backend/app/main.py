@@ -100,6 +100,7 @@ async def lifespan(app: FastAPI):
     with Session(engine) as db:
         persisted = draft_session_repo.load_state(db)
         persisted_model = draft_session_repo.get_ai_model(db)
+        persisted_sleeper_draft_id = draft_session_repo.get_sleeper_draft_id(db)
 
     draft_service = DraftStateService()
     connection_manager = ConnectionManager()
@@ -134,9 +135,36 @@ async def lifespan(app: FastAPI):
         print(
             f"Recovered active draft session: {len(picks)} pick(s), "
             f"round {draft_service.current_round}, "
-            f"pick #{draft_service.current_pick_number} on the clock. "
-            "Note: Sleeper live sync does not auto-resume — POST /api/sync/start again if needed."
+            f"pick #{draft_service.current_pick_number} on the clock."
         )
+
+        # Resume Sleeper sync too, not just the picks/config — this is the
+        # other half of the fix. DraftSyncService always starts idle on a
+        # fresh process, and an idle sync is indistinguishable from "no sync
+        # was ever running" to the frontend (GET /api/sync/status just
+        # returns idle either way), so the manual pick/undo controls
+        # silently reappeared over a draft the user still believed was
+        # syncing live — see DraftSession.sleeper_draft_id's docstring for
+        # the live incident this fixes.
+        #
+        # Skipped once the draft is already complete: nothing left to sync,
+        # and a session can sit persisted indefinitely after the last pick
+        # if nobody explicitly ended it, so resuming here would spin up a
+        # background poller against a finished Sleeper draft on every
+        # restart for no reason.
+        if persisted_sleeper_draft_id is not None and not draft_service.draft_complete:
+            try:
+                await app.state.sync_service.start(persisted_sleeper_draft_id)
+                print(f"Resumed Sleeper sync for draft {persisted_sleeper_draft_id}.")
+            except Exception as e:
+                # Same failure policy as the rest of startup: a sync that
+                # won't resume is a worse day, not a crashed server. The
+                # frontend's own status poll will surface sync_service's
+                # status/error the same way it does for any other sync
+                # failure, so this isn't a silent miss — see StatusBar's
+                # "Sync error" indicator.
+                print(f"[WARN] Could not resume Sleeper sync: {e}. "
+                      "POST /api/sync/start manually if needed.")
 
     _print_startup_banner(app.state.ai_service)
     print("Fantasy Draft Assistant API is ready.")

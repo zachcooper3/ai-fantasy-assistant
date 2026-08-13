@@ -89,6 +89,17 @@ class DraftSession(SQLModel, table=True):
     # explicit choice yet" — AIService keeps using its own env-derived
     # default in that case.
     ai_model: Optional[str] = Field(default=None)
+    # The Sleeper draft ID live sync is (or was) polling, so a backend
+    # restart mid-draft can resume sync instead of silently dropping it.
+    # Before this field, main.py's lifespan restored picks/config but never
+    # sync itself — DraftSyncService always starts at status="idle" on a
+    # fresh process, and a null sync status is indistinguishable from "no
+    # sync" to the frontend, so the manual pick/undo controls silently
+    # reappeared over a draft the user still believed was syncing live.
+    # Set in POST /api/sync/start, cleared in DELETE /api/sync/stop (an
+    # explicit stop means don't resume this on the next restart) and
+    # implicitly on any save_config (a new session has no sync to inherit).
+    sleeper_draft_id: Optional[str] = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

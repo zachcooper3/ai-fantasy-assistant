@@ -94,6 +94,40 @@ def get_ai_model(session: Session) -> str | None:
     return row.ai_model if row else None
 
 
+def set_sleeper_draft_id(session: Session, draft_id: str | None) -> None:
+    """
+    Updates the persisted Sleeper draft ID on the ALREADY-ACTIVE session in
+    place — same shape as set_ai_model, and for the same reason: this is a
+    live-sync state change, not a new draft, so it must not touch the pick
+    journal the way save_config does.
+
+    Call with the real ID from POST /api/sync/start so a restart can resume
+    sync automatically (see main.py's lifespan), and with None from
+    DELETE /api/sync/stop so an explicit stop is honored — a restart after
+    that must NOT silently reconnect to a sync the user turned off on
+    purpose.
+
+    No-op if no session is active yet, same reasoning as set_ai_model.
+    """
+    row = session.get(DraftSession, _SESSION_ROW_ID)
+    if row is None:
+        return
+    row.sleeper_draft_id = draft_id
+    session.add(row)
+    session.commit()
+
+
+def get_sleeper_draft_id(session: Session) -> str | None:
+    """
+    Returns the Sleeper draft ID live sync was polling for the active
+    session, or None if there isn't one (no session active, a session active
+    with no sync ever started, or sync was explicitly stopped) — caller
+    should treat None as "nothing to resume."
+    """
+    row = session.get(DraftSession, _SESSION_ROW_ID)
+    return row.sleeper_draft_id if row else None
+
+
 def clear(session: Session) -> None:
     """Removes the persisted session and its pick journal — mirrors
     DraftStateService.reset()."""
