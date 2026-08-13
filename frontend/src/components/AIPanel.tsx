@@ -679,17 +679,19 @@ export default function AIPanel({
                   <Layers size={11} aria-hidden="true" />
                   Depth Stash
                 </p>
-                {recommendation.depth.map((p) => (
-                  <SuggestionCard
-                    key={p.player_id}
-                    suggestion={p}
-                    section="depth"
-                    pickNumber={recommendation.pick_number}
-                    player={playersById.get(p.player_id)}
-                    canDraft={canDraft}
-                    onDraft={() => onDraftRecommended(p.player_id)}
-                  />
-                ))}
+                <div className={isWide ? "grid grid-cols-2 gap-2 items-start" : "space-y-2"}>
+                  {recommendation.depth.map((p) => (
+                    <SuggestionCard
+                      key={p.player_id}
+                      suggestion={p}
+                      section="depth"
+                      pickNumber={recommendation.pick_number}
+                      player={playersById.get(p.player_id)}
+                      canDraft={canDraft}
+                      onDraft={() => onDraftRecommended(p.player_id)}
+                    />
+                  ))}
+                </div>
               </div>
             )}
 
@@ -704,17 +706,19 @@ export default function AIPanel({
                   <Rocket size={11} aria-hidden="true" />
                   Opportunity
                 </p>
-                {recommendation.opportunity.map((p) => (
-                  <SuggestionCard
-                    key={p.player_id}
-                    suggestion={p}
-                    section="opportunity"
-                    pickNumber={recommendation.pick_number}
-                    player={playersById.get(p.player_id)}
-                    canDraft={canDraft}
-                    onDraft={() => onDraftRecommended(p.player_id)}
-                  />
-                ))}
+                <div className={isWide ? "grid grid-cols-2 gap-2 items-start" : "space-y-2"}>
+                  {recommendation.opportunity.map((p) => (
+                    <SuggestionCard
+                      key={p.player_id}
+                      suggestion={p}
+                      section="opportunity"
+                      pickNumber={recommendation.pick_number}
+                      player={playersById.get(p.player_id)}
+                      canDraft={canDraft}
+                      onDraft={() => onDraftRecommended(p.player_id)}
+                    />
+                  ))}
+                </div>
               </div>
             )}
           </div>
