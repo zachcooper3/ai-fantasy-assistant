@@ -23,7 +23,7 @@
  * fallback reports confidence "low" and carries no strategy).
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Lightbulb,
   RefreshCw,
@@ -40,7 +40,18 @@ import {
   Rocket,
 } from "lucide-react";
 
-import { api, Confidence, Player, PickSuggestion, Recommendation, Scarcity, SectionTag, Survival } from "@/lib/api";
+import {
+  api,
+  Confidence,
+  Player,
+  PickSuggestion,
+  Recommendation,
+  Scarcity,
+  ScarcityAlert,
+  ScarcityAnalysis,
+  SectionTag,
+  Survival,
+} from "@/lib/api";
 import { PastRecommendation } from "@/hooks/useDraft";
 import { adpValue } from "@/lib/draft";
 import ConfirmButton from "@/components/ConfirmButton";
@@ -66,6 +77,53 @@ const VALUE_STYLES = {
   reach: "text-amber-400",
   even:  "text-slate-400",
 } as const;
+
+/**
+ * Position Depth tiles, keyed by the backend's scarcity tier.
+ *
+ * The tier is NOT computed here. It used to be — two absolute thresholds
+ * (`count < 20` low, `count < 8` critical) applied to every position in every
+ * league — which is wrong wherever demand isn't uniform across positions. A
+ * 12-team league starting 2 RB + 1 FLEX has demand for ~36 running backs, so
+ * 25 left is genuinely critical, while 25 quarterbacks against demand for 12
+ * is a healthy supply. The old rule called both of those "ok" and only ever
+ * fired late, after the scarcity had already cost you something.
+ *
+ * GET /api/recommend/scarcity does the real math from THIS session's league
+ * size and starting lineup, sharing compute_position_scarcity with the
+ * recommendation prompt's own Positional Availability section — so what the
+ * panel says and what the model was told can't drift apart.
+ *
+ * "unknown" is a real state, not a default: it covers both the pre-first-fetch
+ * moment and a position this league doesn't start at all (the backend drops
+ * zero-slot positions rather than emitting "critical: 0 needed"). Either way
+ * the count still renders, without a tier claim attached to it.
+ */
+const TIER_STYLES: Record<
+  ScarcityAlert["tier"] | "unknown",
+  { tile: string; count: string; label: string | null }
+> = {
+  critical: {
+    tile: "bg-red-900/30 border-red-800/50",
+    count: "text-red-400",
+    label: "Critical",
+  },
+  low: {
+    tile: "bg-amber-900/20 border-amber-800/30",
+    count: "text-amber-400",
+    label: "Low",
+  },
+  ok: {
+    tile: "bg-slate-800 border-slate-700",
+    count: "text-slate-200",
+    label: null,
+  },
+  unknown: {
+    tile: "bg-slate-800 border-slate-700",
+    count: "text-slate-200",
+    label: null,
+  },
+};
 
 /**
  * Panel width, in px, above which a 2-entry section (Best Available, Needs)
@@ -166,7 +224,13 @@ function SurvivalBadge({ survival }: { survival: Survival }) {
 interface Props {
   recommendation: Recommendation | null;
   recHistory: PastRecommendation[];
+  /** Available counts per position, from the board — updated locally on every
+   *  pick, so this is the responsive half of the Position Depth panel. */
   scarcity: Scarcity | null;
+  /** Tiered critical/low/ok analysis for those counts, computed server-side
+   *  against this league's real roster shape. Null before the first fetch or
+   *  if it failed — the panel then shows counts with no tier claim. */
+  scarcityAnalysis: ScarcityAnalysis | null;
   isLoading: boolean;
   isMyTurn: boolean;
   onFetch: () => void;
@@ -409,6 +473,7 @@ export default function AIPanel({
   recommendation,
   recHistory,
   scarcity,
+  scarcityAnalysis,
   isLoading,
   isMyTurn,
   onFetch,
@@ -423,6 +488,16 @@ export default function AIPanel({
   onShowDetail,
 }: Props) {
   const [showHistory, setShowHistory] = useState(false);
+
+  // Alerts arrive as a list sorted critical-first (the backend orders them for
+  // callers that render a feed). This panel is a fixed-order grid instead —
+  // the same argument as DraftRoom's POS_ORDER: a tile that moves around
+  // between refreshes can't be found at a glance mid-draft — so it indexes by
+  // position rather than iterating the list.
+  const alertsByPosition = useMemo(
+    () => new Map((scarcityAnalysis?.alerts ?? []).map((a) => [a.position, a])),
+    [scarcityAnalysis]
+  );
 
   // Tracks this panel's actual rendered width so Best Available/Needs can
   // switch to a 2-column grid once there's genuinely room for it — see
@@ -809,37 +884,45 @@ export default function AIPanel({
             <h2 className="text-xs font-bold text-slate-300 uppercase tracking-wider">
               Position Depth
             </h2>
+            {scarcityAnalysis === null && (
+              <span
+                className="ml-auto text-[10px] text-slate-500"
+                title="Scarcity tiers haven't loaded — showing raw counts only."
+              >
+                counts only
+              </span>
+            )}
           </div>
           <div className="grid grid-cols-3 gap-2">
             {(["QB", "RB", "WR", "TE", "DST", "K"] as const).map((pos) => {
+              // Count comes from the board (decremented locally on every pick,
+              // so it's instant); the tier comes from the analysis, which is
+              // fetched in the same round as the board — see refreshBoard.
               const count = scarcity[pos];
-              const low = count < 20;
-              const critical = count < 8;
+              const alert = alertsByPosition.get(pos);
+              const style = TIER_STYLES[alert?.tier ?? "unknown"];
+
               return (
                 <div
                   key={pos}
-                  className={`rounded-lg p-2.5 text-center border ${
-                    critical
-                      ? "bg-red-900/30 border-red-800/50"
-                      : low
-                      ? "bg-amber-900/20 border-amber-800/30"
-                      : "bg-slate-800 border-slate-700"
-                  }`}
+                  title={alert?.message}
+                  className={`rounded-lg p-2.5 text-center border ${style.tile}`}
                 >
                   <div className={`text-xs font-bold ${POS_COLORS[pos]}`}>{pos}</div>
-                  <div
-                    className={`text-lg font-bold tabular-nums ${
-                      critical ? "text-red-400" : low ? "text-amber-400" : "text-slate-200"
-                    }`}
-                  >
+                  <div className={`text-lg font-bold tabular-nums ${style.count}`}>
                     {count}
                   </div>
-                  {critical && <div className="text-xs text-red-400">Critical</div>}
-                  {low && !critical && <div className="text-xs text-amber-400">Low</div>}
+                  {style.label && (
+                    <div className={`text-xs ${style.count}`}>{style.label}</div>
+                  )}
                 </div>
               );
             })}
           </div>
+          <p className="mt-2.5 text-[10px] text-slate-500 leading-relaxed">
+            Measured against what your league actually starts — critical means
+            fewer left than half the league needs.
+          </p>
         </div>
       )}
     </div>

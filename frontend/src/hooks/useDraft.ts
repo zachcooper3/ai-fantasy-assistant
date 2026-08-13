@@ -11,7 +11,16 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, API_TOKEN, Board, DraftState, Recommendation, SyncStatus, WsEvent } from "@/lib/api";
+import {
+  api,
+  API_TOKEN,
+  Board,
+  DraftState,
+  Recommendation,
+  ScarcityAnalysis,
+  SyncStatus,
+  WsEvent,
+} from "@/lib/api";
 
 // Browsers can't set an Authorization header on a WebSocket handshake, so
 // the shared token (if configured) rides a query param instead — checked
@@ -68,6 +77,19 @@ export interface PastRecommendation {
 export interface DraftHook {
   session: DraftState | null;
   board: Board | null;
+  /**
+   * Tiered positional scarcity from the backend — critical/low/ok per
+   * position, computed against THIS league's size and starting lineup.
+   *
+   * The panel that shows this used to apply two hardcoded absolute
+   * thresholds (`< 20` low, `< 8` critical) to every position in every
+   * league, which is wrong wherever demand isn't uniform: 3 RB/FLEX slots
+   * across 12 teams is demand for 36, so 25 RBs left is critical while the
+   * same 25 QBs is a healthy supply. Null until the first fetch lands, or
+   * if that fetch fails — callers must render counts without tier colouring
+   * rather than guessing.
+   */
+  scarcityAnalysis: ScarcityAnalysis | null;
   recommendation: Recommendation | null;
   /**
    * Previous recommendations, newest first. The live recommendation used to be
@@ -128,6 +150,7 @@ export interface DraftHook {
 export function useDraft(): DraftHook {
   const [session, setSession] = useState<DraftState | null>(null);
   const [board, setBoard] = useState<Board | null>(null);
+  const [scarcityAnalysis, setScarcityAnalysis] = useState<ScarcityAnalysis | null>(null);
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [recHistory, setRecHistory] = useState<PastRecommendation[]>([]);
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
@@ -198,12 +221,21 @@ export function useDraft(): DraftHook {
   const reconcileTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const refreshBoard = useCallback(async () => {
-    try {
-      const b = await api.getBoard(400);
-      setBoard(b);
-    } catch {
-      // Board fetch failures are non-fatal; keep showing the old board
-    }
+    // Board and scarcity analysis are fetched together, not sequentially and
+    // not on separate schedules: the Position Depth panel renders the board's
+    // count with the analysis's tier behind it, and two independent refreshes
+    // would routinely pair a number from one moment with a colour from
+    // another. allSettled because they fail independently — a scarcity
+    // endpoint that errors should cost the tier colouring, not the board.
+    const [boardResult, scarcityResult] = await Promise.allSettled([
+      api.getBoard(400),
+      api.getScarcity(),
+    ]);
+
+    // Fetch failures are non-fatal; keep showing the last good value rather
+    // than blanking a panel mid-draft.
+    if (boardResult.status === "fulfilled") setBoard(boardResult.value);
+    if (scarcityResult.status === "fulfilled") setScarcityAnalysis(scarcityResult.value);
   }, []);
 
   /**
@@ -356,6 +388,7 @@ export function useDraft(): DraftHook {
         } else if (msg.type === "reset") {
           setSession(null);
           setBoard(null);
+      setScarcityAnalysis(null);
           setRecommendation(null);
           // History belongs to the draft that just ended — carrying it into a
           // new session would show advice about a different board.
@@ -486,6 +519,7 @@ export function useDraft(): DraftHook {
       // setup modal appear immediately even if the socket is mid-reconnect.
       setSession(null);
       setBoard(null);
+      setScarcityAnalysis(null);
       setRecommendation(null);
       setRecHistory([]);
       setSyncStatus(null);
@@ -634,6 +668,7 @@ export function useDraft(): DraftHook {
   return {
     session,
     board,
+    scarcityAnalysis,
     recommendation,
     recHistory,
     syncStatus,

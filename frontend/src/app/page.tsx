@@ -48,6 +48,7 @@ export default function DraftPage() {
   const {
     session,
     board,
+    scarcityAnalysis,
     recommendation,
     recHistory,
     syncStatus,
@@ -290,6 +291,7 @@ export default function DraftPage() {
           recommendation={recommendation}
           recHistory={recHistory}
           scarcity={scarcity}
+          scarcityAnalysis={scarcityAnalysis}
           isLoading={isLoadingRec}
           isMyTurn={session.is_my_turn}
           onFetch={fetchRecommendation}
@@ -324,6 +326,7 @@ export default function DraftPage() {
             recommendation={recommendation}
             recHistory={recHistory}
             scarcity={scarcity}
+          scarcityAnalysis={scarcityAnalysis}
             isLoading={isLoadingRec}
             isMyTurn={session.is_my_turn}
             onFetch={fetchRecommendation}
