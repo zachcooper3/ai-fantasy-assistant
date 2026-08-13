@@ -124,45 +124,54 @@ App runs at `http://localhost:3000`
 
 ### Refresh everything (recommended)
 
-One command runs every data source in dependency order:
+One command runs every data source in dependency order — **except ADP**, which is
+excluded on purpose (see below):
 
 ```bash
-py -m backend.ingestion.refresh              # everything free
+py -m backend.ingestion.refresh              # everything free, ADP untouched
 py -m backend.ingestion.refresh --with-ai    # + the two Claude synthesis steps
 ```
 
-The split is deliberate. Six of the eight steps hit free public sources and can be
-re-run as often as you like; the two synthesis steps call the Claude API once per
-player and cost real money, so they never run unless you ask for them by name.
-During draft week the free refresh is the one you want daily — ADP and injuries move,
+The split is deliberate. Of the seven steps this runs, five hit free public sources
+and can be re-run as often as you like; the two synthesis steps call the Claude API
+once per player and cost real money, so they never run unless you ask for them by
+name. During draft week the free refresh is the one you want daily — injuries move,
 synthesis output doesn't change much day to day.
 
-Order matters and the steps are not independent — `fetch_adp` truncates and reloads
-the whole `Player` table, so anything run against a stale player table produces
-silently mismatched data rather than an error:
+Order matters and the steps are not independent — they all key off the `Player` table
+however it currently stands:
 
 ```
-adp → ids → metrics ─┬→ synthesis   [Claude]
-              draft ─┴→ college
-              news  ──→ rookies     [Claude]
+ids ─┬→ metrics ─┬→ synthesis   [Claude]
+     │    draft ─┴→ college
+     └→ news  ──────→ rookies   [Claude]
 ```
 
-`adp` and `ids` are critical: if either fails the run stops, because continuing would
-just write mismatched rows on top of a broken foundation. Everything else is
-best-effort and the run continues without it. Other options:
+`ids` is critical: if it fails the run stops, because everything else keys off the
+sleeper_id crosswalk it produces, and continuing would just write mismatched rows on
+top of a broken foundation. Everything else is best-effort and the run continues
+without it. Other options:
 
 ```bash
 py -m backend.ingestion.refresh --dry-run              # print the plan, run nothing
 py -m backend.ingestion.refresh --only metrics news    # re-run specific steps
+py -m backend.ingestion.refresh --only adp             # ADP, by explicit name only
 ```
 
 The summary at the end prints the exact retry command for anything that failed.
 
-### Refreshing one source at a time
+### ADP is manual, on purpose
 
-ADP data is fetched automatically from [FantasyFootballCalculator](https://fantasyfootballcalculator.com) on startup if the local CSV is older than 7 days. No manual action needed in most cases.
+ADP used to auto-refresh from FantasyFootballCalculator whenever the local CSV looked
+stale — on every app startup, and as the first step of `refresh`. As of 2026-08-13 it
+does neither: `data/raw/fantasypros_adp.csv` only changes when you explicitly ask for
+it, because ADP is the one source people hand-curate (dropping in a real FantasyPros
+export, see below), and having "refresh everything" or "restart the server" silently
+overwrite that choice defeated the point of curating it. The startup banner still
+prints how old the on-disk data is — a stale file is visible, it's just never silently
+fixed for you.
 
-To force a manual refresh at any time:
+To pull fresh PPR ADP from FantasyFootballCalculator:
 
 ```bash
 py -m backend.ingestion.fetch_adp
@@ -182,21 +191,19 @@ py -m backend.ingestion.fetch_adp --no-ingest   # write CSV only, skip DB reload
 
 **Note:** FantasyFootballCalculator typically publishes data starting in July/August once community drafts begin. Running before then will show a warning and keep existing data.
 
-If you have a FantasyPros CSV you'd prefer to use instead, drop it into `data/raw/fantasypros_adp.csv` and run:
+If you'd rather use a real FantasyPros export (`fantasypros.com/nfl/adp/overall.php` →
+Export to CSV), it needs converting first — the raw export packs name/team/bye into one
+column and formats defenses differently, which `ingest_players.py` doesn't parse on its own:
 
 ```bash
-py -m backend.ingestion.ingest_players
-py -m backend.ingestion.sync_sleeper_ids
-py -m backend.db.metrics_repo
+py -m backend.ingestion.convert_fantasypros_export "FantasyPros_2026_Overall_ADP_Rankings.csv"
+py -m backend.ingestion.reingest
 ```
 
-(Three steps here, not one — `ingest_players` alone doesn't know to re-sync Sleeper IDs or
-relink PlayerMetrics the way `fetch_adp` does, since it's also used standalone for CSVs that
-have nothing to do with Sleeper. The third step only matters if you've already run
-`fetch_metrics`/`fetch_synthesis` — skip it on a fresh setup with no metrics yet. Don't skip it
-on a repeat run, though: `ingest_players` reassigns every player's internal ID on each reload,
-which silently detaches any existing PlayerMetrics rows from the right player until this step
-re-links them.)
+The first command writes a converted `data/raw/fantasypros_adp.csv`; the second loads it
+and re-syncs/relinks everything that depends on the `Player` table (Sleeper IDs,
+PlayerMetrics, DraftProfile) — the same four steps `fetch_adp` runs after its own fetch,
+just without fetching anything first.
 
 ---
 

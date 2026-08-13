@@ -16,12 +16,17 @@ import os
 # Configured once, here, before any other backend module is imported. This
 # is the single source of truth for logging format across the whole running
 # app — previously, backend/ingestion/sync_sleeper_ids.py called
-# logging.basicConfig() itself at import time, and since it's now imported
-# transitively (fetch_adp.auto_refresh() -> sync_sleeper_ids) during every
-# startup, whichever module happened to import first was silently deciding
-# the log format for every logger in the process. See sync_sleeper_ids.py
-# for the other half of this fix (its basicConfig call moved into its own
-# `if __name__ == "__main__"` guard so it only applies when run standalone).
+# logging.basicConfig() itself at import time, and since it was imported
+# transitively (fetch_adp.auto_refresh() -> sync_sleeper_ids, back when
+# startup called that automatically — see the 2026-08-13 removal below) at
+# whatever point the chain happened to fire, whichever module imported first
+# was silently deciding the log format for every logger in the process.
+# refresh.py's subprocess-per-step design routes around this same class of
+# problem a different way, but sync_sleeper_ids can still be imported
+# directly (reingest.py, manual runs), so this guard stays. See
+# sync_sleeper_ids.py for the other half of this fix (its basicConfig call
+# moved into its own `if __name__ == "__main__"` guard so it only applies
+# when run standalone).
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 from contextlib import asynccontextmanager
@@ -42,7 +47,7 @@ from backend.app.services.ai_service import AIService
 from backend.app.services.draft_sync import DraftSyncService
 from backend.app.services import sleeper_client
 from backend.app.api import players, draft, websocket, recommendations, sync, sleeper
-from backend.ingestion.fetch_adp import auto_refresh as _refresh_adp, adp_age_str, OUT_PATH
+from backend.ingestion.fetch_adp import adp_age_str, OUT_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -81,21 +86,20 @@ async def lifespan(app: FastAPI):
     # Startup: create DB tables and attach services to app state
     create_db_and_tables()
 
-    # Check for a persisted draft session BEFORE the ADP auto-refresh.
-    # If one exists, this boot is (or may be) a mid-draft restart, and the
-    # refresh must be skipped: ingest_csv() does a full delete-and-reinsert
-    # of Player, which reassigns every Player.id out from under the
-    # journaled picks and resets is_available on the whole board. Two-day-
-    # old ADP is a far smaller cost than a corrupted live draft.
+    # ADP no longer auto-refreshes on startup (removed 2026-08-13). It used
+    # to silently re-fetch from FantasyFootballCalculator whenever the CSV
+    # looked stale — which meant a manually-curated ADP source (e.g. a
+    # FantasyPros export dropped in by hand, see convert_fantasypros_
+    # export.py) would get quietly overwritten on the next non-mid-draft
+    # restart with no visible sign it had happened. data/raw/fantasypros_
+    # adp.csv now only changes when you explicitly run `py -m backend.
+    # ingestion.fetch_adp` yourself, or `--only adp` via refresh.py, which
+    # excludes it from the default "refresh everything" plan for the same
+    # reason. The banner below still reports how old the on-disk data is,
+    # so a stale file is visible, just never silently fixed for you.
     with Session(engine) as db:
         persisted = draft_session_repo.load_state(db)
         persisted_model = draft_session_repo.get_ai_model(db)
-
-    if persisted is None:
-        # Auto-refresh ADP data if the CSV is older than the threshold
-        await _refresh_adp()
-    else:
-        print("Persisted draft session found — skipping ADP auto-refresh (mid-draft restart).")
 
     draft_service = DraftStateService()
     connection_manager = ConnectionManager()

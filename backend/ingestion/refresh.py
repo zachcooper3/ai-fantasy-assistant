@@ -1,37 +1,40 @@
 """
 One command to refresh every data source this app draws on, in dependency
-order.
+order — EXCEPT the ADP/Player-table source itself, which this deliberately
+leaves alone.
 
-    py -m backend.ingestion.refresh              # everything free
+    py -m backend.ingestion.refresh              # everything free, ADP untouched
     py -m backend.ingestion.refresh --with-ai    # + the two Claude synthesis steps
+    py -m backend.ingestion.refresh --only adp   # ADP only, by explicit name
 
-The split is deliberate. Six of the eight steps hit free public data sources
-and can be re-run as often as you like; the two synthesis steps call the
-Claude API once per player and cost real money, so they never run unless you
-ask for them by name. During draft week the free refresh is the one you want
-daily — ADP moves, injuries move, and neither synthesis step's output changes
-much day to day.
+`adp` (fetch_adp.py, FantasyFootballCalculator) is excluded from the default
+plan as of 2026-08-13: ADP is the one source people hand-curate (e.g. a
+FantasyPros export converted via convert_fantasypros_export.py and dropped
+into data/raw/fantasypros_adp.csv), and a script advertised as "refresh
+everything" silently clobbering that choice on every run defeats the point
+of curating it. `--only adp` still runs it — asking for a step by name is
+unambiguous consent — it's just no longer bundled into the thing you run
+out of habit. Everything else here still refreshes freely; none of it
+touches data/raw/fantasypros_adp.csv or re-ingests Player.
 
-Ordering is not arbitrary and the steps are not independent:
+The split on --with-ai is separately deliberate. Of the seven steps below,
+five hit free public data sources and can be re-run as often as you like;
+the two synthesis steps call the Claude API once per player and cost real
+money, so they never run unless you ask for them by name. During draft week
+the free refresh is the one you want daily — injuries move, synthesis
+output doesn't change much day to day.
 
-    fetch_adp ............... rewrites the Player table wholesale
-      -> sync_sleeper_ids ... needs those rows to attach sleeper_ids to
-        -> fetch_metrics .... matches players by sleeper_id
-        -> fetch_draft_profiles
-          -> fetch_college_stats ... only enriches existing DraftProfile rows
-        -> chunker .......... needs sleeper_ids to key chunks by
-          -> fetch_synthesis ......... reads PlayerMetrics   [Claude]
-          -> fetch_rookie_synthesis .. reads DraftProfile    [Claude]
+Ordering is not arbitrary and the steps are not independent — they all key
+off the Player table `adp` last wrote, whenever that was:
 
-Because fetch_adp truncates and reloads Player, running anything downstream
-of it against a stale player table produces silently mismatched data rather
-than an error — which is exactly the kind of failure this script exists to
-make impossible to cause by hand.
+    ids ─┬→ metrics ─┬→ synthesis   [Claude]
+         │    draft ─┴→ college
+         └→ news  ──────→ rookies   [Claude]
 
-Failure policy mirrors the rest of the app: a step that only enriches the
-prompt is best-effort and the run continues without it, but a step everything
-downstream depends on stops the run, because continuing would just write
-mismatched rows on top of a broken foundation.
+`ids` is critical: if it fails the run stops, because everything else keys
+off the sleeper_id crosswalk it produces, and continuing would just write
+mismatched rows on top of a broken foundation. Everything else is
+best-effort and the run continues without it.
 
 Author: Zach Cooper
 """
@@ -55,15 +58,23 @@ class Step:
     label: str          # what it actually does, for the log
     critical: bool      # does the rest of the run depend on this succeeding?
     uses_claude: bool
+    # True for steps that must be named explicitly via --only to run at all
+    # — excluded from both the default and --with-ai plans. Currently just
+    # `adp`: it overwrites a file people hand-curate (see module docstring),
+    # so "refresh everything" must not include it by default, only on request.
+    manual_only: bool = False
     args: tuple[str, ...] = ()
 
 
 # fetch_adp is listed instead of ingest_players because it re-ingests the
 # database itself after writing the CSV (see its docstring) — running both
-# would just do the same import twice.
+# would just do the same import twice. It's manual_only (see Step above) —
+# present here so `--only adp` still works, absent from every other plan.
 _STEPS: list[Step] = [
     Step("adp", "backend.ingestion.fetch_adp",
-         "Fresh PPR ADP + reload of the Player table", critical=True, uses_claude=False),
+         "Fresh PPR ADP + reload of the Player table (excluded from the "
+         "default plan — run by name: --only adp)",
+         critical=True, uses_claude=False, manual_only=True),
     Step("ids", "backend.ingestion.sync_sleeper_ids",
          "Sleeper ID crosswalk (everything below keys off this)",
          critical=True, uses_claude=False),
@@ -84,7 +95,6 @@ _STEPS: list[Step] = [
 
 
 def _plan(with_ai: bool, only: list[str] | None) -> list[Step]:
-    steps = _STEPS if with_ai else [s for s in _STEPS if not s.uses_claude]
     if only:
         wanted = {n.lower() for n in only}
         unknown = wanted - {s.name for s in _STEPS}
@@ -93,10 +103,14 @@ def _plan(with_ai: bool, only: list[str] | None) -> list[Step]:
                 f"Unknown step(s): {', '.join(sorted(unknown))}. "
                 f"Valid: {', '.join(s.name for s in _STEPS)}"
             )
-        # Filter the full list, not `steps`, so `--only synthesis` works
-        # without also needing --with-ai. Asking for a step by name is
-        # unambiguous consent to run it.
-        steps = [s for s in _STEPS if s.name in wanted]
+        # Filter the full list, not the default/--with-ai plan, so `--only
+        # synthesis` works without also needing --with-ai, and `--only adp`
+        # works despite `adp` being manual_only. Asking for a step by name
+        # is unambiguous consent to run it, Claude cost and all.
+        return [s for s in _STEPS if s.name in wanted]
+    steps = [s for s in _STEPS if not s.manual_only]
+    if not with_ai:
+        steps = [s for s in steps if not s.uses_claude]
     return steps
 
 

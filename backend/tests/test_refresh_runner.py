@@ -42,12 +42,27 @@ def test_with_ai_includes_the_claude_steps_last():
 
 def test_dependency_order_is_preserved():
     names = [s.name for s in _plan(with_ai=True, only=None)]
-    # fetch_adp truncates and reloads Player; everything keys off sleeper_ids.
-    assert names.index("adp") == 0
+    # ids is first among what actually runs by default — everything below
+    # keys off the sleeper_id crosswalk it produces.
+    assert names.index("ids") == 0
     assert names.index("ids") < names.index("metrics")
     assert names.index("ids") < names.index("news")
     # fetch_college_stats only enriches rows fetch_draft_profiles created.
     assert names.index("draft") < names.index("college")
+
+
+def test_adp_is_excluded_from_the_default_and_with_ai_plans():
+    # adp overwrites a file people hand-curate (e.g. a FantasyPros export) —
+    # "refresh everything" must not silently clobber that. See refresh.py's
+    # module docstring, 2026-08-13.
+    assert "adp" not in [s.name for s in _plan(with_ai=False, only=None)]
+    assert "adp" not in [s.name for s in _plan(with_ai=True, only=None)]
+
+
+def test_adp_still_runs_when_named_explicitly():
+    # Asking for it by name is unambiguous consent — manual_only means
+    # "never by default," not "never."
+    assert [s.name for s in _plan(with_ai=False, only=["adp"])] == ["adp"]
 
 
 def test_only_runs_the_named_steps():
