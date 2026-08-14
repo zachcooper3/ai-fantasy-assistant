@@ -21,6 +21,7 @@ import {
   SyncStatus,
   WsEvent,
 } from "@/lib/api";
+import { shouldAutoRecommend } from "@/lib/draft";
 import { isUndraftable } from "@/lib/injury";
 
 // Browsers can't set an Authorization header on a WebSocket handshake, so
@@ -52,18 +53,10 @@ function sameSyncStatus(a: SyncStatus | null, b: SyncStatus | null): boolean {
 /** How many past recommendations to keep for review. */
 const REC_HISTORY_LIMIT = 3;
 
-/**
- * Auto-fetch the recommendation once you're this many picks away.
- *
- * One, deliberately. Each fire is a paid Claude call, and because the
- * recommendation is invalidated by every pick, a threshold of N fires roughly
- * N+1 times per turn. At 1 that means: once while the team ahead of you is
- * picking (so there's something on screen immediately), then once more when
- * you're actually on the clock — which is the one that reflects the real board
- * and is safe to draft from. At 2 it was three calls a turn, most of them
- * describing a board that no longer existed by the time you looked.
- */
-const REC_PREFETCH_WITHIN_PICKS = 1;
+// The auto-recommend trigger (threshold, guards, rationale) lives in
+// lib/draft.ts as shouldAutoRecommend — a pure predicate, so it's covered by
+// the existing node-environment vitest setup rather than needing a hook
+// harness. See REC_AUTO_WITHIN_PICKS there for why it's on-the-clock only.
 
 /** localStorage key for the auto-recommend preference. */
 const AUTO_RECOMMEND_KEY = "fda:auto-recommend";
@@ -638,29 +631,31 @@ export function useDraft(): DraftHook {
   }, [session?.is_active]);
 
   /**
-   * Fetch the recommendation ahead of your turn instead of on a click.
+   * Fetch the recommendation automatically when you reach the clock, instead
+   * of on a click.
    *
-   * A recommendation takes several seconds (Claude call plus retrieval), and
-   * asking for one only when you're already on the clock spends that time out
-   * of your pick window. Firing it a couple of picks early means the advice is
-   * usually on screen by the time it's your turn.
-   *
-   * Fires at most once per pick number: `prefetchedForPick` is what stops the
-   * effect from re-requesting every time the board or session object changes
-   * identity.
+   * The decision itself is shouldAutoRecommend in lib/draft.ts — see there for
+   * why each guard exists and why the window is on-the-clock only. This effect
+   * is just the wiring: ask, then record which pick was asked for so the
+   * re-renders that follow don't ask again.
    */
-  const prefetchedForPick = useRef<number | null>(null);
+  const requestedForPick = useRef<number | null>(null);
 
   useEffect(() => {
-    // Parked until the stored preference has been read — otherwise a saved
-    // "off" would still let one automatic call through on every page load.
-    if (!prefsLoaded || !autoRecommend) return;
-    if (!session?.is_active || session.draft_complete) return;
-    if (session.picks_until_my_turn > REC_PREFETCH_WITHIN_PICKS) return;
-    if (prefetchedForPick.current === session.current_pick_number) return;
-    if (recommendation || isLoadingRec) return;
+    if (
+      !shouldAutoRecommend({
+        prefsLoaded,
+        autoRecommend,
+        session,
+        requestedForPick: requestedForPick.current,
+        hasRecommendation: Boolean(recommendation),
+        isLoading: isLoadingRec,
+      })
+    ) {
+      return;
+    }
 
-    prefetchedForPick.current = session.current_pick_number;
+    requestedForPick.current = session!.current_pick_number;
     fetchRecommendation();
   }, [
     prefsLoaded,

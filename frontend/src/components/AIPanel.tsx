@@ -630,7 +630,7 @@ export default function AIPanel({
               disabled={draftComplete}
               title={
                 autoRecommend
-                  ? "Auto-recommend on — fetches as your turn comes up"
+                  ? "Auto-recommend on — fetches once you're on the clock"
                   : "Auto-recommend off — fetch manually with Get pick or g"
               }
               className={`flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-medium border transition-colors disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${

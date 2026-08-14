@@ -138,6 +138,72 @@ export function draftedCountsByPosition(session: DraftState): Record<string, num
   return counts;
 }
 
+/**
+ * How many picks out the automatic recommendation fires.
+ *
+ * Zero: on the clock only. Each fire is a paid Claude call, and every pick
+ * invalidates the current recommendation, so a threshold of N fires roughly
+ * N+1 times per turn. At 1 this fired twice — once while the team ahead of you
+ * was picking, then again once you were actually on the clock — and only the
+ * second described the board you were drafting from. The first was discarded
+ * by the same pick that made it worth having.
+ *
+ * The cost of 0 is that the Claude call happens inside your pick window rather
+ * than ahead of it. That's the deliberate trade: one call per turn, always
+ * against the real board.
+ *
+ * If the wait ever needs hiding, keep the previous recommendation on screen
+ * while the new one loads rather than fetching earlier — that costs nothing
+ * and doesn't present stale advice as current.
+ */
+export const REC_AUTO_WITHIN_PICKS = 0;
+
+export interface AutoRecommendInputs {
+  /** Has the stored auto-recommend preference been read from localStorage? */
+  prefsLoaded: boolean;
+  /** The user's auto-recommend preference. */
+  autoRecommend: boolean;
+  session: DraftState | null;
+  /** Pick number an automatic request has already been made for, if any. */
+  requestedForPick: number | null;
+  /** Is a recommendation already on screen? */
+  hasRecommendation: boolean;
+  /** Is a request already in flight? */
+  isLoading: boolean;
+}
+
+/**
+ * Whether the automatic recommendation should fire right now.
+ *
+ * Extracted from the effect that used to hold it inline so it can be tested
+ * directly — the frontend's vitest setup runs in a node environment with no
+ * jsdom or React testing library, so a predicate is testable where a hook is
+ * not. Every guard here is load-bearing and each one has cost money or shown
+ * wrong advice at some point:
+ *
+ *  - `prefsLoaded` — without it a saved "off" still let one automatic call
+ *    through on every page load, before the preference had been read.
+ *  - `requestedForPick` — the effect re-runs whenever the session or board
+ *    object changes identity, which is often; this pins it to once per pick.
+ *  - `hasRecommendation` / `isLoading` — stops a second request stacking on
+ *    top of advice that's already there or already coming.
+ */
+export function shouldAutoRecommend({
+  prefsLoaded,
+  autoRecommend,
+  session,
+  requestedForPick,
+  hasRecommendation,
+  isLoading,
+}: AutoRecommendInputs): boolean {
+  if (!prefsLoaded || !autoRecommend) return false;
+  if (!session?.is_active || session.draft_complete) return false;
+  if (session.picks_until_my_turn > REC_AUTO_WITHIN_PICKS) return false;
+  if (requestedForPick === session.current_pick_number) return false;
+  if (hasRecommendation || isLoading) return false;
+  return true;
+}
+
 export function rosterSlots(session: DraftState): string[] {
   const starters: string[] = [
     ...Array<string>(session.qb_slots).fill("QB"),
