@@ -60,26 +60,32 @@ if __name__ == "__main__" and __package__ in (None, ""):
 from backend.app.services.ai_service import build_anthropic_client
 from backend.db.database import engine
 from backend.db.models import DraftProfile, Player, PlayerMetrics
+from backend.ingestion.fetch_draft_profiles import _current_draft_year
 from backend.ingestion.fetch_synthesis import SYNTHESIS_MODEL, _fmt
 
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
     "You are an expert NFL fantasy football analyst. You will be given one "
-    "rookie or recently-drafted player's known pre-NFL facts — draft "
-    "capital (round/pick/team) and/or final college season production — "
-    "and NOTHING else. You do not have outside knowledge about this "
-    "player's landing-spot depth chart, coaching staff, offensive scheme, "
-    "or current NFL role beyond what's in this data block, and must not "
-    "state or imply any such fact unless it's explicitly present in the "
-    "data given to you. "
-    "Write a concise 2-4 sentence scouting note synthesizing what this "
-    "data suggests for a fantasy manager evaluating this player as a "
-    "rookie prospect — make clear this is a pre-NFL projection, not a "
-    "recap of established NFL production. Reference specific numbers "
-    "you're given where useful: draft capital (round/pick) is one of the "
-    "strongest predictors of a rookie's eventual role, and college "
-    "production is the closest thing to a track record this player has. "
+    "player's known pre-NFL facts — draft capital (round/pick/team) and/or "
+    "final college season production — and NOTHING else. You do not have "
+    "outside knowledge about this player's landing-spot depth chart, "
+    "coaching staff, offensive scheme, or current NFL role beyond what's in "
+    "this data block, and must not state or imply any such fact unless it's "
+    "explicitly present in the data given to you. "
+    "The data block opens with a Status line. READ IT FIRST and let it "
+    "decide your framing. Only a player whose Status line says 'incoming "
+    "rookie' may be described as a rookie or as having never played; for "
+    "anyone else the Status line will tell you they were drafted in an "
+    "earlier year and simply have no NFL production on file, which is NOT "
+    "the same thing as being new to the league. Never call a player a "
+    "rookie, a prospect, or 'unproven at the NFL level' unless the Status "
+    "line supports it. "
+    "Write a concise 2-4 sentence scouting note synthesizing what this data "
+    "suggests for a fantasy manager. Reference specific numbers you're "
+    "given where useful: draft capital (round/pick) is one of the strongest "
+    "predictors of a player's eventual role, and college production is the "
+    "closest thing to a track record present in this data. "
     "If only draft capital is given, evaluate on that alone rather than "
     "guessing at production; if only college production is given (no "
     "draft capital resolved), evaluate on that alone instead. "
@@ -96,12 +102,48 @@ _SYSTEM_PROMPT = (
 # Prompt construction
 # ---------------------------------------------------------------------------
 
+def _status_line(dp: DraftProfile, current_class: int | None = None) -> str:
+    """One sentence telling Claude whether this player is actually new to
+    the league, so it can't infer that from the mere presence of college
+    stats.
+
+    This module selects players who have a DraftProfile but no
+    PlayerMetrics row. That was a clean proxy for "rookie" while
+    fetch_draft_profiles only pulled two classes. It stopped being one when
+    that widened to four (2026-08-14), which deliberately added players
+    whose problem is no RECENT season rather than no season at all —
+    Jonathon Brooks and MarShawn Lloyd, who have missed nearly their whole
+    careers injured, and Tank Dell, a third-year receiver with a productive
+    2023 behind him. Fourteen players got notes calling them rookie
+    prospects; for Dell that's simply false.
+
+    The selection is still right — these players genuinely have no usage
+    data to reason from, which is why they're here. Only the framing was
+    wrong, so state the fact rather than narrow the query.
+    """
+    current_class = current_class or _current_draft_year()
+    if dp.draft_year >= current_class:
+        return (
+            f"Status: incoming rookie, drafted {dp.draft_year} — has not yet "
+            f"played an NFL season."
+        )
+    seasons = current_class - dp.draft_year
+    return (
+        f"Status: drafted {dp.draft_year}, {seasons} season(s) ago — NOT a rookie. "
+        f"No NFL production is on file for him in the most recent season "
+        f"(injury, inactive, or a role too small to register), so only his "
+        f"pre-NFL facts are available below. Do not describe him as new to "
+        f"the league or as never having played."
+    )
+
+
 def format_draft_profile_prompt(player: Player, dp: DraftProfile) -> str:
     """Builds the per-player data block Claude synthesizes from. Only
     non-None fields are included — an absent fact should never be silently
     rendered as 0/"unknown" and treated as a real signal."""
     lines = [
         f"Player: {player.name} ({player.position})",
+        _status_line(dp),
         "",
     ]
 
