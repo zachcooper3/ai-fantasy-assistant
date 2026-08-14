@@ -286,6 +286,47 @@ def _fantasy_points_ppr(row: dict) -> float:
 # genuine receiving role clears it easily.
 _MIN_AIR_YARDS_FOR_RACR = 50.0
 
+# RACR is a receiver metric and is only computed for receivers.
+#
+# A floor on the denominator turned out not to be enough. A running back can
+# accumulate 50+ season air yards while still catching essentially everything
+# at or behind the line of scrimmage, because air yards on screens are
+# negative and partially cancel the downfield ones — leaving a tiny positive
+# total under a large receiving-yard numerator. Confirmed live on the 2025
+# data AFTER the floor was already in place: all 7 RBs who cleared it had
+# implausible values, and they were the highest-ADP backs on the board —
+# Gibbs 11.41, Robinson 8.12, Cook 5.20, McCaffrey 2.76, against a real-world
+# range of roughly 0.5-1.5.
+#
+# The floor was treating this as a sample-size problem. It isn't: RACR is
+# undefined for a usage pattern built on targets at or behind the line, no
+# matter how many of them there are. So gate on position, which is what the
+# stat actually depends on.
+_RACR_POSITIONS = {"WR", "TE"}
+
+# Even within WR/TE, a ratio this high means the air-yards denominator is
+# broken rather than that the player is extraordinary — a receiver cannot
+# generate three times his air yards over a full season. Catches the 8
+# remaining implausible WR/TE values (Greg Dortch 3.55 and friends), all of
+# them low-volume players whose denominators are small enough to be noise.
+_MAX_PLAUSIBLE_RACR = 3.0
+
+
+def _racr(sum_rec_yards: float, sum_air_yards: float, position: str | None) -> float | None:
+    """Receiving yards / air yards, or None when that ratio isn't meaningful.
+
+    None means "not a meaningful stat for this player," which the prompt
+    already renders as absence rather than as zero — so a suppressed RACR
+    costs nothing, while a wrong one is a number Claude will happily reason
+    from out loud.
+    """
+    if position is not None and position.upper() not in _RACR_POSITIONS:
+        return None
+    if sum_air_yards < _MIN_AIR_YARDS_FOR_RACR:
+        return None
+    value = sum_rec_yards / sum_air_yards
+    return value if value <= _MAX_PLAUSIBLE_RACR else None
+
 
 def _team_week_totals(stats_rows: list[dict]) -> dict[tuple[str, int], dict[str, float]]:
     """
@@ -349,6 +390,7 @@ def _team_totals_for(
 def _compute_opportunity_efficiency(
     weeks: list[dict],
     team_totals: dict[tuple[str, int], dict[str, float]] | None = None,
+    position: str | None = None,
 ) -> dict:
     games = len(weeks)
     if games == 0:
@@ -375,25 +417,10 @@ def _compute_opportunity_efficiency(
         "yards_per_target": (sum_rec_yards / sum_targets) if sum_targets else None,
         "yards_per_carry": (sum(rush_yards) / sum_carries) if sum_carries else None,
         "yac_per_reception": (sum(yac) / sum(receptions)) if sum(receptions) else None,
-        # RACR (receiving yards / air yards) is a WR/TE metric and is
-        # undefined for players whose targets come at or behind the line of
-        # scrimmage. Running backs catch screens, checkdowns and dumpoffs,
-        # whose depth of target is negative, so their season air-yard total
-        # is often negative or a handful of yards — which turned this
-        # division into nonsense for 50 of 57 RBs in the DB (TreVeyon
-        # Henderson: 221 receiving yards on -1.0 air yards = RACR -221).
-        #
-        # The old guard only rejected exactly 0. Requiring a meaningful
-        # positive denominator rejects both the negative case and the
-        # tiny-denominator case, where a 1-yard air total inflates RACR by
-        # two orders of magnitude. None means "not a meaningful stat for
-        # this player," which the prompt already renders as absence rather
-        # than as zero.
-        "racr": (
-            (sum_rec_yards / sum_air_yards)
-            if sum_air_yards >= _MIN_AIR_YARDS_FOR_RACR
-            else None
-        ),
+        # RACR (receiving yards / air yards) — see _racr for why this is
+        # gated on position rather than on the size of the denominator, and
+        # for the two rounds of live data that got it there.
+        "racr": _racr(sum_rec_yards, sum_air_yards, position),
         "catch_rate": (sum(receptions) / sum_targets) if sum_targets else None,
         "target_share": (sum_targets / sum_team_targets) if sum_team_targets else None,
         "carry_share": (sum_carries / sum_team_carries) if sum_team_carries else None,
@@ -673,7 +700,9 @@ def refresh_metrics(season: int = CURRENT_YEAR, include_redzone: bool = True) ->
                     max(weeks, key=_order_key), "team", "recent_team", "team_abbr"
                 ),
             }
-            fields.update(_compute_opportunity_efficiency(weeks, team_totals))
+            fields.update(
+                _compute_opportunity_efficiency(weeks, team_totals, player.position)
+            )
             fields.update(_compute_consistency_risk(weeks, injuries_by_player.get(gsis_id, [])))
             fields.update(_compute_forward_looking(weeks, snap_weeks, depth_weeks, team_totals))
 

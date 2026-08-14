@@ -36,6 +36,8 @@ path documented in the README — fetch_adp.py already does this step for you):
 Author: Zach Cooper
 """
 
+from datetime import datetime, timezone
+
 from sqlmodel import Session, select
 
 from backend.db.models import Player, PlayerMetrics
@@ -63,6 +65,13 @@ def upsert_metrics(session: Session, player_id: int, sleeper_id: str | None = No
             setattr(existing, key, value)
         if sleeper_id is not None:
             existing.sleeper_id = sleeper_id
+        # last_updated is a default_factory, which SQLModel evaluates once at
+        # INSERT and never again — so without this line an updated row keeps
+        # the timestamp of the day it was first created. Confirmed live: 170
+        # of 433 rows claimed 2026-07-29 hours after being recomputed, which
+        # is precisely backwards for a field whose only job is to answer "how
+        # fresh is this?".
+        existing.last_updated = datetime.now(timezone.utc)
         session.add(existing)
         session.commit()
         session.refresh(existing)
@@ -231,10 +240,20 @@ def main() -> None:
     """CLI wrapper around relink_player_ids — see module docstring for when
     you need this (anything that reingests Player outside of fetch_adp.py,
     which already calls this automatically)."""
+    import sys
+
     from backend.db.database import engine
 
-    with Session(engine) as session:
-        relinked, orphaned = relink_player_ids(session)
+    try:
+        with Session(engine) as session:
+            relinked, orphaned = relink_player_ids(session)
+    except RelinkAborted as e:
+        # An expected, handled outcome — the guard working is the SUCCESS
+        # case for a broken crosswalk, not a crash. A traceback here reads
+        # as "the tool is broken" when the actual message is "the tool just
+        # saved your metrics table," so print it plainly and exit non-zero.
+        print(f"Relink aborted, nothing deleted: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"PlayerMetrics relink complete: {relinked} relinked, {orphaned} orphaned.")
 
 

@@ -215,19 +215,33 @@ class PlayerMetrics(SQLModel, table=True):
     snap_pct_trend: Optional[float] = None        # same idea, snap share
     depth_chart_trend: Optional[int] = None       # rank change over last 3 wks; negative = moving up
 
-    # NOTE: `is_rookie_or_second_year` was declared here and read in three
-    # places, but no ingestion script ever wrote it — 0 of 185 rows were ever
-    # populated, so every reader silently saw False for everyone, including a
-    # "Rookie or second-year: Yes" line in fetch_synthesis.py's prompt that
-    # could never fire. Experience now comes from DraftProfile.draft_year,
-    # which IS populated and has exactly one source of truth (see
-    # ai_service._format_metrics_section).
+    # VESTIGIAL — write nothing here, read nothing from here.
     #
-    # Dropped from the model rather than backfilled, but NOT dropped from
-    # existing databases: migrations.py is additive-only on purpose (see its
-    # docstring), and an unmapped leftover column is inert — SQLAlchemy names
-    # the columns it selects, so it's simply never read. Fresh databases
-    # won't have it at all.
+    # No ingestion script ever populated this: 0 of 185 rows were ever True,
+    # so every reader silently saw False for everyone, including a "Rookie or
+    # second-year: Yes" line in fetch_synthesis.py's prompt that could never
+    # fire. All those readers are gone as of 2026-08-13. Experience now comes
+    # from DraftProfile.draft_year, which IS populated and gives the fact
+    # exactly one source of truth (see ai_service._format_metrics_section).
+    #
+    # The FIELD stays only to keep INSERTs working against databases created
+    # before that date. Removing it from the model looked safe — SQLAlchemy
+    # names the columns it selects, so an unmapped column is never read — but
+    # that reasoning only covers SELECT and UPDATE. This column is
+    # `BOOLEAN NOT NULL` with the default living in Python rather than in
+    # SQL (`dflt_value=None`), so an INSERT that doesn't name it violates the
+    # constraint. Confirmed live: fetch_metrics crashed on the first NEW
+    # PlayerMetrics row with "NOT NULL constraint failed". Existing rows
+    # updated fine, which is exactly why it wasn't caught sooner — and why
+    # the test suite missed it too, since tests build fresh tables from the
+    # current model and never see the legacy schema.
+    #
+    # Safe to delete for real once every database has been migrated:
+    #   ALTER TABLE playermetrics DROP COLUMN is_rookie_or_second_year;
+    # (SQLite 3.35+, so it needs a real migration step rather than a model
+    # edit — migrations.py is additive-only by design. Not worth doing
+    # mid-season; it buys nothing but tidiness.)
+    is_rookie_or_second_year: bool = False
 
     # --- Metadata ---
     source: str = Field(default="nflreadpy")

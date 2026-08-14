@@ -18,6 +18,8 @@ Player reingest):
 Author: Zach Cooper
 """
 
+from datetime import datetime, timezone
+
 from sqlmodel import Session, select
 
 from backend.db.metrics_repo import (
@@ -49,6 +51,11 @@ def upsert_draft_profile(session: Session, player_id: int, sleeper_id: str | Non
             setattr(existing, key, value)
         if sleeper_id is not None:
             existing.sleeper_id = sleeper_id
+        # Same default_factory-only-on-INSERT problem as metrics_repo — and
+        # it matters more here, because two different scripts upsert into
+        # this one row (fetch_draft_profiles, then fetch_college_stats), so
+        # the timestamp should track whichever ran last.
+        existing.last_updated = datetime.now(timezone.utc)
         session.add(existing)
         session.commit()
         session.refresh(existing)
@@ -177,10 +184,18 @@ def main() -> None:
     """CLI wrapper around relink_player_ids — see module docstring for when
     you need this (anything that reingests Player outside of fetch_adp.py,
     which already calls this automatically)."""
+    import sys
+
     from backend.db.database import engine
 
-    with Session(engine) as session:
-        relinked, orphaned = relink_player_ids(session)
+    try:
+        with Session(engine) as session:
+            relinked, orphaned = relink_player_ids(session)
+    except RelinkAborted as e:
+        # See metrics_repo.main — the guard firing is a handled outcome,
+        # not a crash, and should read like one.
+        print(f"Relink aborted, nothing deleted: {e}", file=sys.stderr)
+        sys.exit(1)
     print(f"DraftProfile relink complete: {relinked} relinked, {orphaned} orphaned.")
 
 

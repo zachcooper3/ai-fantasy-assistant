@@ -83,6 +83,30 @@ def _pct(x: float | None) -> str | None:
     return f"{x * 100:.0f}%" if x is not None else None
 
 
+def _round(x: float | None, places: int = 1) -> float | None:
+    """Rounds a metric to the precision it actually carries.
+
+    Every float in PlayerMetrics is a ratio of two season totals, so it
+    arrives with full binary precision: targets_per_game renders as
+    `5.529411764705882` and fantasy_points_avg as `21.582352941176474`.
+    Both problems with that are worth stating, because only one of them is
+    about cost.
+
+    The smaller problem is tokens — roughly 35 per prompt, ~17k across a
+    full synthesis run. Real, but pennies.
+
+    The larger problem is that it's a lie about the data. Twelve
+    significant figures asserts a precision that 17 games of counting stats
+    cannot support, and the model is being asked to reason from it. A
+    per-game average derived from a 17-game sample is a one-decimal
+    quantity; saying so is more honest than padding it with noise.
+
+    Rates that live in a narrow band (RACR, roughly 0.5-1.5) keep two
+    decimals — see the call sites.
+    """
+    return round(x, places) if x is not None else None
+
+
 def _fmt(label: str, value) -> str | None:
     return f"- {label}: {value}" if value is not None else None
 
@@ -99,9 +123,9 @@ def format_metrics_prompt(player: Player, m: PlayerMetrics) -> str:
     ]
 
     opportunity = list(filter(None, [
-        _fmt("Targets/game", m.targets_per_game),
-        _fmt("Carries/game", m.carries_per_game),
-        _fmt("Red zone touches/game", m.red_zone_touches_per_game),
+        _fmt("Targets/game", _round(m.targets_per_game)),
+        _fmt("Carries/game", _round(m.carries_per_game)),
+        _fmt("Red zone touches/game", _round(m.red_zone_touches_per_game)),
         _fmt("Snap %", _pct(m.snap_pct)),
         _fmt("Target share", _pct(m.target_share)),
         _fmt("Carry share", _pct(m.carry_share)),
@@ -110,10 +134,12 @@ def format_metrics_prompt(player: Player, m: PlayerMetrics) -> str:
         lines += ["Opportunity / Volume:"] + opportunity + [""]
 
     efficiency = list(filter(None, [
-        _fmt("Yards/target", m.yards_per_target),
-        _fmt("Yards/carry", m.yards_per_carry),
-        _fmt("YAC/reception", m.yac_per_reception),
-        _fmt("RACR", m.racr),
+        _fmt("Yards/target", _round(m.yards_per_target)),
+        _fmt("Yards/carry", _round(m.yards_per_carry)),
+        _fmt("YAC/reception", _round(m.yac_per_reception)),
+        # Two decimals: RACR lives in roughly 0.5-1.5, so one decimal would
+        # collapse meaningfully different receivers onto the same value.
+        _fmt("RACR", _round(m.racr, 2)),
         _fmt("Catch rate", _pct(m.catch_rate)),
     ]))
     if efficiency:
@@ -127,8 +153,8 @@ def format_metrics_prompt(player: Player, m: PlayerMetrics) -> str:
         lines += ["Team Context:"] + team_context + [""]
 
     consistency = list(filter(None, [
-        _fmt("Fantasy points/game (PPR)", m.fantasy_points_avg),
-        _fmt("Week-to-week std dev (PPR)", m.fantasy_points_stdev),
+        _fmt("Fantasy points/game (PPR)", _round(m.fantasy_points_avg)),
+        _fmt("Week-to-week std dev (PPR)", _round(m.fantasy_points_stdev)),
         _fmt("Weeks on injury report", m.injury_report_appearances or None),
         _fmt("Games missed to injury", m.games_missed or None),
     ]))

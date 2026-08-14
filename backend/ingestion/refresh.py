@@ -90,8 +90,18 @@ _STEPS: list[Step] = [
          critical=True, uses_claude=False),
     Step("metrics", "backend.ingestion.fetch_metrics",
          "Prior-season usage, efficiency, durability", critical=False, uses_claude=False),
+    # --years 4, not the script's own default of 2. Two classes covers the
+    # players who have no NFL season YET, but misses the ones who have no
+    # RECENT NFL season — a 2023/2024 draftee who missed all of 2025 to
+    # injury has no PlayerMetrics row (nflverse has no stats for him) AND no
+    # DraftProfile (his class wasn't pulled), so he renders as a blank line.
+    # Confirmed live 2026-08-14: Jonathon Brooks (ADP 108), Tank Dell (184)
+    # and MarShawn Lloyd (198) all landed in that hole. That's the
+    # injury-return cohort, where ADP is least reliable and grounding matters
+    # most. Four classes costs one extra nflverse pull and nothing else.
     Step("draft", "backend.ingestion.fetch_draft_profiles",
-         "Draft capital for the last two classes", critical=False, uses_claude=False),
+         "Draft capital for the last four classes", critical=False,
+         uses_claude=False, args=("--years", "4")),
     Step("college", "backend.ingestion.fetch_college_stats",
          "Final-college-season production (needs CFBD_API_KEY)",
          critical=False, uses_claude=False),

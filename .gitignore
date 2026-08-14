@@ -1,6 +1,13 @@
 data
-chroma_db/
+# Trailing-slash form matched chroma_db/ but NOT the backup copies taken
+# before a destructive re-ingest (chunker.py prunes chunks, so the standard
+# rollback step is `cp -r chroma_db chroma_db.bak`). That left 9 MB of
+# binary staged as untracked and one `git add .` away from the history.
+chroma_db*/
 *.db
+# Backups of anything, by directory or file — same reasoning.
+*.bak
+*.bak/
 
 # Frontend
 frontend/node_modules/
