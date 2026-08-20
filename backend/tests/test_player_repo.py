@@ -112,3 +112,46 @@ def test_handcuff_excludes_an_injured_backup(db):
     handcuff = repo.get_handcuff(db, player_id=1)
     assert handcuff is not None
     assert handcuff.name == "Healthy Backup"
+
+
+def test_teamless_player_excluded_from_top_available(db):
+    # Live failure (2026-08-20): Tyreek Hill (team="", injury_status stale
+    # at "Questionable") was recommended as `main` in the final round of a
+    # real draft. "Questionable" is deliberately NOT in UNDRAFTABLE_STATUSES
+    # (see test_questionable_and_doubtful_are_not_excluded), so nothing
+    # caught him — team=="" is the real, structured signal that a player is
+    # off every NFL roster, and it was simply never queried.
+    _seed(
+        db,
+        make_player(1, "Healthy WR", "WR", team="KC", adp=10.0),
+        make_player(2, "No Team Guy", "WR", team="", adp=12.0,
+                     injury_status="Questionable"),
+    )
+    names = [p.name for p in repo.get_top_available(db, n=10)]
+    assert "No Team Guy" not in names
+    assert "Healthy WR" in names
+
+
+def test_teamless_player_excluded_from_best_available_by_ppg(db):
+    # The VOR/PPG axis is exactly how a teamless player with a strong prior
+    # season (stale metrics from before he left the league) can look like
+    # great value — this is the axis that actually surfaced Tyreek Hill.
+    from backend.db.models import PlayerMetrics
+
+    teamless = make_player(1, "No Team Stud", "WR", team="", adp=200.0)
+    healthy = make_player(2, "Healthy Value", "WR", team="MIA", adp=60.0)
+    _seed(db, teamless, healthy)
+    db.add(PlayerMetrics(player_id=1, season=2025, through_week=17, games_played=17,
+                          fantasy_points_avg=20.0))
+    db.add(PlayerMetrics(player_id=2, season=2025, through_week=17, games_played=17,
+                          fantasy_points_avg=10.0))
+    db.commit()
+
+    names = [p.name for p in repo.get_best_available_by_ppg(db, n=5)]
+    assert names == ["Healthy Value"]
+
+
+def test_teamless_only_position_reads_as_zero_available(db):
+    _seed(db, make_player(1, "Teamless Kicker", "K", team="", adp=200.0))
+    counts = repo.count_available_by_position(db)
+    assert counts.get("K", 0) == 0

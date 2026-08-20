@@ -30,12 +30,30 @@ def _exclude_undraftable(query):
     suggestion. NULL-safe: `.notin_()` alone would silently drop every row
     where injury_status IS NULL, since SQL's NOT IN evaluates NULL rather
     than true for those rows.
+
+    Also excludes `Player.team == ""` — a player with no current NFL team at
+    all, an even more absolute case than IR (IR at least means rostered and
+    eligible to return this season). Live failure (2026-08-20): Tyreek Hill
+    was recommended as `main` in the final round with `team == ""` and a
+    stale `injury_status == "Questionable"` left over from before he left
+    his last roster — none of the existing UNDRAFTABLE_STATUSES logic
+    catches a teamless player, since "Questionable" is deliberately kept in
+    the pool. Confirmed this isn't a data-sync fluke: 40/601 players in a
+    real snapshot have `team == ""`, and they're real veterans off NFL
+    rosters entirely (Nick Chubb, Ezekiel Elliott, Dalvin Cook, Philip
+    Rivers, Justin Tucker) — a `Player.team` this app's own
+    convert_fantasypros_export.py and fetch_adp.py both deliberately keep
+    as "" rather than guessing one (see that script's Team="" handling), so
+    it's a reliable, already-populated signal that was simply never read
+    here, same class of bug as the original injury_status gap this function
+    exists to fix.
     """
     return query.where(
         or_(
             Player.injury_status.is_(None),  # type: ignore[union-attr]
             Player.injury_status.notin_(UNDRAFTABLE_STATUSES),  # type: ignore[union-attr]
-        )
+        ),
+        Player.team != "",  # type: ignore[union-attr]
     )
 
 
