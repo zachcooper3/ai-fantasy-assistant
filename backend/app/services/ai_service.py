@@ -1353,8 +1353,8 @@ def _shortlist(
     with_vor = [(v, p) for p in board if (v := vor_of(p)) is not None]
     by_vor = [p for _, p in sorted(with_vor, key=lambda t: -t[0])[:2]]
 
-    # Best available at each position, so the shortlist can never collapse
-    # onto one position and hide the choice that matters most.
+    # Best available at each STILL-OPEN position, so the shortlist can never
+    # collapse onto one position and hide the choice that matters most.
     #
     # At a position still missing from the starting lineup, BOTH the
     # cheapest and the most productive are forced in — mirroring
@@ -1363,20 +1363,35 @@ def _shortlist(
     # no required verdict, and the model recommended the cheaper one while
     # asserting he was "the only TE on the board". A player who must be
     # accounted for cannot be waved away as absent.
+    #
+    # Gated on `pos in needed` for BOTH additions, not just the VOR one.
+    # Previously the cheapest-by-ADP line ran unconditionally for every one
+    # of QB/RB/WR/TE regardless of roster state, which force-added the
+    # cheapest available player at an ALREADY-FILLED position into MUST
+    # EVALUATE on every single pick of the draft. Confirmed live: with TE1
+    # already filled (a rookie TE taken three rounds earlier), the cheapest
+    # available TE was still force-required onto the shortlist — with the
+    # prompt telling the model "you must not ignore them" — and the model
+    # ended up taking a fully redundant second TE at a real starting need
+    # (an open FLEX slot) went unaddressed. A genuinely great-value player
+    # at a filled position can still surface through the `by_vor`/`by_adp`
+    # global axes below on his own merit; he just no longer gets force-
+    # required purely for being cheapest at a position already covered.
     needed = set(gaps or {}) | set(due_late_gaps or {})
     per_position: list[dict] = []
     for pos in ("QB", "RB", "WR", "TE", *(due_late_gaps or {})):
+        if pos not in needed:
+            continue
         at_pos = [p for p in board if p["position"] == pos]
         if not at_pos:
             continue
         per_position.append(min(at_pos, key=lambda p: p["adp"]))
-        if pos in needed:
-            scored_pos = [
-                (v, p) for p in at_pos
-                if (v := _vor(p, player_metrics, replacement)) is not None
-            ]
-            if scored_pos:
-                per_position.append(max(scored_pos, key=lambda t: t[0])[1])
+        scored_pos = [
+            (v, p) for p in at_pos
+            if (v := _vor(p, player_metrics, replacement)) is not None
+        ]
+        if scored_pos:
+            per_position.append(max(scored_pos, key=lambda t: t[0])[1])
 
     # Priority order is load-bearing, because the cap truncates. Position
     # representatives go first: quarterbacks and tight ends have late ADP by

@@ -1639,12 +1639,17 @@ def test_shortlist_axes_are_not_secretly_the_same_axis():
 def test_shortlist_spans_positions_on_a_lopsided_board():
     # Without a per-position axis, a board whose top is all receivers yields
     # an all-receiver shortlist and the cross-position call never gets forced.
+    #
+    # gaps={"RB": 1}: the per-position axis is now gated on need (see
+    # test_a_filled_position_is_not_force_included below) — this test is
+    # about a genuinely open RB slot, so it now says so explicitly rather
+    # than relying on the old unconditional behavior.
     board = ([{"id": i, "rank": i, "name": f"W{i}", "position": "WR",
                "team": "X", "adp": float(i), "sleeper_id": None}
               for i in range(1, 9)]
              + [{"id": 20, "rank": 20, "name": "The RB", "position": "RB",
                  "team": "X", "adp": 40.0, "sleeper_id": None}])
-    positions = {p["position"] for p in _shortlist(board, 20, {}, {})}
+    positions = {p["position"] for p in _shortlist(board, 20, {}, {}, {"RB": 1})}
     assert "RB" in positions and "WR" in positions
 
 
@@ -1674,6 +1679,11 @@ def test_cap_never_truncates_the_per_position_representatives():
     # exists to guarantee. Reproduced with four distinct receivers winning
     # both the ADP and VOR axes: RB and TE were cut and the shortlist
     # collapsed back onto one position.
+    #
+    # gaps names QB/RB/TE as open starting slots — the per-position axis is
+    # gated on need (see test_a_filled_position_is_not_force_included), so
+    # this guarantee now applies to positions you're actually still filling,
+    # which is exactly the scenario this test is pinning.
     board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR",
               "team": "X", "adp": float(i), "sleeper_id": None}
              for i in range(1, 9)]
@@ -1688,7 +1698,8 @@ def test_cap_never_truncates_the_per_position_representatives():
     metrics = {5: {"fantasy_points_avg": 40.0}, 6: {"fantasy_points_avg": 39.0},
                1: {"fantasy_points_avg": 12.0}}
     repl = {"WR": 11.9, "RB": 11.1, "QB": 17.5, "TE": 10.6}
-    positions = {p["position"] for p in _shortlist(board, 20, metrics, repl)}
+    gaps = {"QB": 1, "RB": 1, "TE": 1}
+    positions = {p["position"] for p in _shortlist(board, 20, metrics, repl, gaps)}
     assert {"QB", "RB", "TE", "WR"} <= positions
 
 
@@ -2570,13 +2581,23 @@ def test_a_needed_position_forces_verdicts_on_both_the_cheap_and_the_good():
     assert "Cheap TE" in names and "Good TE" in names
 
 
-def test_a_filled_position_only_contributes_its_best_by_adp():
-    # The second entry is reserved for positions you must still fill; adding
-    # it everywhere would crowd the cap and dilute the requirement.
+def test_a_filled_position_is_not_force_included():
+    # Real live bug (2026-08-20): with TE1 already filled (a TE taken three
+    # rounds earlier), the per-position axis's cheapest-by-ADP line ran
+    # UNCONDITIONALLY for every one of QB/RB/WR/TE regardless of roster
+    # state — so the cheapest available TE kept getting force-added to MUST
+    # EVALUATE every single round, with the prompt telling the model "you
+    # must not ignore them." The model ended up drafting a fully redundant
+    # second TE (positive VOR, so not an obviously bad value in isolation)
+    # while a real starting need (an open FLEX slot) went unaddressed.
     #
-    # The receivers carry strong metrics on purpose, so they win the GLOBAL
-    # best-VOR slots. Otherwise "Good TE" enters through that axis instead of
-    # the per-position one and the test proves nothing about either.
+    # Fixed: the cheapest-by-ADP addition is now gated on `pos in needed`,
+    # same as the best-VOR addition beside it. A position you've already
+    # filled no longer gets force-required just for being cheapest there —
+    # a genuinely great-value player can still surface on his own merit via
+    # the global by_vor/by_adp axes (see test_a_needed_position_forces_
+    # verdicts_on_both_the_cheap_and_the_good for the "still needed" case,
+    # which is unchanged).
     board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
               "adp": float(90 + i), "sleeper_id": None} for i in range(1, 21)]
     board += [{"id": 50, "rank": 50, "name": "Cheap TE", "position": "TE",
@@ -2587,12 +2608,38 @@ def test_a_filled_position_only_contributes_its_best_by_adp():
     metrics.update({50: {"fantasy_points_avg": 7.6}, 51: {"fantasy_points_avg": 10.5}})
     repl = {"TE": 10.5, "WR": 11.5}
 
-    # TE not needed -> only the cheapest TE is forced in.
+    # TE not needed -> neither TE is force-included (the WRs' far higher
+    # PPG wins every global axis, so nothing about TE surfaces at all).
     filled = {p["name"] for p in _shortlist(board, 128, metrics, repl, {})}
-    assert "Cheap TE" in filled and "Good TE" not in filled
-    # TE needed -> both, which is the whole point of the change.
+    assert "Cheap TE" not in filled and "Good TE" not in filled
+    # TE needed -> both, unchanged from before this fix.
     needed = {p["name"] for p in _shortlist(board, 128, metrics, repl, {"TE": 1})}
     assert "Cheap TE" in needed and "Good TE" in needed
+
+
+def test_goedert_after_fannin_regression():
+    # Pins the exact live scenario Coop reported (2026-08-20): TE1 already
+    # filled (a TE drafted three rounds earlier), only real gap is an open
+    # FLEX slot, and a decent-value TE (positive VOR) sits on the board.
+    # Before the fix he was force-required into MUST EVALUATE purely for
+    # being cheapest at TE; he must not be, since TE isn't in `needed`.
+    board = [{"id": i, "rank": i, "name": f"WR{i}", "position": "WR", "team": "X",
+              "adp": float(90 + i), "sleeper_id": None} for i in range(1, 10)]
+    board.append({"id": 110, "rank": 110, "name": "Second TE", "position": "TE",
+                   "team": "PHI", "adp": 110.4, "sleeper_id": None})
+    # A couple of WRs carry a better VOR than the TE (mirrors the real board:
+    # Quentin Johnston +2.6, Tyreek Hill +2.8 both beat Goedert's +1.8) so the
+    # TE doesn't accidentally win the global by_vor axis either — this test
+    # isolates the per-position axis specifically.
+    metrics = {i: {"fantasy_points_avg": 12.0} for i in range(1, 10)}
+    metrics[1] = {"fantasy_points_avg": 13.5}
+    metrics[2] = {"fantasy_points_avg": 14.0}
+    metrics[110] = {"fantasy_points_avg": 12.3}
+    repl = {"WR": 11.5, "TE": 10.5}
+
+    # Only FLEX is open — TE is not a gap, so gaps carries no TE key.
+    names = {p["name"] for p in _shortlist(board, 109, metrics, repl, {"FLEX": 1})}
+    assert "Second TE" not in names
 
 
 def test_shortlist_and_board_agree_on_which_players_exist():
