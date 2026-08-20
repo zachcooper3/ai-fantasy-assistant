@@ -1915,28 +1915,57 @@ def _format_positional_dropoff(
         if not at_pos:
             continue
         best = at_pos[0]
-        survivor = next(
-            (p for p in at_pos if _survival(p["adp"], horizon_pick) != _SURVIVAL_GONE),
+        # Confident survivor ONLY — must be the SAFE/"WILL LAST" bucket, not
+        # merely "not yet confirmed GONE". `!= _SURVIVAL_GONE` used to match
+        # here, which silently included TOSSUP/"MIGHT LAST" players too:
+        # confirmed live (2026-08-20) at TE, where Harold Fannin Jr. was his
+        # own "survivor" under that test purely because he wasn't GONE, and
+        # this section told the model "projects to still be there... No cost
+        # to waiting" about a player the Opportunity Cost section — reading
+        # the exact same ADP through the exact same _survival() call — was
+        # simultaneously and correctly labeling "MIGHT LAST — could go
+        # either way." The model quoted the false confident claim nearly
+        # verbatim to justify taking a MIGHT LAST tight end over a TAKE NOW
+        # OR LOSE HIM receiver, which RULE 1 exists specifically to prevent.
+        # See project_cost_of_waiting_inversion_bug.md.
+        safe_survivor = next(
+            (p for p in at_pos if _survival(p["adp"], horizon_pick) == _SURVIVAL_SAFE),
             None,
         )
-        if survivor is None:
+        tossup_survivor = next(
+            (p for p in at_pos if _survival(p["adp"], horizon_pick) == _SURVIVAL_TOSSUP),
+            None,
+        )
+        if safe_survivor is None and tossup_survivor is None:
             lines.append(
                 f"- {pos}: best available {best['name']} (ADP {best['adp']:g}). "
                 f"Every {pos} currently on this board projects to be gone by your "
                 f"next turn — waiting means starting from whatever is left."
             )
-        elif survivor["id"] == best["id"]:
+        elif safe_survivor is not None and safe_survivor["id"] == best["id"]:
             lines.append(
                 f"- {pos}: best available {best['name']} (ADP {best['adp']:g}) — "
                 f"projects to still be there at your next turn. No cost to waiting."
             )
+        elif safe_survivor is None:
+            # Nobody at this position is confidently expected to survive —
+            # including `best` himself, whose own odds are a toss-up. This
+            # is NOT "no cost to waiting": waiting here is a real gamble on
+            # the same player you'd be taking now, not a free option, and
+            # must not read as license to pass him over for a MIGHT LAST
+            # player at another position the way a genuine WILL LAST would.
+            lines.append(
+                f"- {pos}: best available {best['name']} (ADP {best['adp']:g}) — "
+                f"his own survival to your next turn is a toss-up, not a safe bet. "
+                f"Waiting on him is a gamble, not a free option."
+            )
         else:
-            gap = survivor["adp"] - best["adp"]
+            gap = safe_survivor["adp"] - best["adp"]
             # Points where they're known, ADP only as the fallback — a
             # drop-off stated in prior-season PPR ppg is directly comparable
             # to what a roster hole costs, which "46 ADP points" is not.
             best_ppg = _ppg(player_metrics or {}, best)
-            surv_ppg = _ppg(player_metrics or {}, survivor)
+            surv_ppg = _ppg(player_metrics or {}, safe_survivor)
             if best_ppg is not None and surv_ppg is not None:
                 cost = (
                     f"Cost of waiting: {best_ppg - surv_ppg:+.1f} PPR ppg "
@@ -1946,8 +1975,8 @@ def _format_positional_dropoff(
                 cost = f"Cost of waiting: {gap:.0f} ADP points at the position"
             lines.append(
                 f"- {pos}: best available {best['name']} (ADP {best['adp']:g}); best "
-                f"likely to survive to your next turn is {survivor['name']} (ADP "
-                f"{survivor['adp']:g}). {cost}."
+                f"likely to survive to your next turn is {safe_survivor['name']} (ADP "
+                f"{safe_survivor['adp']:g}). {cost}."
             )
 
     if not lines:
@@ -3293,8 +3322,15 @@ def _build_system_prompt(scoring_format: str = "ppr") -> str:
         "who will not survive to your next turn and plan to take the other one later. "
         "The prompt tells you explicitly which players fall in each bucket and what "
         "the drop-off at each position is if you wait; use those numbers rather than "
-        "estimating. Never spend a pick on a player labeled 'WILL LAST' unless he is "
-        "clearly — not marginally — better than everything about to disappear.\n\n"
+        "estimating. Never spend a pick on a player labeled 'WILL LAST' — or 'MIGHT "
+        "LAST' — over a player labeled 'TAKE NOW OR LOSE HIM', unless the one you're "
+        "taking is clearly — not marginally — better than the one about to disappear. "
+        "'MIGHT LAST' means his own survival is a genuine toss-up, not a safe bet: "
+        "treat waiting on him as a real gamble, never as a free option, and never cite "
+        "his chance of surviving as the reason to take him now instead of the TAKE NOW "
+        "player — that reasoning is backwards. If a Cost of Waiting line ever reads as "
+        "confident about a MIGHT LAST player, trust this rule's bucket label over that "
+        "line's wording.\n\n"
 
         "RULE 1a — EVERY LISTED PLAYER IS AVAILABLE. Every name anywhere in this "
         "prompt is on the board and can be drafted with this pick; already-drafted "

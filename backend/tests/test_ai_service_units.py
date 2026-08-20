@@ -2822,20 +2822,56 @@ def test_the_union_is_smaller_than_the_window_it_replaced(monkeypatch):
 
 def test_the_survivor_at_a_position_is_loaded_however_far_out_he_sits(monkeypatch):
     # Cost of waiting compares the best player now against the best one
-    # likely to still be there next turn. That second player is past the
-    # run of the board by definition, so a slate of the cheapest few never
-    # holds him — and without him the prompt says "every RB will be gone",
-    # which is false and tells you nothing about whether to wait.
+    # CONFIDENTLY likely to still be there next turn. That second player is
+    # past the run of the board by definition, so a slate of the cheapest
+    # few never holds him — and without him the prompt says "every RB will
+    # be gone", which is false and tells you nothing about whether to wait.
+    #
+    # Deliberately gives each position one genuinely SAFE deep player (ADP
+    # 250 against horizon 130 — comfortably past the noise band) rather than
+    # merely "not yet confirmed gone". A merely-not-GONE (TOSSUP) survivor is
+    # a different, weaker claim — see
+    # test_cost_of_waiting_does_not_claim_safety_for_a_toss_up_survivor
+    # below, which pins that distinction directly. Conflating the two was
+    # the live bug (2026-08-20): see project_cost_of_waiting_inversion_bug.md.
     from backend.app.api.recommendations import _load_board
     from backend.app.services.ai_service import _format_positional_dropoff
-    pool = ([_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 41)]
-            + [_FakePlayer(200 + i, f"RB{i}", "RB", 95.0 + i * 2) for i in range(20)])
+    pool = ([_FakePlayer(i, f"WR{i}", "WR", 90.0 + i) for i in range(1, 4)]
+            + [_FakePlayer(50, "Deep Safe WR", "WR", 250.0)]
+            + [_FakePlayer(200 + i, f"RB{i}", "RB", 95.0 + i) for i in range(3)]
+            + [_FakePlayer(300, "Deep Safe RB", "RB", 250.0)])
     _fake_pool(monkeypatch, pool)
     horizon = 130
     board = _load_board(None, top_n=30, per_position=6, horizon_pick=horizon)
     text = _format_positional_dropoff(board, horizon)
     assert "projects to be gone" not in text
+    assert "toss-up, not a safe bet" not in text
     assert "Cost of waiting" in text
+    assert "Deep Safe WR" in text and "Deep Safe RB" in text
+
+
+def test_cost_of_waiting_does_not_claim_safety_for_a_toss_up_survivor(monkeypatch):
+    # The actual live bug (2026-08-20, pick 58 of a real draft): Harold
+    # Fannin Jr. (TE, ADP 67.8) was the cheapest AND only non-GONE TE on the
+    # board at horizon 83 — but his own survival bucket was MIGHT LAST (a
+    # toss-up), not WILL LAST. The old `!= _SURVIVAL_GONE` check treated
+    # "not confirmed gone" as "confirmed safe" and told the model "projects
+    # to still be there... No cost to waiting" — directly contradicting the
+    # Opportunity Cost section's own MIGHT LAST label for the exact same
+    # player (computed via the same _survival() call). The model quoted
+    # that false confidence almost verbatim to justify taking Fannin over
+    # Terry McLaurin, a TAKE NOW OR LOSE HIM receiver, which RULE 1 exists
+    # specifically to prevent. See project_cost_of_waiting_inversion_bug.md.
+    from backend.app.api.recommendations import _load_board
+    from backend.app.services.ai_service import _format_positional_dropoff
+    pool = [_FakePlayer(1, "Toss-up TE", "TE", 67.8)]
+    _fake_pool(monkeypatch, pool)
+    horizon = 83
+    board = _load_board(None, top_n=30, per_position=6, horizon_pick=horizon)
+    text = _format_positional_dropoff(board, horizon, positions=("TE",))
+    assert "No cost to waiting" not in text
+    assert "projects to still be there" not in text
+    assert "toss-up, not a safe bet" in text
 
 
 def test_without_a_horizon_no_survivors_are_fetched(monkeypatch):
