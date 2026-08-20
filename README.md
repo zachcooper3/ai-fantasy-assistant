@@ -4,9 +4,7 @@
 
 DraftCopilot runs beside you during a live draft: it tracks every pick in real time (synced straight from Sleeper), keeps a tier-aware big board of who's left, and — when you're on the clock — asks Claude for a recommendation grounded in your actual roster, positional scarcity, real injury news, and computed player metrics. Not a static cheat sheet; a draft room that thinks along with the draft.
 
-<!-- SCREENSHOT: drop a draft-room screenshot here, e.g.
 ![DraftCopilot draft room](docs/screenshot-draft-room.png)
--->
 
 ## What it does
 
