@@ -221,7 +221,7 @@ export default function SetupModal({ onStart, isConnected = true }: Props) {
         className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-700 p-8 shadow-2xl"
       >
         <h1 id="setup-title" className="text-2xl font-bold text-slate-100 mb-1">
-          Fantasy Draft Assistant
+          DraftCopilot
         </h1>
         <p id="setup-description" className="text-slate-300 text-sm mb-8">
           Configure your draft settings to get started.

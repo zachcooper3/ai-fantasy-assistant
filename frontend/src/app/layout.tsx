@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Fantasy Draft Assistant",
+  title: "DraftCopilot",
   description: "AI-powered draft day co-pilot for Sleeper PPR leagues",
 };
 

@@ -73,7 +73,7 @@ def _print_startup_banner(ai_service: AIService) -> None:
     )
     db_path = os.getenv("DB_PATH", "data/fantasy.db")
     print("=" * 64)
-    print("  Fantasy Draft Assistant — startup configuration")
+    print("  DraftCopilot — startup configuration")
     print(f"    Claude API : {claude_status}")
     print(f"    API auth   : {auth_status}")
     print(f"    Database   : {db_path}")
@@ -167,7 +167,7 @@ async def lifespan(app: FastAPI):
                       "POST /api/sync/start manually if needed.")
 
     _print_startup_banner(app.state.ai_service)
-    print("Fantasy Draft Assistant API is ready.")
+    print("DraftCopilot API is ready.")
     yield
     # Shutdown: stop sync task and close the persistent Sleeper HTTP client
     await app.state.sync_service.stop()
@@ -179,7 +179,7 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Fantasy Football Draft Assistant",
+    title="DraftCopilot",
     description="AI-powered draft day co-pilot for Sleeper PPR leagues.",
     version="0.1.0",
     lifespan=lifespan,

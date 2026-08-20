@@ -1,6 +1,32 @@
-# AI Fantasy Football Draft Assistant
+# DraftCopilot
 
-AI-powered draft day co-pilot for Sleeper PPR leagues. Built with FastAPI (Python) + Next.js.
+**An AI-powered draft-day co-pilot for Sleeper PPR fantasy football leagues.**
+
+DraftCopilot runs beside you during a live draft: it tracks every pick in real time (synced straight from Sleeper), keeps a tier-aware big board of who's left, and — when you're on the clock — asks Claude for a recommendation grounded in your actual roster, positional scarcity, real injury news, and computed player metrics. Not a static cheat sheet; a draft room that thinks along with the draft.
+
+<!-- SCREENSHOT: drop a draft-room screenshot here, e.g.
+![DraftCopilot draft room](docs/screenshot-draft-room.png)
+-->
+
+## What it does
+
+- **Live draft room** — big board with ADP tiers and drop-off indicators, positional scarcity counts, injury badges, player detail drawer, keyboard shortcuts, and one-click undo for mis-entered picks.
+- **Real-time Sleeper sync** — attach to a live Sleeper draft and picks flow in automatically over a WebSocket; the session survives a server restart mid-draft (picks, sync, and model choice all resume).
+- **AI pick recommendations** — Claude weighs roster needs, tier scarcity, value over replacement, run risk, and the cost of waiting a round — then explains its reasoning. No API key? The app still works, falling back to best-available-by-ADP.
+- **Grounded, not vibes** — a RAG layer (ChromaDB) feeds the prompt two kinds of evidence: factual "what happened" chunks from Sleeper injury statuses and RotoWire news, and Claude-written "what it means" scouting notes synthesized *only* from each player's computed nflverse metrics — never invented stats. Rookies get their own equivalent built from NFL draft capital and final-season college production.
+- **A real data pipeline** — one command refreshes every source in dependency order with validation guards (a suspicious fetch never overwrites good data), plus read-only diagnostic tools for answering "why did it recommend X over Y?"
+
+## How it works
+
+```
+Next.js draft room ── REST + WebSocket ──> FastAPI backend
+                                             ├─ SQLite        players, metrics, draft journal
+                                             ├─ ChromaDB      news chunks + scouting notes (RAG)
+                                             └─ Claude API    live recommendations + offline synthesis
+Data sources: Sleeper · FantasyPros/FFC ADP · nflverse · RotoWire · CollegeFootballData
+```
+
+**Stack:** Python / FastAPI / SQLModel / SQLite / ChromaDB / Anthropic API · TypeScript / Next.js / React / Tailwind · pytest + Vitest.
 
 ---
 
