@@ -1268,8 +1268,15 @@ def test_missing_considered_does_not_reject_the_recommendation():
     assert result.considered == []
 
 
-def test_temperature_allows_variation_without_being_random():
-    assert 0.0 < _TEMPERATURE <= 0.5
+def test_temperature_is_deterministic():
+    # Was 0.3 (see the constant's docstring for the full history): with
+    # `main` now the ONLY model-generated field (alternatives removed
+    # 2026-08-09), nonzero temperature had no upside left and a real live
+    # cost — rerunning `main` on an unchanged board (Bijan Robinson vs
+    # Christian McCaffrey, 2026-08-20) returned a different, equally
+    # confident top pick each time. `confidence: low` is the mechanism for
+    # flagging a close call now, not a resampled `main`.
+    assert _TEMPERATURE == 0.0
 
 
 # ---------------------------------------------------------------------------

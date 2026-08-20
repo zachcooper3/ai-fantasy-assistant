@@ -75,19 +75,28 @@ _CONFIDENCE_LEVELS = {"high", "medium", "low"}
 # JSON into an unparseable response that falls back to ADP.
 _MAX_RESPONSE_TOKENS = 3072
 
-# Low but not zero. The default of 1.0 made two clicks on an unchanged board
-# return different players with equally confident reasoning, which reads as
-# the tool being unreliable rather than the board being close (that's what
-# `confidence: low` is for). 0 fixed that but made the advice feel locked:
-# re-rolling a pick you disagreed with returned the identical answer.
+# Back to 0, as of 2026-08-20. The default of 1.0 made two clicks on an
+# unchanged board return different players with equally confident reasoning,
+# which reads as the tool being unreliable rather than the board being close
+# (that's what `confidence: low` is for). 0.3 was chosen instead of 0 so that
+# genuine alternatives could surface when the top few were close — back when
+# `main` shipped alongside a model-written `alternatives` list, a little
+# randomness there was a feature: a reroll could name a different, still
+# legitimate, second opinion.
 #
-# 0.3 keeps near-identical behaviour on clear-cut boards while allowing
-# genuine alternatives to surface when the top few are close — which is
-# exactly when a second opinion is worth anything. It has no measurable
-# effect on latency (temperature is free) and, with the assistant prefill
-# forcing the opening brace and a fully specified schema, negligible effect
-# on JSON validity at this level.
-_TEMPERATURE = 0.3
+# That `alternatives` field was removed entirely in the 2026-08-09
+# recommendation-sections redesign (see best_available/needs/depth —
+# deterministic Python, not model output) — `main` became the ONLY thing the
+# model still generates. Nobody revisited temperature at that point, so the
+# randomness kept doing exactly what it was built to avoid: on 2026-08-20,
+# rerunning `main` on an unchanged draft-2 board (Bijan Robinson vs Christian
+# McCaffrey, both legitimately close — Bijan the better ADP and cleaner
+# injury profile, CMC the higher VOR) returned a genuinely different top
+# pick with equally confident reasoning both times. With no alternatives
+# list left to benefit from the variety, there is no upside left to weigh
+# against that instability. `confidence: low` is what should communicate "an
+# unusually close call," not a coin-flipped `main`.
+_TEMPERATURE = 0.0
 
 # Models that 400 on ANY `temperature` value at all — "`temperature` is
 # deprecated for this model" — rather than clamping or ignoring it. Confirmed
